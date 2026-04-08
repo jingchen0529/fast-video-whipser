@@ -1,0 +1,145 @@
+$paper: #f5f0e4;
+$ink: #12110f;
+$rust: #a24a20;
+$ocean: #12354a;
+
+:root {
+  color-scheme: light;
+}
+
+html {
+  background:
+    radial-gradient(circle at top left, rgba($paper, 0.96), rgba(white, 0.88) 45%, rgba(#f0e7d4, 0.94)),
+    linear-gradient(135deg, #f8f4eb 0%, #f3ede0 100%);
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: $ink;
+  font-family:
+    "Avenir Next",
+    "IBM Plex Sans",
+    "Segoe UI",
+    sans-serif;
+  background:
+    radial-gradient(circle at top right, rgba($rust, 0.09), transparent 28%),
+    radial-gradient(circle at bottom left, rgba($ocean, 0.08), transparent 32%);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+::selection {
+  background: rgba($rust, 0.18);
+}
+
+.starter-shell {
+  position: relative;
+}
+
+.starter-shell::before {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background-image:
+    linear-gradient(rgba($ink, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba($ink, 0.03) 1px, transparent 1px);
+  background-size: 32px 32px;
+  content: "";
+  mask-image: radial-gradient(circle at center, black 52%, transparent 100%);
+  pointer-events: none;
+}
+
+.hero-slab {
+  position: relative;
+}
+
+.hero-slab::after {
+  position: absolute;
+  inset: auto 28px 24px auto;
+  width: 120px;
+  height: 120px;
+  border-radius: 999px;
+  background: radial-gradient(circle, rgba($rust, 0.18), transparent 70%);
+  content: "";
+  filter: blur(10px);
+  pointer-events: none;
+}
+
+.hero-orb {
+  position: absolute;
+  border-radius: 999px;
+  filter: blur(8px);
+  opacity: 0.7;
+}
+
+.hero-orb--one {
+  top: 24px;
+  right: 18px;
+  width: 130px;
+  height: 130px;
+  background: radial-gradient(circle, rgba(#f97316, 0.36), transparent 68%);
+}
+
+.hero-orb--two {
+  right: 72px;
+  bottom: 24px;
+  width: 160px;
+  height: 160px;
+  background: radial-gradient(circle, rgba(#38bdf8, 0.24), transparent 70%);
+}
+
+.metric-card {
+  border: 1px solid rgba(#d6cfc0, 0.9);
+  border-radius: 1.5rem;
+  padding: 1rem;
+  background: linear-gradient(180deg, rgba(white, 0.82), rgba(#f5f0e4, 0.78));
+  box-shadow: 0 20px 45px rgba(#1f1a14, 0.05);
+}
+
+.metric-label {
+  display: block;
+  margin-bottom: 0.5rem;
+  font-size: 0.73rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: rgba($ink, 0.52);
+}
+
+.metric-value {
+  display: block;
+  font-size: 1.2rem;
+  font-weight: 700;
+  color: $ink;
+}
+
+.metric-copy {
+  margin: 0.5rem 0 0;
+  line-height: 1.6;
+  color: rgba($ink, 0.66);
+}
+
+.endpoint-line {
+  border: 1px solid rgba(white, 0.08);
+  border-radius: 0.9rem;
+  padding: 0.75rem 0.9rem;
+  background: rgba(white, 0.04);
+}
+
+.feature-card {
+  transition:
+    transform 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.feature-card:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 18px 40px rgba(#1f1a14, 0.08);
+}
