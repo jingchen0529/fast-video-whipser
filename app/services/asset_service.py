@@ -174,6 +174,7 @@ class AssetService:
         conversation_id: str | None,
         job_id: str | None,
         clips: list[dict],
+        origin: str = "ai_generated",
     ) -> list[dict]:
         if not clips:
             return []
@@ -195,9 +196,9 @@ class AssetService:
                         id, source_video_asset_id, clip_asset_id, conversation_id, job_id,
                         owner_user_id, start_ms, end_ms, action_summary, action_label,
                         entrance_style, emotion_label, temperament_label, scene_label,
-                        camera_motion, camera_shot, review_status, copyright_risk_level,
+                        camera_motion, camera_shot, origin, review_status, copyright_risk_level,
                         metadata_json, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         motion_asset_id,
@@ -216,6 +217,7 @@ class AssetService:
                         clip.get("scene_label"),
                         clip.get("camera_motion"),
                         clip.get("camera_shot"),
+                        origin,
                         clip.get("review_status", "auto_tagged"),
                         clip.get("copyright_risk_level", "unknown"),
                         json.dumps(metadata, ensure_ascii=False),
@@ -240,6 +242,7 @@ class AssetService:
                         "scene_label": clip.get("scene_label"),
                         "camera_motion": clip.get("camera_motion"),
                         "camera_shot": clip.get("camera_shot"),
+                        "origin": origin,
                         "review_status": clip.get("review_status", "auto_tagged"),
                         "copyright_risk_level": clip.get("copyright_risk_level", "unknown"),
                         "metadata_json": metadata,
@@ -259,6 +262,7 @@ class AssetService:
         action_label: str | None = None,
         scene_label: str | None = None,
         review_status: str | None = None,
+        origin: str | None = None,
         keyword: str | None = None,
         limit: int = 20,
     ) -> list[dict]:
@@ -277,6 +281,9 @@ class AssetService:
         if review_status:
             clauses.append("review_status = ?")
             params.append(review_status.strip())
+        if origin:
+            clauses.append("origin = ?")
+            params.append(origin.strip())
         if keyword:
             clauses.append("action_summary LIKE ?")
             params.append(f"%{keyword.strip()}%")
@@ -297,6 +304,106 @@ class AssetService:
                 params,
             ).fetchall()
             return [self._row_to_motion_asset(row) for row in rows]
+        finally:
+            connection.close()
+
+    def list_media_assets(
+        self,
+        *,
+        asset_type: str | None = None,
+        source_type: str | None = None,
+        owner_user_id: str | None = None,
+        keyword: str | None = None,
+        sort: str = "newest",
+        page: int = 1,
+        page_size: int = 40,
+    ) -> dict:
+        clauses = ["1 = 1"]
+        params: list[object] = []
+
+        if asset_type:
+            clauses.append("asset_type = ?")
+            params.append(asset_type.strip())
+        if source_type:
+            clauses.append("source_type = ?")
+            params.append(source_type.strip())
+        if owner_user_id:
+            clauses.append("owner_user_id = ?")
+            params.append(owner_user_id.strip())
+        if keyword:
+            clauses.append("file_name LIKE ?")
+            params.append(f"%{keyword.strip()}%")
+
+        order = "created_at DESC" if sort == "newest" else "created_at ASC"
+        where = " AND ".join(clauses)
+
+        connection = create_connection()
+        try:
+            total = connection.execute(
+                f"SELECT COUNT(*) AS cnt FROM media_assets WHERE {where}",
+                params,
+            ).fetchone()["cnt"]
+
+            safe_page = max(1, page)
+            safe_size = max(1, min(page_size, 100))
+            offset = (safe_page - 1) * safe_size
+
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM media_assets
+                WHERE {where}
+                ORDER BY {order}
+                LIMIT ? OFFSET ?
+                """,
+                [*params, safe_size, offset],
+            ).fetchall()
+            return {
+                "items": [self._row_to_asset(row) for row in rows],
+                "total": total,
+                "page": safe_page,
+                "page_size": safe_size,
+            }
+        finally:
+            connection.close()
+
+    def get_storage_usage(self) -> dict:
+        connection = create_connection()
+        try:
+            row = connection.execute(
+                "SELECT COALESCE(SUM(size_bytes), 0) AS used FROM media_assets"
+            ).fetchone()
+            return {
+                "used_bytes": row["used"],
+                "total_bytes": 1 * 1024 * 1024 * 1024,
+            }
+        finally:
+            connection.close()
+
+    def delete_asset(self, *, asset_id: str) -> bool:
+        connection = create_connection()
+        try:
+            cursor = connection.execute(
+                "DELETE FROM media_assets WHERE id = ?",
+                (asset_id,),
+            )
+            connection.commit()
+            return cursor.rowcount > 0
+        finally:
+            connection.close()
+
+    def delete_assets_batch(self, *, asset_ids: list[str]) -> int:
+        if not asset_ids:
+            return 0
+        placeholders = ", ".join("?" for _ in asset_ids)
+        connection = create_connection()
+        try:
+            cursor = connection.execute(
+                f"DELETE FROM media_assets WHERE id IN ({placeholders})",
+                asset_ids,
+            )
+            connection.commit()
+            return cursor.rowcount
         finally:
             connection.close()
 

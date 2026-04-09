@@ -3,22 +3,11 @@ import sqlite3
 import uuid
 from typing import Any
 
-from fastapi import HTTPException
-
 from app.auth.security import utcnow_iso
 from app.db.sqlite import create_connection
-from app.services.asset_service import AssetService
-from app.services.job_service import JobService
-from app.services.video_analysis_service import VideoAnalysisService
 
 
 class ConversationService:
-    JOB_MESSAGE_TYPES = {
-        "video_analysis_request",
-        "video_remake_request",
-        "motion_extract_request",
-    }
-
     def create_conversation(
         self,
         *,
@@ -120,14 +109,6 @@ class ConversationService:
     ) -> dict:
         now = utcnow_iso()
         message_id = uuid.uuid4().hex
-        validated_assets: list[dict] = []
-
-        if message_type in self.JOB_MESSAGE_TYPES:
-            validated_assets = self._ensure_dispatch_assets(
-                user_id=user_id,
-                message_type=message_type,
-                asset_ids=asset_ids,
-            )
 
         connection = create_connection()
         try:
@@ -172,22 +153,9 @@ class ConversationService:
         finally:
             connection.close()
 
-        job = None
-        if message_type in self.JOB_MESSAGE_TYPES:
-            job = JobService().create_job_from_message(
-                conversation_id=conversation_id,
-                trigger_message_id=message_id,
-                message_type=message_type,
-                asset_ids=[asset["id"] for asset in validated_assets],
-                options=options,
-            )
-
-            if job["job_type"] == "video_analysis":
-                VideoAnalysisService().run_analysis_job(job_id=job["id"])
-
         return {
             "message_id": message_id,
-            "job": job,
+            "job": None,
         }
 
     def _get_owned_conversation(
@@ -205,22 +173,3 @@ class ConversationService:
             (conversation_id, user_id),
         ).fetchone()
         return dict(row) if row else None
-
-    def _ensure_dispatch_assets(
-        self,
-        *,
-        user_id: str,
-        message_type: str,
-        asset_ids: list[str],
-    ) -> list[dict]:
-        normalized_ids = [asset_id.strip() for asset_id in asset_ids if asset_id and asset_id.strip()]
-        if not normalized_ids:
-            raise HTTPException(
-                status_code=400,
-                detail=f"{message_type} 至少需要一个输入资产。",
-            )
-
-        return AssetService().ensure_accessible_assets(
-            asset_ids=normalized_ids,
-            owner_user_id=user_id,
-        )

@@ -232,6 +232,7 @@ CREATE TABLE IF NOT EXISTS motion_assets (
     scene_label TEXT,
     camera_motion TEXT,
     camera_shot TEXT,
+    origin TEXT NOT NULL DEFAULT 'ai_generated',
     review_status TEXT NOT NULL DEFAULT 'draft',
     copyright_risk_level TEXT NOT NULL DEFAULT 'unknown',
     metadata_json TEXT,
@@ -244,6 +245,102 @@ CREATE TABLE IF NOT EXISTS motion_assets (
     FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS shot_segments (
+    id TEXT PRIMARY KEY,
+    project_id INTEGER NOT NULL,
+    conversation_id TEXT,
+    job_id TEXT,
+    source_video_asset_id TEXT NOT NULL,
+    owner_user_id TEXT,
+    segment_index INTEGER NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    start_frame INTEGER,
+    end_frame INTEGER,
+    boundary_in_type TEXT NOT NULL DEFAULT 'cut',
+    boundary_out_type TEXT NOT NULL DEFAULT 'cut',
+    detector_name TEXT NOT NULL DEFAULT 'pyscenedetect',
+    detector_version TEXT,
+    detector_config_json TEXT,
+    keyframe_asset_ids_json TEXT,
+    transcript_text TEXT NOT NULL DEFAULT '',
+    ocr_text TEXT NOT NULL DEFAULT '',
+    visual_summary TEXT,
+    title TEXT,
+    shot_type_code TEXT,
+    camera_angle_code TEXT,
+    camera_motion_code TEXT,
+    scene_label TEXT,
+    confidence REAL,
+    metadata_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE SET NULL,
+    FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE SET NULL,
+    FOREIGN KEY (source_video_asset_id) REFERENCES media_assets(id) ON DELETE CASCADE,
+    FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE SET NULL,
+    UNIQUE(project_id, segment_index)
+);
+
+CREATE TABLE IF NOT EXISTS storyboards (
+    id TEXT PRIMARY KEY,
+    project_id INTEGER NOT NULL,
+    conversation_id TEXT,
+    job_id TEXT,
+    source_video_asset_id TEXT NOT NULL,
+    owner_user_id TEXT,
+    version_no INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'generated',
+    generator_provider TEXT,
+    generator_model TEXT,
+    prompt_version TEXT,
+    summary TEXT,
+    item_count INTEGER NOT NULL DEFAULT 0,
+    metadata_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE SET NULL,
+    FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE SET NULL,
+    FOREIGN KEY (source_video_asset_id) REFERENCES media_assets(id) ON DELETE CASCADE,
+    FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE SET NULL,
+    UNIQUE(project_id, version_no)
+);
+
+CREATE TABLE IF NOT EXISTS storyboard_items (
+    id TEXT PRIMARY KEY,
+    storyboard_id TEXT NOT NULL,
+    item_index INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    shot_type_code TEXT,
+    camera_angle_code TEXT,
+    camera_motion_code TEXT,
+    visual_description TEXT NOT NULL,
+    transcript_excerpt TEXT NOT NULL DEFAULT '',
+    ocr_excerpt TEXT NOT NULL DEFAULT '',
+    confidence REAL,
+    review_status TEXT NOT NULL DEFAULT 'auto_generated',
+    metadata_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (storyboard_id) REFERENCES storyboards(id) ON DELETE CASCADE,
+    UNIQUE(storyboard_id, item_index)
+);
+
+CREATE TABLE IF NOT EXISTS storyboard_item_segments (
+    storyboard_item_id TEXT NOT NULL,
+    shot_segment_id TEXT NOT NULL,
+    display_order INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (storyboard_item_id, shot_segment_id),
+    FOREIGN KEY (storyboard_item_id) REFERENCES storyboard_items(id) ON DELETE CASCADE,
+    FOREIGN KEY (shot_segment_id) REFERENCES shot_segments(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS system_settings (
     key TEXT PRIMARY KEY,
     value_json TEXT NOT NULL,
@@ -251,6 +348,23 @@ CREATE TABLE IF NOT EXISTS system_settings (
     updated_by_user_id TEXT,
     FOREIGN KEY (updated_by_user_id) REFERENCES users(id) ON DELETE SET NULL
 );
+
+CREATE TABLE IF NOT EXISTS task_queue (
+    id TEXT PRIMARY KEY,
+    task_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    payload_json TEXT,
+    max_retries INTEGER NOT NULL DEFAULT 0,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_queue_status_created
+    ON task_queue (status, created_at);
 
 CREATE INDEX IF NOT EXISTS idx_user_roles_user_id ON user_roles(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_roles_role_id ON user_roles(role_id);
@@ -277,6 +391,15 @@ CREATE INDEX IF NOT EXISTS idx_motion_assets_source_video_asset_id ON motion_ass
 CREATE INDEX IF NOT EXISTS idx_motion_assets_action_label ON motion_assets(action_label);
 CREATE INDEX IF NOT EXISTS idx_motion_assets_scene_label ON motion_assets(scene_label);
 CREATE INDEX IF NOT EXISTS idx_motion_assets_review_status ON motion_assets(review_status);
+CREATE INDEX IF NOT EXISTS idx_shot_segments_project_id ON shot_segments(project_id);
+CREATE INDEX IF NOT EXISTS idx_shot_segments_source_video_asset_id ON shot_segments(source_video_asset_id);
+CREATE INDEX IF NOT EXISTS idx_shot_segments_job_id ON shot_segments(job_id);
+CREATE INDEX IF NOT EXISTS idx_shot_segments_start_ms ON shot_segments(project_id, start_ms);
+CREATE INDEX IF NOT EXISTS idx_storyboards_project_id ON storyboards(project_id);
+CREATE INDEX IF NOT EXISTS idx_storyboards_source_video_asset_id ON storyboards(source_video_asset_id);
+CREATE INDEX IF NOT EXISTS idx_storyboard_items_storyboard_id ON storyboard_items(storyboard_id);
+CREATE INDEX IF NOT EXISTS idx_storyboard_items_start_ms ON storyboard_items(storyboard_id, start_ms);
+CREATE INDEX IF NOT EXISTS idx_storyboard_item_segments_shot_segment_id ON storyboard_item_segments(shot_segment_id);
 """
 
 
@@ -326,6 +449,7 @@ def initialize_database(database_url: str | None = None) -> None:
 
 
 def _migrate_schema(connection: sqlite3.Connection) -> None:
+    _ensure_column(connection, "motion_assets", "origin", "TEXT NOT NULL DEFAULT 'ai_generated'")
     _ensure_column(connection, "users", "token_version", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(connection, "users", "avatar_url", "TEXT")
     _ensure_column(connection, "refresh_tokens", "session_id", "TEXT")
@@ -401,6 +525,33 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
     )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_motion_assets_review_status ON motion_assets(review_status)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shot_segments_project_id ON shot_segments(project_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shot_segments_source_video_asset_id ON shot_segments(source_video_asset_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shot_segments_job_id ON shot_segments(job_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shot_segments_start_ms ON shot_segments(project_id, start_ms)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_storyboards_project_id ON storyboards(project_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_storyboards_source_video_asset_id ON storyboards(source_video_asset_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_storyboard_items_storyboard_id ON storyboard_items(storyboard_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_storyboard_items_start_ms ON storyboard_items(storyboard_id, start_ms)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_storyboard_item_segments_shot_segment_id ON storyboard_item_segments(shot_segment_id)"
     )
 
 

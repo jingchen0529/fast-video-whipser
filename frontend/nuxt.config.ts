@@ -28,10 +28,10 @@ export default defineNuxtConfig({
   },
   app: {
     head: {
+      title: "Cut Killer",
       link: [
-        { rel: "icon", type: "image/png", href: "/icon.png" },
-        { rel: "shortcut icon", type: "image/png", href: "/icon.png" },
-        { rel: "apple-touch-icon", href: "/icon.png" },
+        { rel: "icon", type: "image/x-icon", href: "/favicon.ico" },
+        { rel: "shortcut icon", type: "image/x-icon", href: "/favicon.ico" },
       ],
     },
   },

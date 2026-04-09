@@ -154,6 +154,13 @@ export interface SystemSettingsProviderConfig {
   api_key: string;
   default_model: string;
   model_options: string[];
+  model_dir: string;
+  device: string;
+  compute_type: string;
+  language: string;
+  prompt: string;
+  beam_size: number;
+  vad_filter: boolean;
 }
 
 export interface SystemSettingsProviderGroup {
@@ -171,5 +178,48 @@ export interface SystemSettingsPayload {
   system: SystemSettingsInfoConfig;
   proxy: SystemSettingsProxyConfig;
   analysis: SystemSettingsProviderGroup;
+  transcription: SystemSettingsProviderGroup;
   remake: SystemSettingsProviderGroup;
+}
+
+export interface TranscriptionDependencyStatus {
+  installed: boolean;
+  version: string;
+}
+
+export interface FasterWhisperLocalModel {
+  name: string;
+  path: string;
+}
+
+export interface FasterWhisperCapabilities {
+  provider: "faster_whisper";
+  available: boolean;
+  issues: string[];
+  dependency_status: Record<string, TranscriptionDependencyStatus>;
+  binary_status: Record<string, boolean>;
+  model_dir: string;
+  local_models: FasterWhisperLocalModel[];
+  available_devices: string[];
+  available_compute_types: string[];
+  recommended_device: string;
+  cuda_device_count: number;
+}
+
+export interface OpenAIWhisperCapabilities {
+  provider: "openai_whisper_api";
+  available: boolean;
+  issues: string[];
+  supported_models: string[];
+  base_url: string;
+  file_size_limit_mb: number;
+  supported_formats: string[];
+}
+
+export interface TranscriptionCapabilitiesPayload {
+  default_provider: string;
+  providers: {
+    faster_whisper: FasterWhisperCapabilities;
+    openai_whisper_api: OpenAIWhisperCapabilities;
+  };
 }

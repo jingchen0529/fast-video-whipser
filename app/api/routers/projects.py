@@ -1,13 +1,12 @@
 from typing import List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 
 from app.auth.dependencies import get_current_user, require_csrf_protection
 from app.core.http import ResponseModel, build_response
 from app.services.project_service import ProjectService
-
-from app.services.project_service import ProjectService
+from app.workflows.task_queue import TaskQueue
 
 class ProjectMessageRequest(BaseModel):
     content: str
@@ -55,6 +54,8 @@ class ProjectDetail(ProjectListItem):
     ecommerce_analysis: dict = {"title": "分析结果", "content": "AI 分析内容占位符"}
     source_analysis: dict = {"reference_frames": [], "visual_features": None}
     timeline_segments: List[dict] = []
+    shot_segments: List[dict] = []
+    storyboard: dict = {"id": None, "version_no": 0, "status": "idle", "summary": "", "items": []}
     video_generation: dict = {"status": "idle", "provider": None, "model": None, "objective": None, "asset_type": None, "asset_name": None, "asset_url": None, "audio_name": None, "audio_url": None, "reference_frames": [], "script": None, "storyboard": None, "prompt": None, "provider_task_id": None, "result_video_url": None, "error_detail": None, "updated_at": None}
     conversation_messages: List[ProjectConversationMessage] = []
     task_steps: List[ProjectTaskStep] = []
@@ -83,7 +84,6 @@ async def get_project_detail(
 
 @router.post("/upload", response_model=ResponseModel)
 async def upload_project(
-    background_tasks: BackgroundTasks,
     request: Request,
     file: Optional[UploadFile] = File(None),
     objective: str = Form(...),
@@ -105,9 +105,9 @@ async def upload_project(
         if file is not None:
             await file.close()
 
-    background_tasks.add_task(
-        service.run_project_workflow,
-        project_id=project["id"],
+    TaskQueue.instance().enqueue(
+        task_type="workflow",
+        payload={"project_id": project["id"]},
     )
     return build_response(request, data=project)
 
@@ -126,3 +126,40 @@ async def add_project_message(
         content=request.content,
     )
     return build_response(req, data=message)
+
+class UpdateProjectTitleRequest(BaseModel):
+    title: str
+
+@router.patch("/{project_id}", response_model=ResponseModel)
+async def update_project_title(
+    project_id: int,
+    request: UpdateProjectTitleRequest,
+    req: Request,
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_csrf_protection),
+):
+    service = ProjectService()
+    success = service.update_project_title(
+        project_id=project_id,
+        user_id=current_user["id"],
+        title=request.title,
+    )
+    if not success:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+    return build_response(req, data={"success": True})
+
+@router.delete("/{project_id}", response_model=ResponseModel)
+async def delete_project(
+    project_id: int,
+    req: Request,
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(require_csrf_protection),
+):
+    service = ProjectService()
+    success = service.delete_project(
+        project_id=project_id,
+        user_id=current_user["id"],
+    )
+    if not success:
+        raise HTTPException(status_code=404, detail="项目不存在。")
+    return build_response(req, data={"success": True})

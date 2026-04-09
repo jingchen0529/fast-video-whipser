@@ -19,9 +19,12 @@ import {
   Captions,
   MessageSquarePlus,
   History,
+  Shapes,
   MessageSquare,
   Trash2,
-  Plus
+  Plus,
+  Images,
+  Pencil,
 } from "lucide-vue-next";
 import { useColorMode } from "@vueuse/core";
 
@@ -39,6 +42,15 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuSubContent,
 } from "@/components/ui/dropdown-menu";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Textarea } from "@/components/ui/textarea";
 import { DropdownMenuPortal } from "reka-ui";
 import {
   Sidebar,
@@ -53,6 +65,12 @@ import {
   SidebarMenuItem,
   useSidebar,
 } from "@/components/ui/sidebar";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 const auth = useAuth();
 const loadingOverlay = useLoadingOverlay();
@@ -76,7 +94,7 @@ const user = computed(() => {
     name: u?.display_name || u?.username || "Admin",
     email: u?.email || "admin@example.com",
     avatar_url: avatarUrl
-      ? `${avatarUrl}${avatarUrl.includes("?") ? "&" : "?"}_t=${Date.now()}`
+      ? `${avatarUrl}${avatarUrl.includes("?") ? "&" : "?"}_t=${import.meta.client ? Date.now() : ""}`
       : undefined,
   };
 });
@@ -133,15 +151,10 @@ const loadProjects = async (silent = false) => {
 };
 
 const handleProjectSelect = async (projectId: number) => {
-  if (route.path !== "/video/workbench") {
-    await navigateTo("/video/workbench");
-  }
-  // The workbench component itself should handle loading the detail based on store state or we can do it here
-  // Actually, workbench.vue has its own loadProjectDetail. 
-  // It's better if we just set the ID or tell the store to load it.
   try {
     const project = await api<any>(`/projects/${projectId}`);
     chatStore.selectedProject = project;
+    await navigateTo(`/video/history?id=${projectId}`);
   } catch (error) {
     console.error(error);
   }
@@ -149,8 +162,73 @@ const handleProjectSelect = async (projectId: number) => {
 
 const startNewChat = () => {
   chatStore.selectedProject = null;
-  if (route.path !== "/video/workbench") {
-    navigateTo("/video/workbench");
+  navigateTo("/video/workbench");
+};
+
+const handleNavClick = (url: string) => {
+  if (url === "/video/workbench") {
+    chatStore.selectedProject = null;
+  }
+};
+
+const renamingProjectId = ref<number | null>(null);
+const renameTitle = ref("");
+const showRenameDialog = ref(false);
+
+const deletingProjectId = ref<number | null>(null);
+const deletingProjectTitle = ref("");
+const showDeleteDialog = ref(false);
+
+const handleRename = (project: any) => {
+  renamingProjectId.value = project.id;
+  renameTitle.value = project.title || "";
+  showRenameDialog.value = true;
+};
+
+const submitRename = async () => {
+  if (renamingProjectId.value === null || !renameTitle.value.trim()) {
+    showRenameDialog.value = false;
+    return;
+  }
+  const id = renamingProjectId.value;
+  try {
+    await api(`/projects/${id}`, {
+      method: "PATCH",
+      body: { title: renameTitle.value.trim() },
+    });
+    chatStore.projects = chatStore.projects.map((p: any) =>
+      p.id === id ? { ...p, title: renameTitle.value.trim() } : p,
+    );
+    if (chatStore.selectedProject?.id === id) {
+      chatStore.selectedProject.title = renameTitle.value.trim();
+    }
+    toast.success("重命名完成");
+    showRenameDialog.value = false;
+  } catch (error) {
+    toast.error("操作失败，请重试");
+  }
+};
+
+const handleDeleteRequest = (project: any) => {
+  deletingProjectId.value = project.id;
+  deletingProjectTitle.value = project.title || "未命名对话";
+  showDeleteDialog.value = true;
+};
+
+const confirmDelete = async () => {
+  if (deletingProjectId.value === null) return;
+  const id = deletingProjectId.value;
+  try {
+    await api(`/projects/${id}`, { method: "DELETE" });
+    chatStore.projects = chatStore.projects.filter((p: any) => p.id !== id);
+    if (chatStore.selectedProject?.id === id) {
+      chatStore.selectedProject = null;
+      navigateTo("/video/workbench");
+    }
+    toast.success("对话已删除");
+    showDeleteDialog.value = false;
+  } catch (error) {
+    toast.error("删除失败");
   }
 };
 
@@ -160,18 +238,23 @@ onMounted(() => {
 
 const navMain = [
   {
-    items: [
-      { title: "仪表盘", url: "/dashboard", icon: LayoutDashboard },
-      { title: "视频分析", url: "/video/workbench", icon: Captions },
-    ],
+    items: [{ title: "仪表盘", url: "/dashboard", icon: LayoutDashboard }],
   },
   {
-    title: "系统管理",
+    title: "系统",
     items: [
       { title: "用户管理", url: "/users", icon: UserCog },
       { title: "角色管理", url: "/roles", icon: ShieldCheck },
       { title: "菜单管理", url: "/menus", icon: FolderTree },
     ],
+  },
+  {
+    title: "创作",
+    items: [{ title: "视频分析", url: "/video/workbench", icon: Captions }],
+  },
+  {
+    title: "空间",
+    items: [{ title: "动态资产", url: "/assets", icon: Shapes }],
   },
 ];
 </script>
@@ -222,7 +305,7 @@ const navMain = [
           <SidebarMenu>
             <SidebarMenuItem v-for="item in group.items" :key="item.title">
               <SidebarMenuButton as-child :is-active="route.path === item.url">
-                <NuxtLink :to="item.url">
+                <NuxtLink :to="item.url" @click="handleNavClick(item.url)">
                   <component :is="item.icon" class="size-4" />
                   <span class="group-data-[collapsible=icon]:hidden">{{
                     item.title
@@ -235,8 +318,12 @@ const navMain = [
       </SidebarGroup>
 
       <!-- History Dialogues -->
-      <SidebarGroup class="flex-1 overflow-hidden flex flex-col min-h-0">
-        <div class="px-2 mb-2 flex items-center justify-between group-data-[collapsible=icon]:hidden">
+      <SidebarGroup
+        class="flex-[3] overflow-hidden flex flex-col min-h-0 border-t border-zinc-100 dark:border-zinc-800/50 mt-2 pt-2"
+      >
+        <div
+          class="px-2 mb-2 flex items-center justify-between group-data-[collapsible=icon]:hidden"
+        >
           <SidebarGroupLabel class="px-0">历史对话</SidebarGroupLabel>
           <Button
             variant="ghost"
@@ -250,32 +337,101 @@ const navMain = [
 
         <SidebarGroupContent class="flex-1 overflow-y-auto custom-scrollbar">
           <SidebarMenu>
-            <SidebarMenuItem class="px-2 mb-1 group-data-[collapsible=icon]:block hidden">
+            <SidebarMenuItem
+              class="px-2 mb-1 group-data-[collapsible=icon]:block hidden"
+            >
               <SidebarMenuButton @click="startNewChat" tooltip="新建对话">
                 <Plus class="size-4" />
               </SidebarMenuButton>
             </SidebarMenuItem>
 
-            <div v-if="loadingHistory && !projects.length" class="px-4 py-2 text-xs text-zinc-400">
+            <div
+              v-if="loadingHistory && !projects.length"
+              class="px-4 py-2 text-xs text-zinc-400"
+            >
               加载中...
             </div>
-            
+
             <SidebarMenuItem v-for="project in projects" :key="project.id">
               <SidebarMenuButton
                 :is-active="selectedProject?.id === project.id"
                 @click="handleProjectSelect(project.id)"
-                class="group/item relative"
+                class="group/item relative h-9 w-full transition-all duration-200 hover:bg-zinc-100/80 dark:hover:bg-zinc-800/80"
               >
-                <div class="flex items-center gap-3 overflow-hidden w-full">
-                  <MessageSquare class="size-4 shrink-0" />
-                  <span class="truncate text-xs group-data-[collapsible=icon]:hidden">
-                    {{ project.title || '未命名对话' }}
-                  </span>
+                <div
+                  class="flex items-center gap-2.5 overflow-hidden w-full pr-6 group-hover/item:pr-8"
+                >
+                  <MessageSquare
+                    class="size-3.5 shrink-0 transition-colors"
+                    :class="
+                      selectedProject?.id === project.id
+                        ? 'text-zinc-400'
+                        : 'text-zinc-400 group-hover/item:text-zinc-600 dark:group-hover/item:text-zinc-300'
+                    "
+                  />
+                  <div class="flex-1 overflow-hidden mt-0.5">
+                    <TooltipProvider :delay-duration="800">
+                      <Tooltip>
+                        <TooltipTrigger as-child>
+                          <span
+                            class="truncate text-[12px] block group-data-[collapsible=icon]:hidden font-medium cursor-help"
+                            :class="
+                              selectedProject?.id === project.id
+                                ? 'text-zinc-900 dark:text-zinc-100'
+                                : 'text-zinc-600 dark:text-zinc-400'
+                            "
+                          >
+                            {{ project.title || "未命名对话" }}
+                          </span>
+                        </TooltipTrigger>
+                        <TooltipContent
+                          side="right"
+                          class="bg-zinc-900 text-white border-zinc-800 px-3 py-1.5 text-xs rounded-lg max-w-[240px]"
+                        >
+                          <p>{{ project.title || "未命名对话" }}</p>
+                        </TooltipContent>
+                      </Tooltip>
+                    </TooltipProvider>
+                  </div>
+                </div>
+
+                <!-- More Options Menu -->
+                <div
+                  class="absolute right-1 top-1/2 -translate-y-1/2 opacity-0 group-hover/item:opacity-100 focus-within:opacity-100 transition-opacity group-data-[collapsible=icon]:hidden"
+                  @click.stop
+                >
+                  <DropdownMenu>
+                    <DropdownMenuTrigger as-child>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        class="h-6 w-6 rounded-md hover:bg-zinc-200 dark:hover:bg-zinc-700 text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100"
+                      >
+                        <MoreHorizontal class="size-3.5" />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" class="w-28">
+                      <DropdownMenuItem @click="handleRename(project)">
+                        <Pencil class="mr-2 size-3.5" />
+                        <span>重命名</span>
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        @click="handleDeleteRequest(project)"
+                        class="text-red-500 focus:text-red-500"
+                      >
+                        <Trash2 class="mr-2 size-3.5" />
+                        <span>删除</span>
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
                 </div>
               </SidebarMenuButton>
             </SidebarMenuItem>
-            
-            <div v-if="!loadingHistory && !projects.length" class="px-4 py-4 text-center group-data-[collapsible=icon]:hidden">
+
+            <div
+              v-if="!loadingHistory && !projects.length"
+              class="px-4 py-4 text-center group-data-[collapsible=icon]:hidden"
+            >
               <p class="text-[11px] text-zinc-400">暂无对话历史</p>
             </div>
           </SidebarMenu>
@@ -286,11 +442,14 @@ const navMain = [
     <SidebarFooter>
       <SidebarMenu>
         <SidebarMenuItem>
-          <SidebarMenuButton as-child>
-            <a :href="apiDocsUrl" target="_blank" rel="noreferrer">
+          <SidebarMenuButton
+            as-child
+            :is-active="route.path.startsWith('/settings')"
+          >
+            <NuxtLink to="/settings">
               <Settings class="size-4" />
-              <span class="group-data-[collapsible=icon]:hidden">API 文档</span>
-            </a>
+              <span class="group-data-[collapsible=icon]:hidden">系统设置</span>
+            </NuxtLink>
           </SidebarMenuButton>
         </SidebarMenuItem>
         <SidebarMenuItem>
@@ -323,8 +482,31 @@ const navMain = [
                 <div
                   class="grid flex-1 text-left text-sm leading-tight group-data-[collapsible=icon]:hidden"
                 >
-                  <span class="truncate font-semibold">{{ user.name }}</span>
-                  <span class="truncate text-xs">{{ user.email }}</span>
+                  <TooltipProvider :delay-duration="500">
+                    <Tooltip>
+                      <TooltipTrigger as-child>
+                        <span class="truncate font-semibold cursor-help">{{
+                          user.name
+                        }}</span>
+                      </TooltipTrigger>
+                      <TooltipContent side="top">
+                        <p>{{ user.name }}</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+
+                  <TooltipProvider :delay-duration="500">
+                    <Tooltip>
+                      <TooltipTrigger as-child>
+                        <span class="truncate text-xs cursor-help">{{
+                          user.email
+                        }}</span>
+                      </TooltipTrigger>
+                      <TooltipContent side="top">
+                        <p>{{ user.email }}</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
                 </div>
                 <MoreHorizontal
                   class="ml-auto size-4 group-data-[collapsible=icon]:hidden"
@@ -414,6 +596,79 @@ const navMain = [
         </SidebarMenuItem>
       </SidebarMenu>
     </SidebarFooter>
+
+    <!-- Project Rename Dialog -->
+    <Dialog v-model:open="showRenameDialog">
+      <DialogContent class="sm:max-w-[600px] rounded-2xl">
+        <DialogHeader>
+          <DialogTitle class="text-lg font-semibold">重命名对话</DialogTitle>
+          <DialogDescription class="text-sm text-zinc-500">
+            请输入该对话的新标题。
+          </DialogDescription>
+        </DialogHeader>
+        <div class="grid gap-4 py-4">
+          <Textarea
+            v-model="renameTitle"
+            placeholder="对话标题"
+            class="min-h-[100px] w-full rounded-2xl border border-zinc-200 bg-zinc-50/50 p-3 text-sm focus-visible:ring-2 focus-visible:ring-zinc-900/10 focus-visible:border-zinc-900 dark:border-zinc-800 dark:bg-zinc-900/50 dark:text-zinc-100 dark:focus-visible:border-white dark:focus-visible:ring-white/10 resize-y"
+            @keydown.enter.prevent="submitRename"
+          />
+        </div>
+        <DialogFooter class="gap-3">
+          <Button
+            variant="ghost"
+            class="rounded-full px-6"
+            @click="showRenameDialog = false"
+            >取消</Button
+          >
+          <Button
+            class="rounded-full px-6 bg-zinc-900 hover:bg-zinc-800 text-white dark:bg-zinc-100 dark:hover:bg-zinc-200 dark:text-zinc-900"
+            @click="submitRename"
+            :disabled="!renameTitle.trim()"
+            >确定</Button
+          >
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <!-- Project Delete Dialog -->
+    <Dialog v-model:open="showDeleteDialog">
+      <DialogContent class="sm:max-w-[400px] rounded-2xl">
+        <DialogHeader>
+          <DialogTitle class="text-lg font-semibold flex items-center gap-2">
+            <div
+              class="p-2 rounded-full bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400"
+            >
+              <Trash2 class="size-4" />
+            </div>
+            删除对话
+          </DialogTitle>
+          <DialogDescription
+            class="pt-2 text-zinc-600 dark:text-zinc-400 leading-relaxed"
+          >
+            确定要删除该对话吗？删除后将无法恢复。<br />
+            <span
+              class="mt-2 block font-medium text-zinc-900 dark:text-zinc-100"
+              >"{{ deletingProjectTitle }}"</span
+            >
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter class="mt-4 gap-3">
+          <Button
+            variant="ghost"
+            class="rounded-full px-6"
+            @click="showDeleteDialog = false"
+            >取消</Button
+          >
+          <Button
+            variant="destructive"
+            class="rounded-full px-6"
+            @click="confirmDelete"
+            >删除</Button
+          >
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   </Sidebar>
 </template>
 <style scoped>

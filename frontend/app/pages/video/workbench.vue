@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 
-import VideoOverviewDrawer from "~/components/custom/VideoOverviewDrawer.vue";
-import TaskTimeline from "~/components/custom/TaskTimeline.vue";
 import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import { toast } from "vue-sonner";
 import {
   Dialog,
   DialogContent,
@@ -28,10 +28,10 @@ useHead({
   title: "视频分析工作台",
 });
 
-type ModeTab = "script" | "remake" | "create";
+type ModeTab = "script" | "remake" | "create" | "";
 type ProjectWorkflowType = "analysis" | "create" | "remake";
 
-const activeMode = ref<ModeTab>("script");
+const activeMode = ref<ModeTab>("");
 const inputText = ref("");
 const sending = ref(false);
 const errorMessage = ref("");
@@ -45,7 +45,7 @@ const showVideoDetailModal = ref(false);
 const selectedProject = computed(() => chatStore.selectedProject);
 const projects = computed(() => chatStore.projects);
 
-const modePrefills: Record<ModeTab, () => string> = {
+const modePrefills: Record<Exclude<ModeTab, "">, () => string> = {
   script: () =>
     "从这个视频中提取完整的文本脚本，包括对话、旁白以及所有文字字幕：",
   remake: () => "复刻这个视频的画面细节，包括画面构图、色彩、光影等：",
@@ -63,8 +63,7 @@ const workflowTypeToMode = (workflowType: ProjectWorkflowType): ModeTab =>
       ? "remake"
       : "script";
 
-// Initial prefill
-inputText.value = modePrefills[activeMode.value]();
+// Initial prefill removed to start empty
 
 let projectPollingTimer: ReturnType<typeof window.setInterval> | null = null;
 
@@ -96,33 +95,6 @@ const startProjectPolling = (projectId: number) => {
       stopProjectPolling();
     }
   }, 2000);
-};
-
-const formatDateTime = (value: string | null | undefined) => {
-  if (!value) return "";
-  try {
-    return new Intl.DateTimeFormat("zh-CN", {
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-    }).format(new Date(value));
-  } catch {
-    return value;
-  }
-};
-
-const getMessageTypeLabel = (messageType: string) => {
-  const labels: Record<string, string> = {
-    project_request: "用户需求",
-    workflow_status: "流程更新",
-    analysis_reply: "分析结果",
-    suggestion_reply: "优化建议",
-    workflow_error: "执行异常",
-    chat_question: "追问",
-    chat_reply: "回复",
-  };
-  return labels[messageType] || messageType;
 };
 
 const handleSend = async () => {
@@ -189,14 +161,12 @@ const handleSend = async () => {
         body: formData,
       });
       chatStore.selectedProject = project;
-      if (!isProjectTerminal(project.status)) {
-        startProjectPolling(project.id);
-      }
       inputText.value = "";
       selectedFile.value = null;
       selectedUrls.value = [];
       const res = await api<any[]>("/projects");
       chatStore.projects = res;
+      await navigateTo(`/video/history?id=${project.id}`);
     }
   } catch (error) {
     errorMessage.value = apiService.normalizeError(error);
@@ -210,14 +180,25 @@ const resolveAssetUrl = (value: string | null | undefined): string | null => {
   if (!normalized) return null;
   if (/^(https?:|data:|blob:)/i.test(normalized)) return normalized;
   const apiBase = (runtimeConfig.public.apiBase || "").trim();
-  const origin = apiBase ? new URL(apiBase).origin : window.location.origin;
-  return new URL(normalized, `${origin}/`).toString();
+  let origin = window.location.origin;
+  if (apiBase) {
+    try {
+      origin = new URL(apiBase, window.location.origin).origin;
+    } catch {
+      origin = window.location.origin;
+    }
+  }
+  try {
+    return new URL(normalized, `${origin}/`).toString();
+  } catch {
+    return normalized.startsWith("/") ? normalized : `/${normalized}`;
+  }
 };
 
-const textareaRef = ref<HTMLTextAreaElement | null>(null);
+const textareaRef = ref<any>(null);
 const adjustTextareaHeight = () => {
-  const el = textareaRef.value;
-  if (!el) return;
+  const el = textareaRef.value?.$el ?? textareaRef.value;
+  if (!el || typeof el.scrollHeight !== "number") return;
   el.style.height = "auto";
   el.style.height = `${el.scrollHeight}px`;
 };
@@ -247,7 +228,9 @@ watch(
       startProjectPolling(newId);
     } else if (!newId) {
       stopProjectPolling();
-      inputText.value = modePrefills[activeMode.value]();
+      inputText.value = activeMode.value
+        ? modePrefills[activeMode.value as Exclude<ModeTab, "">]()
+        : "";
       selectedFile.value = null;
       selectedUrls.value = [];
     }
@@ -255,6 +238,9 @@ watch(
 );
 
 onMounted(async () => {
+  // workbench should always be for new projects
+  chatStore.selectedProject = null;
+
   if (!chatStore.projects.length) {
     const res = await api<any[]>("/projects");
     chatStore.projects = res;
@@ -262,12 +248,51 @@ onMounted(async () => {
   nextTick(adjustTextareaHeight);
 });
 
-onUnmounted(() => stopProjectPolling());
+const filePreviewUrl = ref<string | null>(null);
+const uploadProgress = ref(100);
+let simulateTimer: any = null;
+
+watch(selectedFile, (newFile) => {
+  if (filePreviewUrl.value) {
+    URL.revokeObjectURL(filePreviewUrl.value);
+    filePreviewUrl.value = null;
+  }
+  if (simulateTimer) clearInterval(simulateTimer);
+
+  if (newFile) {
+    if (
+      newFile.type.startsWith("image/") ||
+      newFile.type.startsWith("video/")
+    ) {
+      filePreviewUrl.value = URL.createObjectURL(newFile);
+    }
+
+    // Simulate upload for UX effect
+    uploadProgress.value = 0;
+    simulateTimer = setInterval(() => {
+      uploadProgress.value += Math.floor(Math.random() * 15) + 8;
+      if (uploadProgress.value >= 100) {
+        uploadProgress.value = 100;
+        clearInterval(simulateTimer);
+        toast.success("附件已经准备就绪！");
+      }
+    }, 150);
+  } else {
+    uploadProgress.value = 100;
+  }
+});
+
+onUnmounted(() => {
+  stopProjectPolling();
+  if (filePreviewUrl.value) {
+    URL.revokeObjectURL(filePreviewUrl.value);
+  }
+});
 
 const handleUploadClick = () => {
   const input = document.createElement("input");
   input.type = "file";
-  input.accept = "video/*";
+  input.accept = "video/*,image/*,audio/*";
   input.onchange = (e) => {
     const file = (e.target as HTMLInputElement).files?.[0];
     if (file) selectedFile.value = file;
@@ -298,10 +323,7 @@ const confirmLink = () => {
         class="flex-1 overflow-y-auto px-6 lg:px-[120px] pb-[180px] pt-10 scroll-smooth custom-scrollbar"
       >
         <!-- Intro State -->
-        <div
-          v-if="!selectedProject"
-          class="h-full flex flex-col items-center justify-center pb-[15vh]"
-        >
+        <div class="h-full flex flex-col items-center justify-center pb-[15vh]">
           <div
             class="w-100 h-20 flex items-center justify-center mb-8 rotate-3 p-4"
           >
@@ -316,67 +338,6 @@ const confirmLink = () => {
           >
             有什么我能帮你的吗？
           </h1>
-        </div>
-
-        <!-- Conversation Content -->
-        <div v-else class="mx-auto max-w-[800px] space-y-8">
-          <!-- Project Header -->
-          <div
-            class="rounded-[28px] border border-zinc-100 bg-white p-6 shadow-xl shadow-zinc-200/40 dark:border-zinc-800 dark:bg-zinc-900 dark:shadow-none"
-          >
-            <div class="flex items-center justify-between mb-6">
-              <h2 class="text-xl font-bold truncate pr-4">
-                {{ selectedProject.title }}
-              </h2>
-              <button
-                @click="showVideoDetailModal = true"
-                class="rounded-full bg-zinc-100 px-4 py-2 text-sm font-medium hover:bg-zinc-200 transition-colors dark:bg-zinc-800"
-              >
-                查看视频
-              </button>
-            </div>
-
-            <!-- Messages -->
-            <div class="space-y-6">
-              <div
-                v-for="message in selectedProject.conversation_messages"
-                :key="message.id"
-                class="flex"
-                :class="
-                  message.role === 'user' ? 'justify-end' : 'justify-start'
-                "
-              >
-                <div
-                  class="max-w-[88%] rounded-[24px] px-5 py-3 shadow-sm border"
-                  :class="
-                    message.role === 'user'
-                      ? 'bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 border-zinc-900'
-                      : 'bg-zinc-50 border-zinc-100 dark:bg-zinc-800 dark:border-zinc-700'
-                  "
-                >
-                  <div
-                    class="flex items-center gap-2 text-[11px] font-bold opacity-60 mb-1.5 uppercase tracking-wider"
-                  >
-                    <span>{{ message.role === "user" ? "ME" : "AI" }}</span>
-                    <span>·</span>
-                    <span>{{ getMessageTypeLabel(message.message_type) }}</span>
-                  </div>
-                  <p class="text-[15px] leading-relaxed whitespace-pre-wrap">
-                    {{ message.content }}
-                  </p>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <!-- Task Timeline -->
-          <div
-            v-if="selectedProject.task_steps?.length"
-            class="rounded-[28px] border border-zinc-100 bg-white p-8 shadow-xl shadow-zinc-200/40 dark:border-zinc-800 dark:bg-zinc-900"
-          >
-            <h3 class="text-lg font-bold mb-6">执行进度</h3>
-            <TaskTimeline :tasks="selectedProject.task_steps" />
-          </div>
         </div>
       </div>
 
@@ -413,6 +374,111 @@ const confirmLink = () => {
             </div>
             <form @submit.prevent="handleSend">
               <div class="relative">
+                <!-- Attachments Preview -->
+                <div
+                  v-if="selectedFile || selectedUrls.length"
+                  class="mb-2 flex flex-wrap gap-2 px-1"
+                >
+                  <!-- File Uploading State -->
+                  <div
+                    v-if="selectedFile && uploadProgress < 100"
+                    class="flex items-center gap-3 p-3 bg-zinc-50 border border-zinc-200 dark:bg-zinc-800/50 dark:border-zinc-700 rounded-2xl w-fit pr-8 shadow-sm"
+                  >
+                    <div
+                      class="relative flex items-center justify-center w-10 h-10 rounded-full border border-zinc-200 dark:border-zinc-700 bg-zinc-100 dark:bg-zinc-900 overflow-hidden shrink-0"
+                    >
+                      <span
+                        class="text-[10px] font-bold text-zinc-600 dark:text-zinc-300 relative z-10"
+                        >{{ Math.min(uploadProgress, 99) }}%</span
+                      >
+                      <div
+                        class="absolute bottom-0 left-0 right-0 bg-zinc-300/60 dark:bg-zinc-700 transition-all duration-150"
+                        :style="{ height: `${uploadProgress}%` }"
+                      ></div>
+                    </div>
+                    <div class="flex flex-col min-w-0 pr-2">
+                      <span
+                        class="text-[13px] font-bold text-zinc-700 dark:text-zinc-200 truncate max-w-[200px]"
+                        >{{ selectedFile.name }}</span
+                      >
+                      <span class="text-[11px] text-zinc-500 dark:text-zinc-400"
+                        >处理并上传到云端...</span
+                      >
+                    </div>
+                  </div>
+
+                  <!-- File Preview -->
+                  <div
+                    v-if="selectedFile && uploadProgress >= 100"
+                    class="group relative flex h-16 w-16 items-center justify-center rounded-xl bg-zinc-100 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-700 overflow-hidden shadow-sm"
+                  >
+                    <img
+                      v-if="
+                        selectedFile.type.startsWith('image/') && filePreviewUrl
+                      "
+                      :src="filePreviewUrl"
+                      class="h-full w-full object-cover"
+                    />
+                    <video
+                      v-else-if="
+                        selectedFile.type.startsWith('video/') && filePreviewUrl
+                      "
+                      :src="filePreviewUrl"
+                      class="h-full w-full object-cover"
+                    ></video>
+                    <LucideIcon
+                      v-else
+                      name="File"
+                      class="size-6 text-zinc-400"
+                    />
+
+                    <button
+                      type="button"
+                      @click.prevent="selectedFile = null"
+                      class="absolute right-1 top-1 flex size-5 items-center justify-center rounded-full bg-black/50 text-white opacity-0 transition-opacity hover:bg-black/70 group-hover:opacity-100 backdrop-blur-md"
+                    >
+                      <LucideIcon name="X" class="size-3" />
+                    </button>
+                    <!-- Small title overlay -->
+                    <div
+                      class="absolute inset-x-0 bottom-0 flex h-5 items-end bg-gradient-to-t from-black/60 to-transparent px-1 pb-0.5 opacity-0 transition-opacity group-hover:opacity-100"
+                    >
+                      <span class="w-full truncate text-[9px] text-white/90">{{
+                        selectedFile.name
+                      }}</span>
+                    </div>
+                  </div>
+
+                  <!-- URL Previews -->
+                  <div
+                    v-for="url in selectedUrls"
+                    :key="url"
+                    class="group relative flex h-16 max-w-[200px] shrink-0 items-center gap-2 rounded-xl bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-700 p-2 shadow-sm"
+                  >
+                    <div
+                      class="flex size-10 shrink-0 items-center justify-center rounded-lg bg-zinc-200/50 dark:bg-zinc-700/50"
+                    >
+                      <LucideIcon name="Link" class="size-5 text-zinc-500" />
+                    </div>
+                    <div class="flex flex-col min-w-0 pr-4">
+                      <span
+                        class="truncate text-[11px] font-semibold text-zinc-700 dark:text-zinc-200"
+                        >网页链接</span
+                      >
+                      <span class="truncate text-[10px] text-zinc-500">{{
+                        url
+                      }}</span>
+                    </div>
+                    <button
+                      type="button"
+                      @click.prevent="selectedUrls = []"
+                      class="absolute right-0 top-0 flex size-5 -translate-x-1 translate-y-1 items-center justify-center rounded-full bg-zinc-200 dark:bg-zinc-600 text-zinc-600 dark:text-zinc-300 opacity-0 transition-opacity hover:bg-zinc-300 dark:hover:bg-zinc-500 group-hover:opacity-100"
+                    >
+                      <LucideIcon name="X" class="size-3" />
+                    </button>
+                  </div>
+                </div>
+
                 <!-- Mode Switcher -->
                 <div class="mb-1.5 flex flex-wrap gap-2">
                   <div class="flex items-center text-xs text-muted-foreground">
@@ -469,14 +535,14 @@ const confirmLink = () => {
                 </div>
 
                 <!-- Input Box -->
-                <textarea
+                <Textarea
                   ref="textareaRef"
                   v-model="inputText"
                   placeholder="上传视频文件或粘贴 TikTok 视频链接，然后问我任何问题..."
                   class="flex min-h-[60px] w-full rounded-md border border-input bg-transparent py-2 placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 md:text-sm resize-none overflow-hidden border-none text-sm text-foreground shadow-none focus-visible:ring-0 px-0"
                   rows="2"
                   @keydown.enter.meta.prevent="handleSend"
-                ></textarea>
+                />
 
                 <!-- Actions -->
                 <div class="mt-2 flex items-center justify-between">
@@ -487,7 +553,7 @@ const confirmLink = () => {
                       class="inline-flex items-center justify-center gap-2 whitespace-nowrap font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 bg-secondary text-secondary-foreground shadow-sm hover:bg-secondary/80 h-8 px-3 text-xs rounded-full"
                     >
                       <LucideIcon name="Upload" class="h-3.5 w-3.5" />
-                      上传视频
+                      上传附件
                     </button>
                     <button
                       type="button"
@@ -497,29 +563,6 @@ const confirmLink = () => {
                       <LucideIcon name="Link" class="h-3.5 w-3.5" />
                       添加链接
                     </button>
-
-                    <div
-                      v-if="selectedFile"
-                      class="text-xs font-bold text-blue-600 bg-blue-50 px-2 py-1 rounded-lg flex items-center gap-1 ml-1"
-                    >
-                      {{ selectedFile.name }}
-                      <LucideIcon
-                        name="X"
-                        class="w-3 h-3 cursor-pointer"
-                        @click="selectedFile = null"
-                      />
-                    </div>
-                    <div
-                      v-if="selectedUrls.length"
-                      class="text-xs font-bold text-emerald-600 bg-emerald-50 px-2 py-1 rounded-lg flex items-center gap-1 ml-1"
-                    >
-                      已添加链接
-                      <LucideIcon
-                        name="X"
-                        class="w-3 h-3 cursor-pointer"
-                        @click="selectedUrls = []"
-                      />
-                    </div>
                   </div>
 
                   <button
@@ -546,22 +589,15 @@ const confirmLink = () => {
       </div>
     </main>
 
-    <!-- Detail Drawer Placeholder -->
-    <VideoOverviewDrawer
-      v-model:open="showVideoDetailModal"
-      :project="selectedProject"
-      :videoUrl="resolveAssetUrl(selectedProject?.media_url)"
-    />
-
     <!-- Link Modal -->
     <Dialog v-model:open="showLinkModal">
       <DialogContent
-        class="sm:max-w-[425px] rounded-[32px] border-zinc-100 dark:border-zinc-800 bg-white/80 dark:bg-zinc-900/80 backdrop-blur-xl shadow-2xl"
+        class="sm:max-w-[425px] rounded-[32px] border-zinc-100 bg-white/80 px-6 py-6 shadow-2xl backdrop-blur-xl dark:border-zinc-800 dark:bg-zinc-900/80 sm:px-7 sm:py-7"
       >
-        <DialogHeader>
+        <DialogHeader class="pr-12">
           <DialogTitle class="text-xl font-bold">添加视频链接</DialogTitle>
         </DialogHeader>
-        <div class="py-4">
+        <div class="py-2">
           <input
             v-model="linkDraft"
             type="text"
@@ -569,16 +605,16 @@ const confirmLink = () => {
             placeholder="https://..."
           />
         </div>
-        <DialogFooter>
+        <DialogFooter class="mt-2 gap-3">
           <Button
             variant="outline"
             @click="showLinkModal = false"
-            class="rounded-full px-6"
+            class="h-12 rounded-full px-7"
             >取消</Button
           >
           <Button
             @click="confirmLink"
-            class="rounded-full px-6 bg-zinc-900 text-white dark:bg-white dark:text-zinc-900"
+            class="h-12 rounded-full px-7 bg-zinc-900 text-white dark:bg-white dark:text-zinc-900"
             >确认</Button
           >
         </DialogFooter>

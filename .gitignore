@@ -9,6 +9,11 @@ __pycache__/
 log_files/
 temp_files/
 
+# webpack and other build artifacts
+node_modules/
+dist/
+build/
+
 # Local databases
 *.db
 *.db-shm

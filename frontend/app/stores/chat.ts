@@ -38,6 +38,7 @@ export interface ProjectDetail extends ProjectListItem {
     content_json: Record<string, unknown> | null;
     reply_to_message_id: string | null;
     created_at: string;
+    _thinking?: boolean;
   }>;
   timeline_segments: Array<{
     id: number;

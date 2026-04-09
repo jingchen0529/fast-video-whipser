@@ -106,7 +106,7 @@ useHead({
         <div class="left-top">
           <div class="brand-mark">
             <div class="brand-mark-inner">
-              <img src="/icon.png" alt="Brand Icon" class="brand-icon" />
+              <img src="/favicon.ico" alt="Brand Icon" class="brand-icon" />
             </div>
           </div>
           <span class="brand-name">爆款杀手🥷</span>
@@ -146,7 +146,7 @@ useHead({
           <div class="mobile-logo">
             <div class="mobile-logo-icon">
               <img
-                src="/icon.png"
+                src="/favicon.ico"
                 alt="Mobile Logo"
                 class="mobile-logo-svg"
               />

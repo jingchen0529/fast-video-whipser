@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Request, UploadFile
@@ -11,6 +12,7 @@ from app.services import captcha_service
 from app.utils.file_utils import FileUtils
 
 router = APIRouter()
+COMMON_UPLOADS_DIR = Path("uploads/common")
 
 
 class CaptchaVerifyRequest(BaseModel):
@@ -76,8 +78,8 @@ async def upload_file(
 
     try:
         async with FileUtils(
-            temp_dir=settings.temp_dir,
-            auto_delete=True,
+            temp_dir=str(COMMON_UPLOADS_DIR),
+            auto_delete=False,
             max_file_size=settings.max_file_size,
         ) as file_utils:
             saved_path = await file_utils.save_uploaded_file(file, file_name)
@@ -86,11 +88,14 @@ async def upload_file(
     finally:
         await file.close()
 
+    file_url = f"/uploads/common/{stored_name}"
+
     return build_response(
         request,
         data={
             "original_name": file_name,
             "stored_name": stored_name,
+            "file_url": file_url,
             "content_type": file.content_type or "application/octet-stream",
             "size_bytes": size_bytes,
         },

@@ -1,5 +1,10 @@
+import logging
+import json
 import os
+import re
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from app.http_client import AsyncHttpClient
 from app.services.system_settings_service import SystemSettingsService
@@ -19,19 +24,33 @@ class AnalysisAIService:
         source_analysis: dict[str, Any],
         timeline_segments: list[dict[str, Any]],
         script_overview: dict[str, Any],
+        storyboard: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         system_prompt = (
-            "你是一名擅长 TikTok 电商短视频拆解的高级策略分析师。"
-            "请输出清晰、专业、可执行的 Markdown 分析结果，聚焦钩子、节奏、镜头、脚本结构和转化逻辑。"
+            "你是一名资深的 TikTok 电商短视频策略分析师，擅长拆解具有极高转化率的商业爆款视频。"
+            "你的分析应深入挖掘视频如何通过钩子（Hook）、视觉节奏、脚本结构和转化机制实现转化。"
+            "\n要求："
+            "1. 爆点总结：一句话点出视频的核心优势。"
+            "2. 开头钩子：精准分析前 3 秒如何留人（如：价格震撼、视觉反差、人设吸引）。"
+            "3. 画面与节奏：分析运镜风格、剪辑点与音乐如何配合展示产品。"
+            "4. 脚本结构：将口播/字幕拆解为逻辑段落（如：抛出问题 -> 解决方案 -> 价格优势 -> 信任背书）。"
+            "5. 转化动作：详细描述结尾如何引导用户联系、购买或留言。"
+            "\n输出 Markdown 格式，层级清晰，表达专业。"
         )
         user_prompt = "\n".join(
             [
-                f"分析目标：{objective or '请拆解视频脚本和转化结构'}",
+                f"分析目标：{objective or '请拆解该视频的爆款基因和脚本结构'}",
                 f"素材名称：{source_name}",
-                f"画面特征：{source_analysis}",
-                f"脚本片段：{timeline_segments}",
-                f"脚本概览：{script_overview}",
-                "请输出以下结构：爆点总结、开头钩子分析、画面与节奏分析、脚本结构分析、转化动作分析。",
+                f"画面特征（含视觉提取结果）：{source_analysis}",
+                f"分镜详情（含视觉动作描述）：{storyboard or {'summary': '', 'items': []}}",
+                f"脚本片段（ASR/OCR 结果）：{timeline_segments}",
+                f"脚本全文：{script_overview.get('full_text', '')}",
+                "请输出以下结构的深度分析：\n"
+                "## 爆点总结\n"
+                "## 开头钩子分析\n"
+                "## 画面与节奏分析\n"
+                "## 脚本结构分析\n"
+                "## 转化动作分析\n",
             ]
         )
         fallback_content = self._build_fallback_analysis(
@@ -40,11 +59,55 @@ class AnalysisAIService:
             source_analysis=source_analysis,
             timeline_segments=timeline_segments,
             script_overview=script_overview,
+            storyboard=storyboard,
         )
         return await self._complete_markdown(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             fallback_content=fallback_content,
+        )
+
+    async def generate_storyboard_reply(
+        self,
+        *,
+        objective: str,
+        source_name: str,
+        video_meta: dict[str, Any],
+        shot_segments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        system_prompt = (
+            "你是一名资深的短视频导演和分镜整理师，擅长将零散的镜头素材整理成具有高度叙事感和导购逻辑的分镜脚本。"
+            "你的目标是生成极其详尽、专业、符合 TikTok 电商爆款节奏的分镜 JSON。"
+            "\n要求："
+            "1. 颗粒度：不要简单堆砌原始片段。如果一个片段过长或包含多个关键视觉变化，请在逻辑上拆分为多个分镜（items）。"
+            "2. 视觉描述：必须包含人物、动作、服装、背景环境和关键道具的细节（例如：'一位身穿白色短袖的东亚女性在机床前随着节奏舞动'）。"
+            "3. 镜头语言：准确识别全景(wide)、中景(medium)、特写(close_up)等景别，以及平视(eye_level)、俯视(top_view)等角度。"
+            "4. 商业重点：在视觉描述中突出价格标签、型号展示、联系方式等转化关键点。"
+            "\n输出必须是 JSON 对象，且只返回 JSON，不要附加解释。"
+        )
+        user_prompt = "\n".join(
+            [
+                f"分析目标：{objective or '整理视频分镜，突出爆点和产品卖点'}",
+                f"素材名称：{source_name}",
+                f"视频元信息：{video_meta}",
+                f"输入镜头段（含脚本内容）：{shot_segments}",
+                (
+                    "请输出符合以下示例结构的 JSON："
+                    '{"summary":"...", "items":[{"item_index":1,"title":"开场引入","start_ms":0,"end_ms":5800,'
+                    '"shot_type_code":"wide","camera_angle_code":"eye_level","camera_motion_code":"static",'
+                    '"visual_description":"展示VMC1050 CNC机床，屏幕出现价格$22,000，背景为整洁的工厂车间。","source_segment_indexes":[1],"confidence":0.9}]}.'
+                ),
+            ]
+        )
+        fallback_storyboard = self._build_fallback_storyboard(
+            objective=objective,
+            source_name=source_name,
+            shot_segments=shot_segments,
+        )
+        return await self._complete_json(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            fallback_payload=fallback_storyboard,
         )
 
     async def generate_suggestions_reply(
@@ -122,7 +185,7 @@ class AnalysisAIService:
                 request_timeout=60,
             ) as client:
                 response = await client.fetch_post_json(
-                    f"{base_url.rstrip('/')}/chat/completions",
+                    self._build_chat_completions_url(base_url),
                     json=payload,
                 )
             content = self._extract_message_content(response)
@@ -133,15 +196,15 @@ class AnalysisAIService:
                     "model": provider.get("display_model", DEFAULT_DOUBAO_MODEL_NAME),
                     "used_remote": True,
                 }
-        except Exception:
-            pass
-
-        return {
-            "content": "抱歉，回复生成失败。请检查网络或 AI 模型连接。",
-            "provider": provider.get("provider", "doubao"),
-            "model": provider.get("display_model", DEFAULT_DOUBAO_MODEL_NAME),
-            "used_remote": False,
-        }
+        except Exception as exc:
+            logger.exception("Chat reply failed: provider=%s model=%s url=%s", provider.get("provider"), request_model, base_url)
+            error_detail = str(exc).strip() or "未知错误"
+            return {
+                "content": f"抱歉，回复生成失败：{error_detail}",
+                "provider": provider.get("provider", "doubao"),
+                "model": provider.get("display_model", DEFAULT_DOUBAO_MODEL_NAME),
+                "used_remote": False,
+            }
 
     async def _complete_markdown(
         self,
@@ -188,7 +251,7 @@ class AnalysisAIService:
                 request_timeout=60,
             ) as client:
                 response = await client.fetch_post_json(
-                    f"{base_url.rstrip('/')}/chat/completions",
+                    self._build_chat_completions_url(base_url),
                     json=payload,
                 )
             content = self._extract_message_content(response)
@@ -209,6 +272,73 @@ class AnalysisAIService:
             "used_remote": False,
         }
 
+    async def _complete_json(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        fallback_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        provider = self._resolve_provider()
+        api_key = provider.get("api_key") or ""
+        base_url = provider.get("base_url") or ""
+        request_model = provider.get("request_model") or ""
+
+        if not api_key or not base_url or not request_model:
+            return {
+                "storyboard": fallback_payload,
+                "provider": provider.get("provider", "doubao"),
+                "model": provider.get("display_model", DEFAULT_DOUBAO_MODEL_NAME),
+                "used_remote": False,
+            }
+
+        payload = {
+            "model": request_model,
+            "temperature": 0.2,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                },
+            ],
+        }
+
+        try:
+            async with AsyncHttpClient(
+                follow_redirects=True,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                request_timeout=60,
+            ) as client:
+                response = await client.fetch_post_json(
+                    self._build_chat_completions_url(base_url),
+                    json=payload,
+                )
+            content = self._extract_message_content(response)
+            parsed_payload = self._extract_json_payload(content)
+            if parsed_payload:
+                return {
+                    "storyboard": parsed_payload,
+                    "provider": provider.get("provider", "doubao"),
+                    "model": provider.get("display_model", DEFAULT_DOUBAO_MODEL_NAME),
+                    "used_remote": True,
+                }
+        except Exception:
+            pass
+
+        return {
+            "storyboard": fallback_payload,
+            "provider": provider.get("provider", "doubao"),
+            "model": provider.get("display_model", DEFAULT_DOUBAO_MODEL_NAME),
+            "used_remote": False,
+        }
+
     def _resolve_provider(self) -> dict[str, str]:
         analysis_settings = SystemSettingsService().get_settings()["analysis"]
         providers = analysis_settings.get("providers", [])
@@ -218,25 +348,13 @@ class AnalysisAIService:
             if isinstance(item, dict) and item.get("provider")
         }
 
-        configured = provider_map.get("doubao")
-        if configured and configured.get("enabled"):
-            return {
-                "provider": "doubao",
-                "api_key": configured.get("api_key") or os.getenv("DOUBAO_API_KEY", ""),
-                "base_url": configured.get("base_url") or DEFAULT_DOUBAO_BASE_URL,
-                "request_model": os.getenv("DOUBAO_ENDPOINT_ID", DEFAULT_DOUBAO_ENDPOINT_ID),
-                "display_model": configured.get("default_model") or DEFAULT_DOUBAO_MODEL_NAME,
-            }
-
         default_provider = provider_map.get(analysis_settings.get("default_provider", ""))
-        if default_provider and default_provider.get("enabled"):
-            return {
-                "provider": default_provider.get("provider", "analysis"),
-                "api_key": default_provider.get("api_key") or "",
-                "base_url": default_provider.get("base_url") or "",
-                "request_model": default_provider.get("default_model") or "",
-                "display_model": default_provider.get("default_model") or "",
-            }
+        if default_provider:
+            return self._build_provider_payload(default_provider)
+
+        for item in providers:
+            if isinstance(item, dict) and item.get("api_key"):
+                return self._build_provider_payload(item)
 
         return {
             "provider": "doubao",
@@ -245,6 +363,37 @@ class AnalysisAIService:
             "request_model": os.getenv("DOUBAO_ENDPOINT_ID", DEFAULT_DOUBAO_ENDPOINT_ID),
             "display_model": DEFAULT_DOUBAO_MODEL_NAME,
         }
+
+    def _build_provider_payload(self, provider: dict[str, Any]) -> dict[str, str]:
+        provider_key = str(provider.get("provider") or "analysis")
+        if provider_key == "doubao":
+            configured_model = (provider.get("default_model") or "").strip()
+            return {
+                "provider": "doubao",
+                "api_key": provider.get("api_key") or os.getenv("DOUBAO_API_KEY", ""),
+                "base_url": provider.get("base_url") or DEFAULT_DOUBAO_BASE_URL,
+                "request_model": configured_model or os.getenv("DOUBAO_ENDPOINT_ID", DEFAULT_DOUBAO_ENDPOINT_ID),
+                "display_model": configured_model or DEFAULT_DOUBAO_MODEL_NAME,
+            }
+
+        default_model = provider.get("default_model") or ""
+        return {
+            "provider": provider_key,
+            "api_key": provider.get("api_key") or "",
+            "base_url": provider.get("base_url") or "",
+            "request_model": default_model,
+            "display_model": default_model,
+        }
+
+    def _build_chat_completions_url(self, base_url: str) -> str:
+        normalized = (base_url or "").strip().rstrip("/")
+        if not normalized:
+            return "/chat/completions"
+
+        if normalized.lower().endswith("/chat/completions"):
+            return normalized
+
+        return f"{normalized}/chat/completions"
 
     def _extract_message_content(self, response: dict[str, Any]) -> str:
         choices = response.get("choices") or []
@@ -275,6 +424,7 @@ class AnalysisAIService:
         source_analysis: dict[str, Any],
         timeline_segments: list[dict[str, Any]],
         script_overview: dict[str, Any],
+        storyboard: dict[str, Any] | None,
     ) -> str:
         visual_summary = (
             (source_analysis.get("visual_features") or {}).get("summary")
@@ -282,22 +432,44 @@ class AnalysisAIService:
         )
         hook_segment = timeline_segments[0]["content"] if timeline_segments else "开场直接抛出核心卖点。"
         close_segment = timeline_segments[-1]["content"] if timeline_segments else "结尾用明确行动召唤推动转化。"
+        storyboard_items = (storyboard or {}).get("items") or []
+        storyboard_summary = (storyboard or {}).get("summary") or "分镜结果显示视频通过不同景别和动作切换维持节奏。"
+        
+        # Build Markdown Table for Storyboard
+        storyboard_table = "| # | 时间 | 标题 | 镜头特征 | 画面描述 |\n|---|---|---|---|---|\n"
+        if storyboard_items:
+            for item in storyboard_items[:10]:
+                idx = item.get("item_index", "?")
+                start = item.get("start_ms", 0) / 1000.0
+                end = item.get("end_ms", 0) / 1000.0
+                title = item.get("title", "未命名")
+                shot = f"{item.get('shot_type_code', 'medium')} / {item.get('camera_angle_code', 'eye_level')}"
+                desc = item.get("visual_description", "无描述")
+                storyboard_table += f"| {idx} | {start:.1f}s-{end:.1f}s | {title} | {shot} | {desc} |\n"
+        else:
+            storyboard_table = "当前未生成详细分镜条分。"
+
         return "\n".join(
             [
                 "## 爆点总结",
-                f"这条素材围绕“{objective or source_name}”建立短平快的带货节奏，适合做 TikTok 电商效果拆解。",
+                f"这条素材围绕“{objective or source_name}”建立短平快的带货节奏，通过视觉和文案的双重冲击实现高留存。",
                 "",
                 "## 开头钩子分析",
-                hook_segment,
+                f"**Hook 内容**：{hook_segment}",
+                "前 3 秒快速切入核心利益点，利用强有力的视觉元素引导用户产生后续观看兴趣。",
                 "",
                 "## 画面与节奏分析",
-                visual_summary,
+                f"{visual_summary}\n\n**分镜概览**：{storyboard_summary}",
+                "",
+                "## 详细分镜拆解",
+                storyboard_table,
                 "",
                 "## 脚本结构分析",
-                script_overview.get("full_text") or "当前未识别到完整脚本，建议补充更清晰的视频音轨。",
+                f"**脚本全文**：\n{script_overview.get('full_text') or '未识别到完整脚本'}",
                 "",
                 "## 转化动作分析",
-                close_segment,
+                f"**结尾 Call to Action**：{close_segment}",
+                "通过明确的引导（如联系方式或型号展示）提示用户采取下一步行动。",
             ]
         )
 
@@ -317,3 +489,70 @@ class AnalysisAIService:
                 "5. 在结构上增加一处前后对比或使用反馈，帮助转化逻辑闭环。",
             ]
         )
+
+    def _build_fallback_storyboard(
+        self,
+        *,
+        objective: str,
+        source_name: str,
+        shot_segments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not shot_segments:
+            return {
+                "summary": f"围绕“{objective or source_name}”未检测到可用镜头段，已退回基础分镜结构。",
+                "items": [],
+            }
+
+        items: list[dict[str, Any]] = []
+        for index, segment in enumerate(shot_segments[:8], start=1):
+            items.append(
+                {
+                    "item_index": index,
+                    "title": segment.get("title")
+                    or segment.get("action_hint")
+                    or f"分镜 {index}",
+                    "start_ms": int(segment.get("start_ms") or 0),
+                    "end_ms": int(segment.get("end_ms") or 0),
+                    "shot_type_code": segment.get("shot_type_code") or "medium",
+                    "camera_angle_code": segment.get("camera_angle_code") or "eye_level",
+                    "camera_motion_code": segment.get("camera_motion_code") or "static",
+                    "visual_description": segment.get("visual_summary")
+                    or segment.get("transcript_text")
+                    or segment.get("ocr_text")
+                    or "该镜头以主体展示为主，适合整理为结构化分镜。",
+                    "source_segment_indexes": [int(segment.get("segment_index") or index)],
+                    "confidence": float(segment.get("confidence") or 0.6),
+                }
+            )
+        return {
+            "summary": f"围绕“{objective or source_name}”共整理出 {len(items)} 条可展示分镜。",
+            "items": items,
+        }
+
+    def _extract_json_payload(self, content: str) -> dict[str, Any] | None:
+        normalized = (content or "").strip()
+        if not normalized:
+            return None
+
+        candidates = [normalized]
+        fenced_blocks = re.findall(r"```(?:json)?\s*(.*?)```", normalized, flags=re.S | re.I)
+        candidates.extend(block.strip() for block in fenced_blocks if block.strip())
+
+        for candidate in candidates:
+            try:
+                payload = json.loads(candidate)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict):
+                return payload
+
+        start = normalized.find("{")
+        end = normalized.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                payload = json.loads(normalized[start : end + 1])
+            except json.JSONDecodeError:
+                return None
+            if isinstance(payload, dict):
+                return payload
+        return None

@@ -16,6 +16,13 @@ logger = configure_logging("fast_video_whisper")
 RESERVED_FRONTEND_PATHS = ("api", "docs", "redoc", "openapi.json", "uploads")
 
 
+async def _workflow_executor(*, project_id: int) -> None:
+    """Task queue executor for workflow tasks."""
+    from app.workflows.engine import WorkflowEngine
+    engine = WorkflowEngine()
+    await engine.run(project_id=project_id)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     validate_runtime_settings()
@@ -23,12 +30,26 @@ async def lifespan(app: FastAPI):
     # Ensure uploads directory exists
     uploads_dir = Path("uploads")
     uploads_dir.mkdir(parents=True, exist_ok=True)
+
+    # Import workflows to trigger registration, then start task queue worker
+    import app.workflows  # noqa: F401
+    from app.workflows.task_queue import TaskQueue
+
+    TaskQueue.register_executor("workflow", _workflow_executor)
+    queue = TaskQueue.instance()
+    await queue.start_worker()
+
     logger.info(
         "Starting %s in %s mode",
         settings.app_name,
         settings.environment,
     )
     yield
+    await queue.stop_worker()
+    
+    from app.utils.process_pool import get_process_pool
+    get_process_pool().shutdown(wait=True)
+    
     logger.info("Stopping %s", settings.app_name)
 
 

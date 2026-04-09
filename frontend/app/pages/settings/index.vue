@@ -3,30 +3,34 @@ import { computed, onMounted, ref } from "vue";
 import {
   RefreshCw,
   Save,
-  ShieldCheck,
   UploadCloud,
   CheckCircle2,
   Activity,
-  Type,
   Image as ImageIcon,
+  Cpu,
+  Cloud,
+  Eye,
+  EyeOff,
 } from "lucide-vue-next";
 import { toast } from "vue-sonner";
 
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { notifyError, formatDateTime } from "@/utils/common";
 import type {
   SystemSettingsPayload,
   SystemSettingsProviderConfig,
+  TranscriptionCapabilitiesPayload,
 } from "@/types/api";
 
 definePageMeta({
@@ -36,14 +40,40 @@ definePageMeta({
 
 const api = useApi();
 const auth = useAuth();
+const runtimeConfig = useRuntimeConfig();
 
 const loading = ref(false);
-const savingSection = ref<"general" | "proxy" | "chat" | "video" | null>(null);
+const savingSection = ref<
+  "general" | "proxy" | "chat" | "transcription" | "video" | null
+>(null);
 const testing = ref(false);
 const loadError = ref("");
 const lastSavedAt = ref<string | null>(null);
 const activeTab = ref("general");
 const initialized = ref(false);
+const showChatApiKey = ref(false);
+const showTranscriptionApiKey = ref(false);
+const showVideoApiKey = ref(false);
+
+const createProviderConfig = (
+  overrides: Partial<SystemSettingsProviderConfig> &
+    Pick<SystemSettingsProviderConfig, "provider" | "label">,
+): SystemSettingsProviderConfig => ({
+  provider: overrides.provider,
+  label: overrides.label,
+  enabled: overrides.enabled ?? false,
+  base_url: overrides.base_url ?? "",
+  api_key: overrides.api_key ?? "",
+  default_model: overrides.default_model ?? "",
+  model_options: overrides.model_options ?? [],
+  model_dir: overrides.model_dir ?? "",
+  device: overrides.device ?? "auto",
+  compute_type: overrides.compute_type ?? "auto",
+  language: overrides.language ?? "",
+  prompt: overrides.prompt ?? "",
+  beam_size: overrides.beam_size ?? 5,
+  vad_filter: overrides.vad_filter ?? true,
+});
 
 const createDefaultSettingsState = (): SystemSettingsPayload => ({
   system: {
@@ -61,7 +91,7 @@ const createDefaultSettingsState = (): SystemSettingsPayload => ({
   analysis: {
     default_provider: "openai",
     providers: [
-      {
+      createProviderConfig({
         provider: "openai",
         label: "OpenAI",
         enabled: true,
@@ -69,8 +99,8 @@ const createDefaultSettingsState = (): SystemSettingsPayload => ({
         api_key: "",
         default_model: "gpt-4.1",
         model_options: ["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini"],
-      },
-      {
+      }),
+      createProviderConfig({
         provider: "gemini",
         label: "Gemini",
         enabled: false,
@@ -82,8 +112,8 @@ const createDefaultSettingsState = (): SystemSettingsPayload => ({
           "gemini-2.5-flash",
           "gemini-2.5-flash-lite",
         ],
-      },
-      {
+      }),
+      createProviderConfig({
         provider: "doubao",
         label: "豆包",
         enabled: true,
@@ -96,8 +126,8 @@ const createDefaultSettingsState = (): SystemSettingsPayload => ({
           "doubao-lite",
           "doubao-thinking",
         ],
-      },
-      {
+      }),
+      createProviderConfig({
         provider: "kimi",
         label: "Kimi",
         enabled: false,
@@ -105,8 +135,8 @@ const createDefaultSettingsState = (): SystemSettingsPayload => ({
         api_key: "",
         default_model: "kimi-k2",
         model_options: ["kimi-k2", "kimi-thinking", "moonshot-v1-128k"],
-      },
-      {
+      }),
+      createProviderConfig({
         provider: "qwen",
         label: "千问",
         enabled: false,
@@ -114,8 +144,8 @@ const createDefaultSettingsState = (): SystemSettingsPayload => ({
         api_key: "",
         default_model: "qwen-plus",
         model_options: ["qwen-max", "qwen-plus", "qwen-turbo"],
-      },
-      {
+      }),
+      createProviderConfig({
         provider: "deepseek",
         label: "DeepSeek",
         enabled: false,
@@ -123,33 +153,79 @@ const createDefaultSettingsState = (): SystemSettingsPayload => ({
         api_key: "",
         default_model: "deepseek-chat",
         model_options: ["deepseek-chat", "deepseek-reasoner"],
-      },
-      {
+      }),
+      createProviderConfig({
         provider: "custom",
-        label: "自定义�
-�容服务",
+        label: "自定义兼容服务",
         enabled: false,
         base_url: "",
         api_key: "",
         default_model: "custom-model",
         model_options: ["custom-model"],
-      },
+      }),
+    ],
+  },
+  transcription: {
+    default_provider: "faster_whisper",
+    providers: [
+      createProviderConfig({
+        provider: "faster_whisper",
+        label: "本地 faster-whisper",
+        enabled: true,
+        base_url: "",
+        api_key: "",
+        default_model: "small",
+        model_options: [
+          "tiny",
+          "base",
+          "small",
+          "medium",
+          "large-v3",
+          "large-v3-turbo",
+        ],
+        model_dir: "./models/faster-whisper",
+        device: "auto",
+        compute_type: "auto",
+        language: "",
+        prompt: "",
+        beam_size: 5,
+        vad_filter: true,
+      }),
+      createProviderConfig({
+        provider: "openai_whisper_api",
+        label: "OpenAI Whisper API",
+        enabled: false,
+        base_url: "https://api.openai.com/v1",
+        api_key: "",
+        default_model: "whisper-1",
+        model_options: [
+          "whisper-1",
+          "gpt-4o-mini-transcribe",
+          "gpt-4o-transcribe",
+        ],
+        model_dir: "",
+        device: "server",
+        compute_type: "server",
+        language: "",
+        prompt: "",
+        beam_size: 5,
+        vad_filter: true,
+      }),
     ],
   },
   remake: {
     default_provider: "doubao",
     providers: [
-      {
+      createProviderConfig({
         provider: "doubao",
-        label: "豆�
-",
+        label: "豆包",
         enabled: true,
         base_url: "",
         api_key: "",
         default_model: "seedance-pro",
         model_options: ["seedance-pro", "seedance-lite"],
-      },
-      {
+      }),
+      createProviderConfig({
         provider: "kling",
         label: "可灵",
         enabled: false,
@@ -157,8 +233,8 @@ const createDefaultSettingsState = (): SystemSettingsPayload => ({
         api_key: "",
         default_model: "kling-v1",
         model_options: ["kling-v1", "kling-master"],
-      },
-      {
+      }),
+      createProviderConfig({
         provider: "veo",
         label: "Veo",
         enabled: false,
@@ -166,8 +242,8 @@ const createDefaultSettingsState = (): SystemSettingsPayload => ({
         api_key: "",
         default_model: "veo-3",
         model_options: ["veo-3", "veo-2"],
-      },
-      {
+      }),
+      createProviderConfig({
         provider: "wanxiang",
         label: "万相",
         enabled: false,
@@ -175,8 +251,8 @@ const createDefaultSettingsState = (): SystemSettingsPayload => ({
         api_key: "",
         default_model: "wanx-video",
         model_options: ["wanx-video", "wanx-image-to-video"],
-      },
-      {
+      }),
+      createProviderConfig({
         provider: "custom",
         label: "自定义视频模型",
         enabled: false,
@@ -184,7 +260,7 @@ const createDefaultSettingsState = (): SystemSettingsPayload => ({
         api_key: "",
         default_model: "custom-video-model",
         model_options: ["custom-video-model"],
-      },
+      }),
     ],
   },
 });
@@ -222,11 +298,30 @@ const mergeProviderGroup = (
   };
 };
 
+type ProviderGroupKey = "analysis" | "transcription" | "remake";
+type ProviderBooleanField = "enabled" | "vad_filter";
+
+const ensureDefaultProviderEnabled = (
+  payload: SystemSettingsPayload,
+  groupKey: ProviderGroupKey,
+) => {
+  const group = payload[groupKey];
+  const defaultProviderKey = group?.default_provider;
+  if (!group || !defaultProviderKey) return;
+
+  const target = group.providers.find(
+    (provider) => provider.provider === defaultProviderKey,
+  );
+  if (target) {
+    target.enabled = true;
+  }
+};
+
 const normalizeSettingsPayload = (
   payload?: Partial<SystemSettingsPayload> | null,
 ): SystemSettingsPayload => {
   const defaults = createDefaultSettingsState();
-  return {
+  const result: SystemSettingsPayload = {
     system: {
       ...defaults.system,
       ...(payload?.system || {}),
@@ -236,14 +331,188 @@ const normalizeSettingsPayload = (
       ...(payload?.proxy || {}),
     },
     analysis: mergeProviderGroup(defaults.analysis, payload?.analysis),
+    transcription: mergeProviderGroup(
+      defaults.transcription,
+      payload?.transcription,
+    ),
     remake: mergeProviderGroup(defaults.remake, payload?.remake),
   };
+
+  // 强制启用所有默认 provider，避免数据库中残留的 enabled=false 导致功能不可用
+  ensureDefaultProviderEnabled(result, "analysis");
+  ensureDefaultProviderEnabled(result, "transcription");
+  ensureDefaultProviderEnabled(result, "remake");
+
+  return result;
 };
 
 const formState = ref<SystemSettingsPayload>(createDefaultSettingsState());
 
 const selectedChatProvider = ref<string>("openai");
+const selectedTranscriptionProvider = ref<string>("faster_whisper");
 const selectedVideoProvider = ref<string>("doubao");
+const transcriptionCapabilities = ref<TranscriptionCapabilitiesPayload | null>(
+  null,
+);
+const transcriptionCapabilitiesLoading = ref(false);
+const transcriptionCapabilitiesError = ref("");
+const transcriptionCapabilitiesAvailable = ref<boolean | null>(null);
+
+const currentChatProvider = computed(
+  () =>
+    formState.value.analysis?.providers?.find(
+      (p) => p.provider === selectedChatProvider.value,
+    ) || null,
+);
+
+const selectedDefaultChatProvider = computed({
+  get: () =>
+    formState.value.analysis?.default_provider ||
+    selectedChatProvider.value ||
+    "openai",
+  set: (provider: string) => {
+    if (!formState.value.analysis) return;
+    formState.value.analysis.default_provider = provider;
+    selectedChatProvider.value = provider;
+    updateProviderBooleanField("analysis", provider, "enabled", true);
+  },
+});
+
+const currentTranscriptionProvider = computed(
+  () =>
+    formState.value.transcription?.providers?.find(
+      (p) => p.provider === selectedTranscriptionProvider.value,
+    ) || null,
+);
+
+const currentVideoProvider = computed(
+  () =>
+    formState.value.remake?.providers?.find(
+      (p) => p.provider === selectedVideoProvider.value,
+    ) || null,
+);
+
+const currentTranscriptionCapability = computed(() => {
+  if (!transcriptionCapabilities.value) return null;
+  return (
+    transcriptionCapabilities.value.providers?.[
+      selectedTranscriptionProvider.value as keyof TranscriptionCapabilitiesPayload["providers"]
+    ] || null
+  );
+});
+
+const updateProviderBooleanField = (
+  groupKey: ProviderGroupKey,
+  providerKey: string,
+  field: ProviderBooleanField,
+  checked: boolean,
+) => {
+  const group = formState.value[groupKey];
+  const target = group?.providers?.find(
+    (provider) => provider.provider === providerKey,
+  );
+  if (!target) return;
+  target[field] = checked;
+};
+
+const currentTranscriptionIssues = computed(() => {
+  const issues = currentTranscriptionCapability.value?.issues;
+  return Array.isArray(issues) ? issues : [];
+});
+
+const fasterWhisperCapability = computed(
+  () => transcriptionCapabilities.value?.providers?.faster_whisper || null,
+);
+
+const openAIWhisperCapability = computed(
+  () => transcriptionCapabilities.value?.providers?.openai_whisper_api || null,
+);
+
+const pickExistingProvider = (
+  providers: SystemSettingsPayload["analysis"]["providers"] | undefined,
+  preferred: string | null | undefined,
+  fallback: string,
+) => {
+  if (!Array.isArray(providers) || !providers.length) return fallback;
+  if (preferred && providers.some((item) => item.provider === preferred)) {
+    return preferred;
+  }
+  return providers[0]?.provider || fallback;
+};
+
+const syncSelectedProviders = (
+  mode: "current-first" | "default-first" = "current-first",
+) => {
+  const preferredChatProvider =
+    mode === "default-first"
+      ? formState.value.analysis?.default_provider || selectedChatProvider.value
+      : selectedChatProvider.value ||
+        formState.value.analysis?.default_provider;
+  const preferredTranscriptionProvider =
+    mode === "default-first"
+      ? formState.value.transcription?.default_provider ||
+        selectedTranscriptionProvider.value
+      : selectedTranscriptionProvider.value ||
+        formState.value.transcription?.default_provider;
+  const preferredVideoProvider =
+    mode === "default-first"
+      ? formState.value.remake?.default_provider || selectedVideoProvider.value
+      : selectedVideoProvider.value || formState.value.remake?.default_provider;
+
+  selectedChatProvider.value = pickExistingProvider(
+    formState.value.analysis?.providers,
+    preferredChatProvider,
+    "openai",
+  );
+  selectedTranscriptionProvider.value = pickExistingProvider(
+    formState.value.transcription?.providers,
+    preferredTranscriptionProvider,
+    "faster_whisper",
+  );
+  selectedVideoProvider.value = pickExistingProvider(
+    formState.value.remake?.providers,
+    preferredVideoProvider,
+    "doubao",
+  );
+};
+
+const isAbsoluteAssetUrl = (value: string) =>
+  /^(https?:)?\/\//.test(value) ||
+  value.startsWith("data:") ||
+  value.startsWith("blob:");
+
+const resolveAssetUrl = (rawUrl?: string | null) => {
+  const normalized = `${rawUrl || ""}`.trim();
+  if (!normalized) return "";
+  if (isAbsoluteAssetUrl(normalized)) return normalized;
+
+  const apiBase = `${runtimeConfig.public.apiBase || ""}`.trim();
+  let origin = "";
+
+  if (import.meta.client) {
+    try {
+      origin = apiBase
+        ? new URL(apiBase, window.location.origin).origin
+        : window.location.origin;
+    } catch {
+      origin = window.location.origin;
+    }
+  }
+
+  if (!origin) {
+    return normalized.startsWith("/") ? normalized : `/${normalized}`;
+  }
+
+  try {
+    return new URL(normalized, `${origin}/`).toString();
+  } catch {
+    return normalized.startsWith("/") ? normalized : `/${normalized}`;
+  }
+};
+
+const resolvedSystemLogoUrl = computed(() =>
+  resolveAssetUrl(formState.value.system?.logo_url),
+);
 
 const proxyHost = computed({
   get: () => {
@@ -279,39 +548,14 @@ const proxyPort = computed({
 const canUpdate = computed(() => {
   const currentUser = auth.user.value;
   if (!currentUser) return false;
+  const permissions = Array.isArray(currentUser.permissions)
+    ? currentUser.permissions
+    : [];
   return (
     currentUser.is_superuser ||
-    currentUser.permissions.some((item) => item.code === "settings.update")
+    permissions.some((item) => item?.code === "settings.update")
   );
 });
-
-const getModelOptionsText = (provider: SystemSettingsProviderConfig) => {
-  if (!provider || !provider.model_options) return "";
-  const options = [...provider.model_options];
-  const defaultModel = (provider.default_model || "").trim();
-  if (defaultModel && !options.includes(defaultModel)) {
-    options.unshift(defaultModel);
-  }
-  return options.join("\n");
-};
-
-const handleModelOptionsInput = (
-  provider: SystemSettingsProviderConfig,
-  event: Event,
-) => {
-  if (!provider) return;
-  const target = event.target as HTMLTextAreaElement | null;
-  const value = target?.value || "";
-  provider.model_options = Array.from(
-    new Set(
-      value
-        .replace(/,/g, "\n")
-        .split(/\r?\n/)
-        .map((item) => item.trim())
-        .filter(Boolean),
-    ),
-  );
-};
 
 const normalizeLoadErrorMessage = (error: unknown) => {
   const message = api.normalizeError(error);
@@ -323,6 +567,17 @@ const normalizeLoadErrorMessage = (error: unknown) => {
   }
   if (message.includes("Not Found")) {
     return "当前后端进程还没有加载系统设置接口，请重启后端服务后再试。";
+  }
+  return message;
+};
+
+const normalizeTranscriptionCapabilitiesErrorMessage = (error: unknown) => {
+  const message = api.normalizeError(error);
+  if (message.includes("Method Not Allowed")) {
+    return "当前后端还不支持转写能力检测接口，请重启后端后再试。";
+  }
+  if (message.includes("Not Found") || message.includes("404")) {
+    return "当前后端进程还没有加载转写能力检测接口，请重启后端服务后再试。";
   }
   return message;
 };
@@ -343,47 +598,76 @@ const testConnection = async () => {
   }
 };
 
+const refreshTranscriptionCapabilities = async (manual = false) => {
+  transcriptionCapabilitiesLoading.value = true;
+  transcriptionCapabilitiesError.value = "";
+  try {
+    const data = await api.post<TranscriptionCapabilitiesPayload>(
+      "/settings/transcription/capabilities",
+      normalizeSettingsPayload(JSON.parse(JSON.stringify(formState.value))),
+    );
+    transcriptionCapabilities.value = data;
+    transcriptionCapabilitiesAvailable.value = true;
+    if (manual) {
+      toast.success("本地转写能力已刷新");
+    }
+  } catch (error) {
+    transcriptionCapabilitiesAvailable.value = false;
+    transcriptionCapabilitiesError.value =
+      normalizeTranscriptionCapabilitiesErrorMessage(error);
+    if (manual) {
+      notifyError(api, error, "刷新转写能力失败");
+    }
+  } finally {
+    transcriptionCapabilitiesLoading.value = false;
+  }
+};
+
 const loadSettings = async (manual = false) => {
   loading.value = true;
   loadError.value = "";
   try {
     const data = await api.get<SystemSettingsPayload>("/settings");
     formState.value = normalizeSettingsPayload(data);
-    selectedChatProvider.value =
-      formState.value.analysis?.default_provider ||
-      formState.value.analysis?.providers?.[0]?.provider ||
-      "openai";
-    selectedVideoProvider.value =
-      formState.value.remake?.default_provider ||
-      formState.value.remake?.providers?.[0]?.provider ||
-      "doubao";
+    syncSelectedProviders("default-first");
     lastSavedAt.value = new Date().toISOString();
     initialized.value = true;
     if (manual) toast.success("设置已刷新");
   } catch (error) {
     loadError.value = normalizeLoadErrorMessage(error);
     formState.value = normalizeSettingsPayload(formState.value);
+    syncSelectedProviders();
     initialized.value = true;
-    notifyError(api, error, "无法加载系统�
-�置");
+    notifyError(api, error, "无法加载系统设置");
   } finally {
     loading.value = false;
   }
 };
 
 const saveSettings = async (
-  section: "general" | "proxy" | "chat" | "video",
+  section: "general" | "proxy" | "chat" | "transcription" | "video",
   label: string,
 ) => {
   if (!formState.value || !canUpdate.value || savingSection.value) return;
 
   savingSection.value = section;
   try {
-    const data = await api.patch<SystemSettingsPayload>(
-      "/settings",
-      normalizeSettingsPayload(JSON.parse(JSON.stringify(formState.value))),
+    const payload = normalizeSettingsPayload(
+      JSON.parse(JSON.stringify(formState.value)),
     );
+    if (section === "chat") {
+      ensureDefaultProviderEnabled(payload, "analysis");
+    }
+    if (section === "transcription") {
+      ensureDefaultProviderEnabled(payload, "transcription");
+    }
+    if (section === "video") {
+      ensureDefaultProviderEnabled(payload, "remake");
+    }
+
+    const data = await api.patch<SystemSettingsPayload>("/settings", payload);
     formState.value = normalizeSettingsPayload(data);
+    syncSelectedProviders();
     lastSavedAt.value = new Date().toISOString();
     toast.success(`${label}保存成功`);
   } catch (error) {
@@ -415,14 +699,15 @@ const handleLogoFile = async (event: Event) => {
   formData.append("file", file);
 
   try {
-    const res = await api.post<{ stored_name: string }>(
+    const res = await api.post<{ stored_name: string; file_url?: string }>(
       "/common/upload",
       formData,
     );
     if (formState.value.system) {
-      formState.value.system.logo_url = `/uploads/${res.stored_name}`;
+      formState.value.system.logo_url =
+        res.file_url || `/uploads/common/${res.stored_name}`;
     }
-    toast.success("Logo 上传成功");
+    toast.success("Logo 上传成功，记得保存通用设置");
   } catch (error) {
     notifyError(api, error, "Logo 上传失败");
   } finally {
@@ -445,7 +730,7 @@ onMounted(async () => {
     >
       <div class="flex flex-col items-center gap-4">
         <RefreshCw class="size-10 text-zinc-200 animate-spin" />
-        <span class="text-zinc-400 font-medium">� �置同步中...</span>
+        <span class="text-zinc-400 font-medium">设置同步中...</span>
       </div>
     </div>
 
@@ -456,14 +741,14 @@ onMounted(async () => {
       >
         <div class="space-y-1">
           <p class="font-bold">
-            设置数据未完� �从后端加载，当前� �展示本地� �底� �置
+            设置数据未能从后端加载，当前仅展示本地兜底配置
           </p>
           <p>{{ loadError }}</p>
         </div>
         <Button
           variant="outline"
           class="rounded-xl border-amber-300 bg-white text-amber-700 hover:bg-amber-100"
-          @click="() => loadSettings(true)"
+          @click="loadSettings(true)"
         >
           重试
         </Button>
@@ -471,32 +756,38 @@ onMounted(async () => {
       <!-- Only render Tabs if system config is actually present to prevent sub-property access errors -->
       <Tabs v-if="formState.system" v-model="activeTab" class="w-full">
         <div
-          class="mb-8 rounded-xl border border-zinc-200 bg-white p-1 dark:border-zinc-800 dark:bg-zinc-950"
+          class="mb-8 rounded-lg border border-zinc-200 bg-zinc-50/80 p-0.5 dark:border-zinc-800 dark:bg-zinc-900/60"
         >
           <TabsList
-            class="flex h-11 w-full gap-1 bg-transparent p-0 border-none"
+            class="flex h-9 w-full gap-0.5 bg-transparent p-0 border-none"
           >
             <TabsTrigger
               value="general"
-              class="h-full flex-1 rounded-lg border bg-white text-sm font-semibold text-zinc-900 transition-colors data-[state=active]:border-zinc-900 data-[state=active]:bg-zinc-900 data-[state=active]:text-white dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100 dark:data-[state=active]:border-zinc-100 dark:data-[state=active]:bg-zinc-100 dark:data-[state=active]:text-zinc-950"
+              class="h-full flex-1 rounded-md border border-transparent bg-transparent px-3 text-[13px] font-medium text-zinc-600 transition-colors hover:text-zinc-900 data-[state=active]:border-zinc-900 data-[state=active]:bg-zinc-900 data-[state=active]:text-white dark:text-zinc-400 dark:hover:text-zinc-100 dark:data-[state=active]:border-zinc-900 dark:data-[state=active]:bg-zinc-900 dark:data-[state=active]:text-white"
             >
-              通用� �置
+              通用设置
             </TabsTrigger>
             <TabsTrigger
               value="proxy"
-              class="h-full flex-1 rounded-lg border bg-white text-sm font-semibold text-zinc-900 transition-colors data-[state=active]:border-zinc-900 data-[state=active]:bg-zinc-900 data-[state=active]:text-white dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100 dark:data-[state=active]:border-zinc-100 dark:data-[state=active]:bg-zinc-100 dark:data-[state=active]:text-zinc-950"
+              class="h-full flex-1 rounded-md border border-transparent bg-transparent px-3 text-[13px] font-medium text-zinc-600 transition-colors hover:text-zinc-900 data-[state=active]:border-zinc-900 data-[state=active]:bg-zinc-900 data-[state=active]:text-white dark:text-zinc-400 dark:hover:text-zinc-100 dark:data-[state=active]:border-zinc-900 dark:data-[state=active]:bg-zinc-900 dark:data-[state=active]:text-white"
             >
               网络代理
             </TabsTrigger>
             <TabsTrigger
               value="chat"
-              class="h-full flex-1 rounded-lg border bg-white text-sm font-semibold text-zinc-900 transition-colors data-[state=active]:border-zinc-900 data-[state=active]:bg-zinc-900 data-[state=active]:text-white dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100 dark:data-[state=active]:border-zinc-100 dark:data-[state=active]:bg-zinc-100 dark:data-[state=active]:text-zinc-950"
+              class="h-full flex-1 rounded-md border border-transparent bg-transparent px-3 text-[13px] font-medium text-zinc-600 transition-colors hover:text-zinc-900 data-[state=active]:border-zinc-900 data-[state=active]:bg-zinc-900 data-[state=active]:text-white dark:text-zinc-400 dark:hover:text-zinc-100 dark:data-[state=active]:border-zinc-900 dark:data-[state=active]:bg-zinc-900 dark:data-[state=active]:text-white"
             >
               模型后端
             </TabsTrigger>
             <TabsTrigger
+              value="transcription"
+              class="h-full flex-1 rounded-md border border-transparent bg-transparent px-3 text-[13px] font-medium text-zinc-600 transition-colors hover:text-zinc-900 data-[state=active]:border-zinc-900 data-[state=active]:bg-zinc-900 data-[state=active]:text-white dark:text-zinc-400 dark:hover:text-zinc-100 dark:data-[state=active]:border-zinc-900 dark:data-[state=active]:bg-zinc-900 dark:data-[state=active]:text-white"
+            >
+              Whisper 配置
+            </TabsTrigger>
+            <TabsTrigger
               value="video"
-              class="h-full flex-1 rounded-lg border bg-white text-sm font-semibold text-zinc-900 transition-colors data-[state=active]:border-zinc-900 data-[state=active]:bg-zinc-900 data-[state=active]:text-white dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100 dark:data-[state=active]:border-zinc-100 dark:data-[state=active]:bg-zinc-100 dark:data-[state=active]:text-zinc-950"
+              class="h-full flex-1 rounded-md border border-transparent bg-transparent px-3 text-[13px] font-medium text-zinc-600 transition-colors hover:text-zinc-900 data-[state=active]:border-zinc-900 data-[state=active]:bg-zinc-900 data-[state=active]:text-white dark:text-zinc-400 dark:hover:text-zinc-100 dark:data-[state=active]:border-zinc-900 dark:data-[state=active]:bg-zinc-900 dark:data-[state=active]:text-white"
             >
               视频引擎
             </TabsTrigger>
@@ -526,8 +817,8 @@ onMounted(async () => {
                       :disabled="uploadingLogo"
                     >
                       <img
-                        v-if="formState.system.logo_url"
-                        :src="formState.system.logo_url"
+                        v-if="resolvedSystemLogoUrl"
+                        :src="resolvedSystemLogoUrl"
                         class="h-full w-full object-contain p-2"
                       />
                       <ImageIcon
@@ -549,8 +840,18 @@ onMounted(async () => {
                       <p class="text-xs text-zinc-500">
                         建议使用正方形、透明底的纯色或渐变色图标。
                       </p>
+                      <p class="text-xs text-zinc-400">
+                        上传后会先预览，保存通用设置后正式生效。
+                      </p>
                     </div>
                   </div>
+                  <input
+                    ref="fileInputRef"
+                    type="file"
+                    class="hidden"
+                    accept="image/png,image/jpeg,image/webp,image/gif,image/x-icon,image/vnd.microsoft.icon,image/svg+xml"
+                    @change="handleLogoFile"
+                  />
                 </div>
 
                 <!-- Name -->
@@ -572,8 +873,7 @@ onMounted(async () => {
                   >
                   <textarea
                     v-model="formState.system.description"
-                    placeholder="�
-�于该平台的简短描述"
+                    placeholder="适用于该平台的简短描述"
                     class="min-h-[124px] w-full rounded-lg border border-zinc-200 bg-white px-4 py-3 text-sm outline-none transition-colors dark:border-zinc-800 dark:bg-zinc-950"
                   />
                 </div>
@@ -601,8 +901,7 @@ onMounted(async () => {
                   <Button
                     class="h-8 min-w-8 rounded-md border border-zinc-900 bg-zinc-900 px-3 text-xs font-medium text-white shadow-none duration-200 ease-linear hover:bg-zinc-900/90 active:bg-zinc-900/90 dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-100/90 dark:active:bg-zinc-100/90"
                     :disabled="!canUpdate || !!savingSection || loading"
-                    @click="saveSettings('general', '通用�
-�置')"
+                    @click="saveSettings('general', '通用设置')"
                   >
                     <Save
                       :class="[
@@ -611,8 +910,7 @@ onMounted(async () => {
                       ]"
                     />
                     {{
-                      savingSection === "general" ? "保存中..." : "保存通用�
-�置"
+                      savingSection === "general" ? "保存中..." : "保存通用设置"
                     }}
                   </Button>
                 </div>
@@ -643,16 +941,14 @@ onMounted(async () => {
                       @update:checked="
                         (val: boolean) => {
                           formState.proxy.enabled = val;
-                          if (!val) saveSettings('proxy', '代理�
-�局开�
-�');
+                          if (!val) saveSettings('proxy', '代理全局开关');
                         }
                       "
                       class="data-[state=checked]:bg-zinc-900 dark:data-[state=checked]:bg-zinc-100"
                     />
                   </div>
                   <p class="text-xs text-zinc-500 ml-1">
-                    设置系统级别的网络出口代理链路� �局总开� �。
+                    设置系统级别的网络出口代理链路全局总开关。
                   </p>
                 </div>
 
@@ -703,7 +999,7 @@ onMounted(async () => {
                   <p
                     class="text-sm font-semibold text-zinc-900 dark:text-zinc-100"
                   >
-                    保存代理� �置
+                    保存代理配置
                   </p>
                   <p class="text-xs text-zinc-500">
                     代理参数修改后只按此按钮局部保存。
@@ -739,154 +1035,562 @@ onMounted(async () => {
           <Card
             class="rounded-xl border-zinc-200 bg-white shadow-none dark:border-zinc-800 dark:bg-zinc-950"
           >
-            <CardContent class="flex flex-col px-4">
-              <div class="flex flex-col gap-6 pt-4">
-                <!-- Selects -->
-                <div class="grid gap-4 md:grid-cols-2">
-                  <div class="space-y-2">
-                    <label class="text-[12px] font-bold text-zinc-400 ml-1"
-                      >选择平台</label
+            <CardContent class="flex flex-col gap-6 px-4 pt-4">
+              <!-- 选择平台 -->
+              <div class="space-y-2">
+                <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                  >默认 AI 对话模型</label
+                >
+                <Select v-model="selectedDefaultChatProvider">
+                  <SelectTrigger
+                    class="h-11 w-full rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                  >
+                    <SelectValue placeholder="选择默认 AI 对话模型" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem
+                      v-for="p in formState.analysis.providers"
+                      :key="p.provider"
+                      :value="p.provider"
                     >
-                    <select
-                      v-model="selectedChatProvider"
-                      class="block h-11 w-full rounded-lg border border-zinc-200 bg-white px-4 text-sm font-semibold text-zinc-900 outline-none shadow-none dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100"
-                    >
-                      <option
-                        v-for="p in formState.analysis.providers"
-                        :key="p.provider"
-                        :value="p.provider"
-                      >
-                        {{ p.label }}
-                      </option>
-                    </select>
-                  </div>
-                  <div class="space-y-2">
-                    <label class="text-[12px] font-bold text-zinc-400 ml-1"
-                      >默认引擎</label
-                    >
-                    <select
-                      v-model="formState.analysis.default_provider"
-                      class="block h-11 w-full rounded-lg border border-zinc-200 bg-white px-4 text-sm font-semibold text-zinc-900 outline-none shadow-none dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100"
-                    >
-                      <option
-                        v-for="p in formState.analysis.providers"
-                        :key="p.provider"
-                        :value="p.provider"
-                      >
-                        {{ p.label }}
-                      </option>
-                    </select>
-                  </div>
+                      {{ p.label }}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+                <p class="text-xs text-zinc-500 ml-1">
+                  这里切换后，保存配置会直接更新当前生效的 AI 对话模型。
+                </p>
+              </div>
+
+              <template v-if="currentChatProvider">
+                <!-- Model -->
+                <div class="space-y-2">
+                  <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                    >Model</label
+                  >
+                  <Input
+                    v-model="currentChatProvider.default_model"
+                    placeholder="填写模型名称，如 gpt-4.1"
+                    class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                  />
                 </div>
 
-                <template
-                  v-for="provider in formState.analysis.providers"
-                  :key="provider.provider"
-                >
-                  <div
-                    v-if="selectedChatProvider === provider.provider"
-                    class="flex flex-col gap-6 pt-2"
+                <!-- API Base Endpoint -->
+                <div class="space-y-2">
+                  <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                    >API Base Endpoint</label
                   >
-                    <!-- Enable Switch -->
-                    <div class="space-y-2">
-                      <div class="flex items-center justify-between">
-                        <label class="text-[12px] font-bold text-zinc-400 ml-1"
-                          >启用 {{ provider.label }}</label
-                        >
-                        <Switch
-                          v-model:checked="provider.enabled"
-                          class="data-[state=checked]:bg-zinc-900 dark:data-[state=checked]:bg-zinc-100"
-                        />
-                      </div>
-                      <p class="text-xs text-zinc-500 ml-1">
-                        开启后该平台接口可在对话与分析工作流中被调度。
+                  <Input
+                    v-model="currentChatProvider.base_url"
+                    placeholder="填写接口地址，如 https://api.openai.com/v1"
+                    class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                  />
+                </div>
+
+                <!-- API Key -->
+                <div class="space-y-2">
+                  <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                    >API Key</label
+                  >
+                  <div class="relative">
+                    <Input
+                      v-model="currentChatProvider.api_key"
+                      :type="showChatApiKey ? 'text' : 'password'"
+                      placeholder="填写密钥"
+                      class="h-11 rounded-lg border-zinc-200 bg-white px-4 pr-12 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                    />
+                    <button
+                      type="button"
+                      class="absolute inset-y-0 right-0 flex w-11 items-center justify-center text-zinc-400 transition-colors hover:text-zinc-700 dark:hover:text-zinc-200"
+                      @click="showChatApiKey = !showChatApiKey"
+                    >
+                      <EyeOff v-if="showChatApiKey" class="size-4" />
+                      <Eye v-else class="size-4" />
+                    </button>
+                  </div>
+                </div>
+              </template>
+
+              <!-- Footer -->
+              <div
+                class="flex items-center justify-end pt-4 border-t border-zinc-200 dark:border-zinc-800"
+              >
+                <Button
+                  class="h-8 min-w-8 rounded-md border border-zinc-900 bg-zinc-900 px-3 text-xs font-medium text-white shadow-none duration-200 ease-linear hover:bg-zinc-900/90 active:bg-zinc-900/90 dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-100/90 dark:active:bg-zinc-100/90"
+                  :disabled="!canUpdate || !!savingSection || loading"
+                  @click="saveSettings('chat', '模型后端配置')"
+                >
+                  <Save
+                    :class="[
+                      'mr-1.5 size-3.5',
+                      savingSection === 'chat' && 'animate-pulse',
+                    ]"
+                  />
+                  {{ savingSection === "chat" ? "保存中..." : "保存模型配置" }}
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <!-- Transcription Tab -->
+        <TabsContent
+          v-if="formState.transcription"
+          value="transcription"
+          class="space-y-6 focus-visible:outline-none"
+        >
+          <Card
+            class="rounded-xl border-zinc-200 bg-white shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+          >
+            <CardContent class="flex flex-col gap-6 px-4 pt-4">
+              <div
+                class="rounded-xl border border-zinc-200 bg-zinc-50/80 p-4 dark:border-zinc-800 dark:bg-zinc-900/60"
+              >
+                <div class="flex items-start justify-between gap-4">
+                  <div class="space-y-1">
+                    <p
+                      class="text-sm font-semibold text-zinc-900 dark:text-zinc-100"
+                    >
+                      转写引擎运行时检测
+                    </p>
+                    <p class="text-xs text-zinc-500">
+                      基于当前表单配置预览本地依赖、模型目录和 OpenAI
+                      接口可用项。
+                    </p>
+                  </div>
+                  <Button
+                    variant="outline"
+                    class="h-8 rounded-md px-3 text-xs"
+                    :disabled="transcriptionCapabilitiesLoading"
+                    @click="refreshTranscriptionCapabilities(true)"
+                  >
+                    <RefreshCw
+                      :class="[
+                        'mr-1.5 size-3.5',
+                        transcriptionCapabilitiesLoading && 'animate-spin',
+                      ]"
+                    />
+                    {{
+                      transcriptionCapabilitiesLoading
+                        ? "检测中..."
+                        : "刷新检测"
+                    }}
+                  </Button>
+                </div>
+
+                <p
+                  v-if="transcriptionCapabilitiesError"
+                  class="mt-3 text-xs text-red-500"
+                >
+                  {{ transcriptionCapabilitiesError }}
+                </p>
+              </div>
+
+              <div class="space-y-2">
+                <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                  >默认转写引擎</label
+                >
+                <Select v-model="formState.transcription.default_provider">
+                  <SelectTrigger
+                    class="h-11 w-full rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                  >
+                    <SelectValue placeholder="选择默认转写引擎" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem
+                      v-for="p in formState.transcription.providers"
+                      :key="p.provider"
+                      :value="p.provider"
+                    >
+                      {{ p.label }}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div class="space-y-2">
+                <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                  >编辑配置</label
+                >
+                <Select v-model="selectedTranscriptionProvider">
+                  <SelectTrigger
+                    class="h-11 w-full rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                  >
+                    <SelectValue placeholder="选择转写提供方" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem
+                      v-for="p in formState.transcription.providers"
+                      :key="p.provider"
+                      :value="p.provider"
+                    >
+                      {{ p.label }}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <template v-if="currentTranscriptionProvider">
+                <div
+                  v-if="currentTranscriptionCapability"
+                  class="rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950"
+                >
+                  <div class="flex items-center gap-2">
+                    <Cpu
+                      v-if="selectedTranscriptionProvider === 'faster_whisper'"
+                      class="size-4 text-zinc-500"
+                    />
+                    <Cloud v-else class="size-4 text-zinc-500" />
+                    <p
+                      class="text-sm font-semibold text-zinc-900 dark:text-zinc-100"
+                    >
+                      {{
+                        selectedTranscriptionProvider === "faster_whisper"
+                          ? "本地能力检测"
+                          : "OpenAI 接口检测"
+                      }}
+                    </p>
+                  </div>
+
+                  <div
+                    v-if="selectedTranscriptionProvider === 'faster_whisper'"
+                    class="mt-4 space-y-4"
+                  >
+                    <div class="flex flex-wrap gap-2">
+                      <span
+                        v-for="(
+                          dep, depName
+                        ) in fasterWhisperCapability?.dependency_status || {}"
+                        :key="depName"
+                        class="rounded-full px-2.5 py-1 text-[11px] font-medium"
+                        :class="
+                          dep.installed
+                            ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400'
+                            : 'bg-red-50 text-red-700 dark:bg-red-950/40 dark:text-red-400'
+                        "
+                      >
+                        {{ depName }} · {{ dep.installed ? "已安装" : "缺失" }}
+                      </span>
+                    </div>
+
+                    <div class="flex flex-wrap gap-2">
+                      <span
+                        class="rounded-full px-2.5 py-1 text-[11px] font-medium"
+                        :class="
+                          fasterWhisperCapability?.binary_status?.ffmpeg
+                            ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400'
+                            : 'bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300'
+                        "
+                      >
+                        ffmpeg ·
+                        {{
+                          fasterWhisperCapability?.binary_status?.ffmpeg
+                            ? "可用"
+                            : "未检测到"
+                        }}
+                      </span>
+                      <span
+                        class="rounded-full px-2.5 py-1 text-[11px] font-medium"
+                        :class="
+                          fasterWhisperCapability?.binary_status?.ffprobe
+                            ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400'
+                            : 'bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300'
+                        "
+                      >
+                        ffprobe ·
+                        {{
+                          fasterWhisperCapability?.binary_status?.ffprobe
+                            ? "可用"
+                            : "未检测到"
+                        }}
+                      </span>
+                    </div>
+
+                    <div class="space-y-1">
+                      <p class="text-xs font-semibold text-zinc-500">
+                        本地模型目录
+                      </p>
+                      <p
+                        class="text-xs text-zinc-600 dark:text-zinc-300 break-all"
+                      >
+                        {{ fasterWhisperCapability?.model_dir || "未设置" }}
+                      </p>
+                      <p class="text-xs text-zinc-500">
+                        检测到
+                        {{
+                          fasterWhisperCapability?.local_models?.length || 0
+                        }}
+                        个本地模型，推荐设备：
+                        {{
+                          fasterWhisperCapability?.recommended_device || "cpu"
+                        }}
                       </p>
                     </div>
 
                     <div
-                      :class="[
-                        'flex flex-col gap-6 transition-opacity duration-200',
-                        !provider.enabled
-                          ? 'opacity-40 pointer-events-none'
-                          : '',
-                      ]"
+                      v-if="fasterWhisperCapability?.local_models?.length"
+                      class="space-y-2"
                     >
-                      <div class="grid gap-6 md:grid-cols-2">
-                        <div class="space-y-2">
-                          <label
-                            class="text-[12px] font-bold text-zinc-400 ml-1"
-                            >API Base Endpoint</label
-                          >
-                          <Input
-                            v-model="provider.base_url"
-                            class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
-                          />
-                        </div>
-                        <div class="space-y-2">
-                          <label
-                            class="text-[12px] font-bold text-zinc-400 ml-1"
-                            >Preferred Model</label
-                          >
-                          <Input
-                            v-model="provider.default_model"
-                            class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
-                          />
-                        </div>
-                      </div>
-
-                      <div class="space-y-2">
-                        <label class="text-[12px] font-bold text-zinc-400 ml-1"
-                          >Secret Authentication Key</label
+                      <p class="text-xs font-semibold text-zinc-500">
+                        已发现本地模型
+                      </p>
+                      <div class="flex flex-wrap gap-2">
+                        <span
+                          v-for="model in fasterWhisperCapability?.local_models ||
+                          []"
+                          :key="model.path"
+                          class="rounded-full bg-zinc-100 px-2.5 py-1 text-[11px] text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
                         >
-                        <Input
-                          v-model="provider.api_key"
-                          type="password"
-                          class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
-                        />
-                      </div>
-                      <div class="space-y-2">
-                        <label class="text-[12px] font-bold text-zinc-400 ml-1"
-                          >Model Availability Pool</label
-                        >
-                        <textarea
-                          :value="getModelOptionsText(provider)"
-                          @input="handleModelOptionsInput(provider, $event)"
-                          class="min-h-[100px] w-full rounded-lg border border-zinc-200 bg-white px-4 py-3 font-mono text-sm outline-none transition-colors dark:border-zinc-800 dark:bg-zinc-950"
-                        />
+                          {{ model.name }}
+                        </span>
                       </div>
                     </div>
                   </div>
-                </template>
-              </div>
 
-              <!-- Footer Buttons -->
-              <div
-                class="flex items-center justify-between gap-5 pt-4 dark:border-zinc-800"
-              >
-                <div
-                  class="flex items-center gap-1.5 w-fit rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-800 dark:border-emerald-900/30 dark:bg-emerald-950/50 dark:text-emerald-500"
-                >
-                  <CheckCircle2 class="size-3.5" />
-                  后端服务：Ready
-                </div>
+                  <div v-else class="mt-4 space-y-3">
+                    <p class="text-xs text-zinc-500">
+                      单文件大小限制约
+                      {{
+                        openAIWhisperCapability?.file_size_limit_mb
+                      }}MB，支持格式：
+                      {{
+                        openAIWhisperCapability?.supported_formats?.join(", ")
+                      }}
+                    </p>
+                    <div class="flex flex-wrap gap-2">
+                      <span
+                        v-for="issue in openAIWhisperCapability?.issues || []"
+                        :key="issue"
+                        class="rounded-full bg-amber-50 px-2.5 py-1 text-[11px] text-amber-700 dark:bg-amber-950/30 dark:text-amber-300"
+                      >
+                        {{ issue }}
+                      </span>
+                    </div>
+                  </div>
 
-                <div class="flex items-center gap-2">
-                  <Button
-                    class="h-8 min-w-8 rounded-md border border-zinc-900 bg-zinc-900 px-3 text-xs font-medium text-white shadow-none duration-200 ease-linear hover:bg-zinc-900/90 active:bg-zinc-900/90 dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-100/90 dark:active:bg-zinc-100/90"
-                    :disabled="!canUpdate || !!savingSection || loading"
-                    @click="saveSettings('chat', '模型后端配置')"
+                  <div
+                    v-if="currentTranscriptionIssues.length"
+                    class="mt-4 space-y-1"
                   >
-                    <Save
-                      :class="[
-                        'mr-1.5 size-3.5',
-                        savingSection === 'chat' && 'animate-pulse',
-                      ]"
-                    />
-                    {{
-                      savingSection === "chat" ? "保存中..." : "保存模型配置"
-                    }}
-                  </Button>
+                    <p class="text-xs font-semibold text-zinc-500">提醒</p>
+                    <p
+                      v-for="issue in currentTranscriptionIssues"
+                      :key="issue"
+                      class="text-xs text-zinc-600 dark:text-zinc-300"
+                    >
+                      {{ issue }}
+                    </p>
+                  </div>
                 </div>
+
+                <div class="space-y-2">
+                  <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                    >默认模型</label
+                  >
+                  <Input
+                    v-model="currentTranscriptionProvider.default_model"
+                    placeholder="例如 whisper-1 / small / large-v3"
+                    class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                  />
+                  <p class="text-xs text-zinc-500 ml-1">
+                    {{
+                      selectedTranscriptionProvider === "faster_whisper"
+                        ? "可填写标准模型名，若本地目录存在同名模型则优先使用本地模型。"
+                        : "推荐默认使用 whisper-1；如需兼容新模型，也可以直接手填。"
+                    }}
+                  </p>
+                </div>
+
+                <div
+                  v-if="selectedTranscriptionProvider === 'faster_whisper'"
+                  class="space-y-6"
+                >
+                  <div class="space-y-2">
+                    <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                      >本地模型目录</label
+                    >
+                    <Input
+                      v-model="currentTranscriptionProvider.model_dir"
+                      placeholder="例如 ./models/faster-whisper"
+                      class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                    />
+                  </div>
+
+                  <div class="grid gap-4 md:grid-cols-2">
+                    <div class="space-y-2">
+                      <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                        >运行设备</label
+                      >
+                      <Select v-model="currentTranscriptionProvider.device">
+                        <SelectTrigger
+                          class="h-11 w-full rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                        >
+                          <SelectValue placeholder="选择设备" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem
+                            v-for="device in fasterWhisperCapability?.available_devices || [
+                              'auto',
+                              'cpu',
+                            ]"
+                            :key="device"
+                            :value="device"
+                          >
+                            {{ device }}
+                          </SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    <div class="space-y-2">
+                      <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                        >计算精度</label
+                      >
+                      <Select
+                        v-model="currentTranscriptionProvider.compute_type"
+                      >
+                        <SelectTrigger
+                          class="h-11 w-full rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                        >
+                          <SelectValue placeholder="选择精度" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem
+                            v-for="computeType in fasterWhisperCapability?.available_compute_types || [
+                              'auto',
+                              'default',
+                              'int8',
+                              'float16',
+                            ]"
+                            :key="computeType"
+                            :value="computeType"
+                          >
+                            {{ computeType }}
+                          </SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+                </div>
+
+                <div v-else class="space-y-6">
+                  <div class="space-y-2">
+                    <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                      >API Base Endpoint</label
+                    >
+                    <Input
+                      v-model="currentTranscriptionProvider.base_url"
+                      placeholder="填写接口地址，如 https://api.openai.com/v1"
+                      class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                    />
+                  </div>
+
+                  <div class="space-y-2">
+                    <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                      >API Key</label
+                    >
+                    <div class="relative">
+                      <Input
+                        v-model="currentTranscriptionProvider.api_key"
+                        :type="showTranscriptionApiKey ? 'text' : 'password'"
+                        placeholder="填写 OpenAI API Key"
+                        class="h-11 rounded-lg border-zinc-200 bg-white px-4 pr-12 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                      />
+                      <button
+                        type="button"
+                        class="absolute inset-y-0 right-0 flex w-11 items-center justify-center text-zinc-400 transition-colors hover:text-zinc-700 dark:hover:text-zinc-200"
+                        @click="
+                          showTranscriptionApiKey = !showTranscriptionApiKey
+                        "
+                      >
+                        <EyeOff v-if="showTranscriptionApiKey" class="size-4" />
+                        <Eye v-else class="size-4" />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="grid gap-4 md:grid-cols-2">
+                  <div class="space-y-2">
+                    <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                      >语言提示</label
+                    >
+                    <Input
+                      v-model="currentTranscriptionProvider.language"
+                      placeholder="留空自动识别，例如 zh / en"
+                      class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                    />
+                  </div>
+
+                  <div class="space-y-2">
+                    <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                      >Beam Size</label
+                    >
+                    <Input
+                      v-model="currentTranscriptionProvider.beam_size"
+                      type="number"
+                      min="1"
+                      class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                    />
+                  </div>
+                </div>
+
+                <div class="space-y-2">
+                  <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                    >初始 Prompt</label
+                  >
+                  <textarea
+                    v-model="currentTranscriptionProvider.prompt"
+                    placeholder="可选：给转写器一些术语、品牌名或语言风格提示"
+                    class="min-h-[110px] w-full rounded-lg border border-zinc-200 bg-white px-4 py-3 text-sm outline-none transition-colors dark:border-zinc-800 dark:bg-zinc-950"
+                  />
+                </div>
+
+                <div class="space-y-2">
+                  <div class="flex items-center justify-between">
+                    <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                      >启用 VAD 过滤</label
+                    >
+                    <Switch
+                      :checked="currentTranscriptionProvider.vad_filter"
+                      @update:checked="
+                        (checked: boolean) =>
+                          updateProviderBooleanField(
+                            'transcription',
+                            currentTranscriptionProvider!.provider,
+                            'vad_filter',
+                            checked,
+                          )
+                      "
+                      class="data-[state=checked]:bg-zinc-900 dark:data-[state=checked]:bg-zinc-100"
+                    />
+                  </div>
+                  <p class="text-xs text-zinc-500 ml-1">
+                    对本地 faster-whisper 更有帮助，可过滤长静音片段。
+                  </p>
+                </div>
+              </template>
+
+              <div
+                class="flex items-center justify-end pt-4 border-t border-zinc-200 dark:border-zinc-800"
+              >
+                <Button
+                  class="h-8 min-w-8 rounded-md border border-zinc-900 bg-zinc-900 px-3 text-xs font-medium text-white shadow-none duration-200 ease-linear hover:bg-zinc-900/90 active:bg-zinc-900/90 dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-100/90 dark:active:bg-zinc-100/90"
+                  :disabled="!canUpdate || !!savingSection || loading"
+                  @click="saveSettings('transcription', 'Whisper 配置')"
+                >
+                  <Save
+                    :class="[
+                      'mr-1.5 size-3.5',
+                      savingSection === 'transcription' && 'animate-pulse',
+                    ]"
+                  />
+                  {{
+                    savingSection === "transcription"
+                      ? "保存中..."
+                      : "保存 Whisper 配置"
+                  }}
+                </Button>
               </div>
             </CardContent>
           </Card>
@@ -901,154 +1605,96 @@ onMounted(async () => {
           <Card
             class="rounded-xl border-zinc-200 bg-white shadow-none dark:border-zinc-800 dark:bg-zinc-950"
           >
-            <CardContent class="flex flex-col px-4">
-              <div class="flex flex-col gap-6 pt-4">
-                <!-- Selects -->
-                <div class="grid gap-4 md:grid-cols-2">
-                  <div class="space-y-2">
-                    <label class="text-[12px] font-bold text-zinc-400 ml-1"
-                      >选择平台</label
-                    >
-                    <select
-                      v-model="selectedVideoProvider"
-                      class="block h-11 w-full rounded-lg border border-zinc-200 bg-white px-4 text-sm font-semibold text-zinc-900 outline-none shadow-none dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100"
-                    >
-                      <option
-                        v-for="p in formState.remake.providers"
-                        :key="p.provider"
-                        :value="p.provider"
-                      >
-                        {{ p.label }}
-                      </option>
-                    </select>
-                  </div>
-                  <div class="space-y-2">
-                    <label class="text-[12px] font-bold text-zinc-400 ml-1"
-                      >活动引擎</label
-                    >
-                    <select
-                      v-model="formState.remake.default_provider"
-                      class="block h-11 w-full rounded-lg border border-zinc-200 bg-white px-4 text-sm font-semibold text-zinc-900 outline-none shadow-none dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100"
-                    >
-                      <option
-                        v-for="p in formState.remake.providers"
-                        :key="p.provider"
-                        :value="p.provider"
-                      >
-                        {{ p.label }}
-                      </option>
-                    </select>
-                  </div>
-                </div>
-
-                <template
-                  v-for="provider in formState.remake.providers"
-                  :key="provider.provider"
+            <CardContent class="flex flex-col gap-6 px-4 pt-4">
+              <!-- 选择平台 -->
+              <div class="space-y-2">
+                <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                  >选择平台</label
                 >
-                  <div
-                    v-if="selectedVideoProvider === provider.provider"
-                    class="flex flex-col gap-6 pt-2"
+                <Select v-model="selectedVideoProvider">
+                  <SelectTrigger
+                    class="h-11 w-full rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
                   >
-                    <!-- Enable Switch -->
-                    <div class="space-y-2">
-                      <div class="flex items-center justify-between">
-                        <label class="text-[12px] font-bold text-zinc-400 ml-1"
-                          >启用 {{ provider.label }}</label
-                        >
-                        <Switch
-                          v-model:checked="provider.enabled"
-                          class="data-[state=checked]:bg-zinc-900 dark:data-[state=checked]:bg-zinc-100"
-                        />
-                      </div>
-                      <p class="text-xs text-zinc-500 ml-1">
-                        开启后该平台接口可在视频生成工作流中被调度。
-                      </p>
-                    </div>
-
-                    <div
-                      :class="[
-                        'flex flex-col gap-6 transition-opacity duration-200',
-                        !provider.enabled
-                          ? 'opacity-40 pointer-events-none'
-                          : '',
-                      ]"
+                    <SelectValue placeholder="选择平台" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem
+                      v-for="p in formState.remake.providers"
+                      :key="p.provider"
+                      :value="p.provider"
                     >
-                      <div class="grid gap-6 md:grid-cols-2">
-                        <div class="space-y-2">
-                          <label
-                            class="text-[12px] font-bold text-zinc-400 ml-1"
-                            >Endpoint URL</label
-                          >
-                          <Input
-                            v-model="provider.base_url"
-                            class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
-                          />
-                        </div>
-                        <div class="space-y-2">
-                          <label
-                            class="text-[12px] font-bold text-zinc-400 ml-1"
-                            >Engine Version</label
-                          >
-                          <Input
-                            v-model="provider.default_model"
-                            class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
-                          />
-                        </div>
-                      </div>
-
-                      <div class="space-y-2">
-                        <label class="text-[12px] font-bold text-zinc-400 ml-1"
-                          >Authentication Credentials</label
-                        >
-                        <Input
-                          v-model="provider.api_key"
-                          type="password"
-                          class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
-                        />
-                      </div>
-                      <div class="space-y-2">
-                        <label class="text-[12px] font-bold text-zinc-400 ml-1"
-                          >Capability Matrix (Models)</label
-                        >
-                        <textarea
-                          :value="getModelOptionsText(provider)"
-                          @input="handleModelOptionsInput(provider, $event)"
-                          class="min-h-[100px] w-full rounded-lg border border-zinc-200 bg-white px-4 py-3 font-mono text-sm outline-none transition-colors dark:border-zinc-800 dark:bg-zinc-950"
-                        />
-                      </div>
-                    </div>
-                  </div>
-                </template>
+                      {{ p.label }}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
 
-              <!-- Footer Buttons -->
-              <div
-                class="flex items-center justify-between gap-5 pt-4 dark:border-zinc-800"
-              >
-                <div
-                  class="flex items-center gap-1.5 w-fit rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-800 dark:border-emerald-900/30 dark:bg-emerald-950/50 dark:text-emerald-500"
-                >
-                  <CheckCircle2 class="size-3.5" />
-                  后端服务：Ready
+              <template v-if="currentVideoProvider">
+                <!-- Model -->
+                <div class="space-y-2">
+                  <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                    >Model</label
+                  >
+                  <Input
+                    v-model="currentVideoProvider.default_model"
+                    placeholder="填写模型名称，如 seedance-pro"
+                    class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                  />
                 </div>
 
-                <div class="flex items-center gap-2">
-                  <Button
-                    class="h-8 min-w-8 rounded-md border border-zinc-900 bg-zinc-900 px-3 text-xs font-medium text-white shadow-none duration-200 ease-linear hover:bg-zinc-900/90 active:bg-zinc-900/90 dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-100/90 dark:active:bg-zinc-100/90"
-                    :disabled="!canUpdate || !!savingSection || loading"
-                    @click="saveSettings('video', '视频引擎配置')"
+                <!-- API Base Endpoint -->
+                <div class="space-y-2">
+                  <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                    >API Base Endpoint</label
                   >
-                    <Save
-                      :class="[
-                        'mr-1.5 size-3.5',
-                        savingSection === 'video' && 'animate-pulse',
-                      ]"
-                    />
-                    {{
-                      savingSection === "video" ? "保存中..." : "保存视频配置"
-                    }}
-                  </Button>
+                  <Input
+                    v-model="currentVideoProvider.base_url"
+                    placeholder="填写接口地址"
+                    class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                  />
                 </div>
+
+                <!-- API Key -->
+                <div class="space-y-2">
+                  <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                    >API Key</label
+                  >
+                  <div class="relative">
+                    <Input
+                      v-model="currentVideoProvider.api_key"
+                      :type="showVideoApiKey ? 'text' : 'password'"
+                      placeholder="填写密钥"
+                      class="h-11 rounded-lg border-zinc-200 bg-white px-4 pr-12 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                    />
+                    <button
+                      type="button"
+                      class="absolute inset-y-0 right-0 flex w-11 items-center justify-center text-zinc-400 transition-colors hover:text-zinc-700 dark:hover:text-zinc-200"
+                      @click="showVideoApiKey = !showVideoApiKey"
+                    >
+                      <EyeOff v-if="showVideoApiKey" class="size-4" />
+                      <Eye v-else class="size-4" />
+                    </button>
+                  </div>
+                </div>
+              </template>
+
+              <!-- Footer -->
+              <div
+                class="flex items-center justify-end pt-4 border-t border-zinc-200 dark:border-zinc-800"
+              >
+                <Button
+                  class="h-8 min-w-8 rounded-md border border-zinc-900 bg-zinc-900 px-3 text-xs font-medium text-white shadow-none duration-200 ease-linear hover:bg-zinc-900/90 active:bg-zinc-900/90 dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-100/90 dark:active:bg-zinc-100/90"
+                  :disabled="!canUpdate || !!savingSection || loading"
+                  @click="saveSettings('video', '视频引擎配置')"
+                >
+                  <Save
+                    :class="[
+                      'mr-1.5 size-3.5',
+                      savingSection === 'video' && 'animate-pulse',
+                    ]"
+                  />
+                  {{ savingSection === "video" ? "保存中..." : "保存视频配置" }}
+                </Button>
               </div>
             </CardContent>
           </Card>
@@ -1073,7 +1719,7 @@ onMounted(async () => {
         <p class="text-sm text-red-500/80 mt-1 max-w-sm">{{ loadError }}</p>
       </div>
       <Button
-        @click="() => loadSettings()"
+        @click="loadSettings()"
         variant="outline"
         class="rounded-2xl h-11 px-10 font-bold border-red-200 hover:bg-red-50 text-red-600"
       >
@@ -1084,17 +1730,7 @@ onMounted(async () => {
 </template>
 
 <style scoped>
-/* Remove focus outline for a cleaner look */
 div[role="tabpanel"] {
   @apply outline-none;
-}
-
-select {
-  appearance: none;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%23ccc'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'%3E%3C/path%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 0.75rem center;
-  background-size: 0.9rem;
-  padding-right: 2.25rem;
 }
 </style>

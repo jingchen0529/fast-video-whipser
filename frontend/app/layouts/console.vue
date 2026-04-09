@@ -31,13 +31,21 @@ const currentTitle = computed(() => {
         <header
           class="flex h-14 items-center justify-between px-4 border-b border-zinc-200 dark:border-zinc-800 bg-[#ffffff] dark:bg-[#171717] sticky top-0 z-10 transition-colors duration-200"
         >
-          <div class="flex items-center gap-3">
+          <div class="flex items-center gap-3 min-w-0 flex-1">
             <SidebarTrigger />
-            <div class="h-4 w-[1px] bg-zinc-200 dark:bg-zinc-700 mx-1" />
-            <span class="text-sm font-semibold transition-colors duration-200">{{
-              currentTitle
-            }}</span>
+            <div
+              v-if="!route.path.startsWith('/video/history')"
+              class="h-4 w-[1px] shrink-0 bg-zinc-200 dark:bg-zinc-700 mx-1"
+            ></div>
+            <span
+              v-if="!route.path.startsWith('/video/history')"
+              class="text-sm font-semibold shrink-0 transition-colors duration-200"
+            >
+              {{ currentTitle }}
+            </span>
+            <div id="header-portal" class="flex items-center gap-3 flex-1 min-w-0"></div>
           </div>
+          <div id="header-actions" class="flex items-center shrink-0 gap-2"></div>
         </header>
         <main class="flex-1 overflow-auto bg-[#ffffff] dark:bg-[#171717] transition-colors duration-200">
           <slot />

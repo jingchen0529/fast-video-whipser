@@ -9,7 +9,7 @@ import LoadingOverlay from "@/components/custom/LoadingOverlay.vue";
     <NuxtRouteAnnouncer />
     <LoadingOverlay />
     <NuxtLayout>
-      <NuxtPage />
+      <NuxtPage :key="$route.fullPath" />
     </NuxtLayout>
     <ClientOnly>
       <Toaster rich-colors position="top-right" close-button />

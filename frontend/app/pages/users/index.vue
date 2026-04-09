@@ -196,7 +196,7 @@ onMounted(async () => {
                     variant="ghost"
                     size="icon"
                     class="size-8 rounded-full border border-zinc-200"
-                    @click="() => loadData(true)"
+                    @click="loadData(true)"
                   >
                     <RefreshCw
                       :class="[

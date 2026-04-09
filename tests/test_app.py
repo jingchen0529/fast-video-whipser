@@ -94,6 +94,7 @@ def test_upload_file(tmp_path) -> None:
         assert body["code"] == 200
         assert body["router"] == "/common/upload"
         assert body["data"]["original_name"] == "sample.txt"
+        assert body["data"]["file_url"].startswith("/uploads/common/")
         assert body["data"]["size_bytes"] == 11
 
 

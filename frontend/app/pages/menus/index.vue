@@ -147,7 +147,7 @@ onMounted(async () => {
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger as-child>
-                  <Button variant="ghost" size="icon" class="size-8 rounded-full border border-zinc-200" @click="() => loadData(true)">
+                  <Button variant="ghost" size="icon" class="size-8 rounded-full border border-zinc-200" @click="loadData(true)">
                     <RefreshCw :class="['size-4 text-zinc-500', loading && 'animate-spin']" />
                   </Button>
                 </TooltipTrigger>
