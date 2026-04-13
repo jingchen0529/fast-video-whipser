@@ -16,6 +16,36 @@ DEFAULT_DOUBAO_MODEL_NAME = "doubao-seed-1-6-250615"
 
 
 class AnalysisAIService:
+    async def generate_motion_tags_reply(
+        self,
+        *,
+        source_name: str,
+        candidate: dict[str, Any],
+        fallback_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        system_prompt = (
+            "你是一名短视频动作资产标注专家，擅长把镜头片段整理成结构化动作标签。"
+            "请根据镜头描述、转写文本、运镜和景别，输出严格 JSON。"
+            "如果信息不足，请保守判断，不要编造具体人物身份。"
+        )
+        user_prompt = "\n".join(
+            [
+                f"素材名称：{source_name}",
+                f"片段信息：{candidate}",
+                (
+                    "请只输出 JSON，字段必须包含："
+                    '{"action_label":"","entrance_style":"","emotion_label":"","temperament_label":"",'
+                    '"scene_label":"","camera_motion":"","camera_shot":"","action_summary":"",'
+                    '"confidence":0.0,"is_high_value":true}'
+                ),
+            ]
+        )
+        return await self._complete_payload_json(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            fallback_payload=fallback_payload,
+        )
+
     async def generate_analysis_reply(
         self,
         *,
@@ -334,6 +364,73 @@ class AnalysisAIService:
 
         return {
             "storyboard": fallback_payload,
+            "provider": provider.get("provider", "doubao"),
+            "model": provider.get("display_model", DEFAULT_DOUBAO_MODEL_NAME),
+            "used_remote": False,
+        }
+
+    async def _complete_payload_json(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        fallback_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        provider = self._resolve_provider()
+        api_key = provider.get("api_key") or ""
+        base_url = provider.get("base_url") or ""
+        request_model = provider.get("request_model") or ""
+
+        if not api_key or not base_url or not request_model:
+            return {
+                "payload": fallback_payload,
+                "provider": provider.get("provider", "doubao"),
+                "model": provider.get("display_model", DEFAULT_DOUBAO_MODEL_NAME),
+                "used_remote": False,
+            }
+
+        payload = {
+            "model": request_model,
+            "temperature": 0.2,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                },
+            ],
+        }
+
+        try:
+            async with AsyncHttpClient(
+                follow_redirects=True,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                request_timeout=60,
+            ) as client:
+                response = await client.fetch_post_json(
+                    self._build_chat_completions_url(base_url),
+                    json=payload,
+                )
+            content = self._extract_message_content(response)
+            parsed_payload = self._extract_json_payload(content)
+            if parsed_payload:
+                return {
+                    "payload": parsed_payload,
+                    "provider": provider.get("provider", "doubao"),
+                    "model": provider.get("display_model", DEFAULT_DOUBAO_MODEL_NAME),
+                    "used_remote": True,
+                }
+        except Exception:
+            pass
+
+        return {
+            "payload": fallback_payload,
             "provider": provider.get("provider", "doubao"),
             "model": provider.get("display_model", DEFAULT_DOUBAO_MODEL_NAME),
             "used_remote": False,

@@ -229,10 +229,10 @@ const createDefaultSettingsState = (): SystemSettingsPayload => ({
         provider: "kling",
         label: "可灵",
         enabled: false,
-        base_url: "",
+        base_url: "https://api-beijing.klingai.com",
         api_key: "",
-        default_model: "kling-v1",
-        model_options: ["kling-v1", "kling-master"],
+        default_model: "kling-v3",
+        model_options: ["kling-v3", "kling-v3-omni", "kling-video-o1", "kling-v2-6"],
       }),
       createProviderConfig({
         provider: "veo",
@@ -240,8 +240,14 @@ const createDefaultSettingsState = (): SystemSettingsPayload => ({
         enabled: false,
         base_url: "",
         api_key: "",
-        default_model: "veo-3",
-        model_options: ["veo-3", "veo-2"],
+        default_model: "veo-3.0-generate-001",
+        model_options: [
+          "veo-3.0-generate-001",
+          "veo-3.0-fast-generate-001",
+          "veo-3.1-generate-001",
+          "veo-3.1-fast-generate-001",
+          "veo-2.0-generate-001",
+        ],
       }),
       createProviderConfig({
         provider: "wanxiang",
@@ -392,6 +398,54 @@ const currentVideoProvider = computed(
     ) || null,
 );
 
+const videoBaseUrlPlaceholder = computed(() => {
+  switch (currentVideoProvider.value?.provider) {
+    case "doubao":
+      return "留空则使用默认地址；若走方舟请填 https://ark.cn-beijing.volces.com/api/v3";
+    case "kling":
+      return "默认可用北京域名，海外可改为新加坡域名";
+    case "veo":
+      return "填写完整 Vertex AI publisher model endpoint";
+    default:
+      return "填写接口地址";
+  }
+});
+
+const videoBaseUrlHint = computed(() => {
+  switch (currentVideoProvider.value?.provider) {
+    case "doubao":
+      return "豆包默认走 https://operator.las.cn-beijing.volces.com。若使用方舟/ARK，请只填写 https://ark.cn-beijing.volces.com/api/v3";
+    case "kling":
+      return "可灵默认走 https://api-beijing.klingai.com，若你的服务部署在海外，请改成官方海外域名。";
+    case "veo":
+      return "Veo 需要完整的 publisher model endpoint，后端会自动拼接 :predictLongRunning 和 :fetchPredictOperation。";
+    default:
+      return "";
+  }
+});
+
+const videoApiKeyPlaceholder = computed(() => {
+  switch (currentVideoProvider.value?.provider) {
+    case "kling":
+      return "填写 Bearer Token，或 AccessKey:SecretKey";
+    case "veo":
+      return "填写 Google Cloud OAuth Bearer Token";
+    default:
+      return "填写密钥";
+  }
+});
+
+const videoApiKeyHint = computed(() => {
+  switch (currentVideoProvider.value?.provider) {
+    case "kling":
+      return "可灵支持直接填短期 Bearer Token，也支持填 AccessKey:SecretKey 由后端临时生成 JWT。";
+    case "veo":
+      return "Veo 使用 Google Cloud OAuth 令牌；如果不指定 output_storage_uri，后端会优先接收内联 bytes 结果并直接入库。";
+    default:
+      return "";
+  }
+});
+
 const currentTranscriptionCapability = computed(() => {
   if (!transcriptionCapabilities.value) return null;
   return (
@@ -514,48 +568,90 @@ const resolvedSystemLogoUrl = computed(() =>
   resolveAssetUrl(formState.value.system?.logo_url),
 );
 
+const canUpdate = computed(() => {
+  const currentUser = auth.user.value;
+  if (!currentUser) return false;
+  return currentUser.is_superuser;
+});
+
+const getProxySourceUrl = () =>
+  `${formState.value.proxy?.http_url || formState.value.proxy?.https_url || formState.value.proxy?.all_url || ""}`.trim();
+
+const parseProxyEndpoint = (rawValue: string) => {
+  const value = `${rawValue || ""}`.trim();
+  if (!value) {
+    return {
+      host: "",
+      port: "",
+    };
+  }
+
+  const candidate = value.includes("://") ? value : `http://${value}`;
+
+  try {
+    const url = new URL(candidate);
+    return {
+      host: url.hostname,
+      port: url.port,
+    };
+  } catch {
+    const withoutProtocol = value.replace(/^[a-z]+:\/\//i, "");
+    const [hostPort = ""] = withoutProtocol.split("/");
+    const lastColonIndex = hostPort.lastIndexOf(":");
+
+    if (lastColonIndex === -1) {
+      return {
+        host: hostPort,
+        port: "",
+      };
+    }
+
+    return {
+      host: hostPort.slice(0, lastColonIndex),
+      port: hostPort.slice(lastColonIndex + 1),
+    };
+  }
+};
+
+const updateProxyEndpoint = (host: string, port: string) => {
+  const normalizedHost = host.trim();
+  const normalizedPort = port.trim();
+  const endpoint = normalizedHost
+    ? `http://${normalizedHost}${normalizedPort ? `:${normalizedPort}` : ""}`
+    : "";
+
+  formState.value.proxy.http_url = endpoint;
+  formState.value.proxy.https_url = endpoint;
+  formState.value.proxy.all_url = "";
+};
+
 const proxyHost = computed({
-  get: () => {
-    const raw = formState.value.proxy?.http_url || "";
-    const withoutProtocol = raw.replace(/^https?:\/\//, "");
-    return withoutProtocol.split(":")[0] || "";
-  },
-  set: (val) => {
-    if (!formState.value.proxy) return;
-    const port = proxyPort.value;
-    formState.value.proxy.http_url = val
-      ? `http://${val}${port ? ":" + port : ""}`
-      : "";
+  get: () => parseProxyEndpoint(getProxySourceUrl()).host,
+  set: (value: string) => {
+    updateProxyEndpoint(value, proxyPort.value);
   },
 });
 
 const proxyPort = computed({
-  get: () => {
-    const raw = formState.value.proxy?.http_url || "";
-    const withoutProtocol = raw.replace(/^https?:\/\//, "");
-    const parts = withoutProtocol.split(":");
-    return parts.length > 1 ? parts[1] : "";
-  },
-  set: (val) => {
-    if (!formState.value.proxy) return;
-    const host = proxyHost.value;
-    if (host) {
-      formState.value.proxy.http_url = `http://${host}${val ? ":" + val : ""}`;
-    }
+  get: () => parseProxyEndpoint(getProxySourceUrl()).port,
+  set: (value: string) => {
+    updateProxyEndpoint(proxyHost.value, value);
   },
 });
 
-const canUpdate = computed(() => {
-  const currentUser = auth.user.value;
-  if (!currentUser) return false;
-  const permissions = Array.isArray(currentUser.permissions)
-    ? currentUser.permissions
-    : [];
-  return (
-    currentUser.is_superuser ||
-    permissions.some((item) => item?.code === "settings.update")
-  );
-});
+const proxyEnabled = computed(() => Boolean(formState.value.proxy?.enabled));
+const proxyInputsDisabled = computed(
+  () => !proxyEnabled.value || Boolean(savingSection.value) || loading.value,
+);
+
+const handleProxyEnabledChange = (checked: boolean) => {
+  const enabled = checked === true;
+  formState.value.proxy.enabled = enabled;
+
+  if (!enabled) {
+    void saveSettings("proxy", "代理全局开关");
+  }
+};
 
 const normalizeLoadErrorMessage = (error: unknown) => {
   const message = api.normalizeError(error);
@@ -580,6 +676,37 @@ const normalizeTranscriptionCapabilitiesErrorMessage = (error: unknown) => {
     return "当前后端进程还没有加载转写能力检测接口，请重启后端服务后再试。";
   }
   return message;
+};
+
+const isValidHttpBaseUrl = (value: string) =>
+  /^https?:\/\//i.test((value || "").trim());
+
+const validateProviderBaseUrls = (payload: SystemSettingsPayload) => {
+  const groups: Array<{
+    key: ProviderGroupKey;
+    label: string;
+  }> = [
+    { key: "analysis", label: "模型后端" },
+    { key: "transcription", label: "Whisper 配置" },
+    { key: "remake", label: "视频引擎配置" },
+  ];
+
+  for (const group of groups) {
+    const providerGroup = payload[group.key];
+    for (const provider of providerGroup.providers) {
+      const baseUrl = (provider.base_url || "").trim();
+      if (!baseUrl) continue;
+      if (isValidHttpBaseUrl(baseUrl)) continue;
+
+      const suffix =
+        group.key === "remake"
+          ? "这里填写的是接口地址，不是模型名。"
+          : "请输入完整接口地址。";
+      throw new Error(
+        `${group.label} / ${provider.label} 的 API Base Endpoint 必须以 http:// 或 https:// 开头。${suffix}`,
+      );
+    }
+  }
 };
 
 const testConnection = async () => {
@@ -655,6 +782,7 @@ const saveSettings = async (
     const payload = normalizeSettingsPayload(
       JSON.parse(JSON.stringify(formState.value)),
     );
+    validateProviderBaseUrls(payload);
     if (section === "chat") {
       ensureDefaultProviderEnabled(payload, "analysis");
     }
@@ -777,7 +905,7 @@ onMounted(async () => {
               value="chat"
               class="h-full flex-1 rounded-md border border-transparent bg-transparent px-3 text-[13px] font-medium text-zinc-600 transition-colors hover:text-zinc-900 data-[state=active]:border-zinc-900 data-[state=active]:bg-zinc-900 data-[state=active]:text-white dark:text-zinc-400 dark:hover:text-zinc-100 dark:data-[state=active]:border-zinc-900 dark:data-[state=active]:bg-zinc-900 dark:data-[state=active]:text-white"
             >
-              模型后端
+              对话模型
             </TabsTrigger>
             <TabsTrigger
               value="transcription"
@@ -789,7 +917,7 @@ onMounted(async () => {
               value="video"
               class="h-full flex-1 rounded-md border border-transparent bg-transparent px-3 text-[13px] font-medium text-zinc-600 transition-colors hover:text-zinc-900 data-[state=active]:border-zinc-900 data-[state=active]:bg-zinc-900 data-[state=active]:text-white dark:text-zinc-400 dark:hover:text-zinc-100 dark:data-[state=active]:border-zinc-900 dark:data-[state=active]:bg-zinc-900 dark:data-[state=active]:text-white"
             >
-              视频引擎
+              视频模型
             </TabsTrigger>
           </TabsList>
         </div>
@@ -937,13 +1065,8 @@ onMounted(async () => {
                       >是否开启代理</label
                     >
                     <Switch
-                      :checked="formState.proxy.enabled"
-                      @update:checked="
-                        (val: boolean) => {
-                          formState.proxy.enabled = val;
-                          if (!val) saveSettings('proxy', '代理全局开关');
-                        }
-                      "
+                      :checked="proxyEnabled"
+                      @update:checked="handleProxyEnabledChange"
                       class="data-[state=checked]:bg-zinc-900 dark:data-[state=checked]:bg-zinc-100"
                     />
                   </div>
@@ -955,34 +1078,37 @@ onMounted(async () => {
                 <div
                   :class="[
                     'flex flex-col gap-6 transition-opacity duration-200',
-                    !formState.proxy.enabled
-                      ? 'opacity-40 pointer-events-none'
-                      : '',
+                    !proxyEnabled ? 'opacity-40' : '',
                   ]"
                 >
-                  <!-- HTTP 代理地址 -->
                   <div class="space-y-2">
                     <label class="text-[12px] font-bold text-zinc-400 ml-1"
-                      >HTTP 代理地址</label
+                      >代理 IP</label
                     >
                     <Input
                       v-model="proxyHost"
                       placeholder="例如: 127.0.0.1"
+                      :disabled="proxyInputsDisabled"
                       class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
                     />
                   </div>
 
-                  <!-- HTTP 代理端口 -->
                   <div class="space-y-2">
                     <label class="text-[12px] font-bold text-zinc-400 ml-1"
-                      >HTTP 代理端口</label
+                      >代理端口</label
                     >
                     <Input
                       v-model="proxyPort"
+                      inputmode="numeric"
                       placeholder="例如: 7890"
+                      :disabled="proxyInputsDisabled"
                       class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
                     />
                   </div>
+                  <p class="text-xs text-zinc-500 ml-1">
+                    保存时会自动写入 HTTP 和 HTTPS 代理地址，格式为
+                    `http://IP:端口`。
+                  </p>
                 </div>
               </div>
 
@@ -990,7 +1116,7 @@ onMounted(async () => {
               <div
                 :class="[
                   'flex items-center justify-between gap-5 pt-4 mt-6 border-t border-zinc-200 dark:border-zinc-800 transition-opacity duration-200',
-                  !formState.proxy.enabled
+                  !proxyEnabled
                     ? 'opacity-40 pointer-events-none'
                     : '',
                 ]"
@@ -1002,7 +1128,7 @@ onMounted(async () => {
                     保存代理配置
                   </p>
                   <p class="text-xs text-zinc-500">
-                    代理参数修改后只按此按钮局部保存。
+                    当前仅需填写代理 IP 和端口。
                   </p>
                 </div>
 
@@ -1320,9 +1446,14 @@ onMounted(async () => {
                         {{
                           fasterWhisperCapability?.local_models?.length || 0
                         }}
-                        个本地模型，推荐设备：
+                        个本地模型，推荐设备 / 精度：
                         {{
                           fasterWhisperCapability?.recommended_device || "cpu"
+                        }}
+                        /
+                        {{
+                          fasterWhisperCapability?.recommended_compute_type ||
+                          "int8"
                         }}
                       </p>
                     </div>
@@ -1416,8 +1547,8 @@ onMounted(async () => {
                     />
                   </div>
 
-                  <div class="grid gap-4 md:grid-cols-2">
-                    <div class="space-y-2">
+                    <div class="grid gap-4 md:grid-cols-2">
+                      <div class="space-y-2">
                       <label class="text-[12px] font-bold text-zinc-400 ml-1"
                         >运行设备</label
                       >
@@ -1469,9 +1600,21 @@ onMounted(async () => {
                           </SelectItem>
                         </SelectContent>
                       </Select>
+                      </div>
                     </div>
+                    <p class="text-xs text-zinc-500 ml-1">
+                      当前环境推荐使用
+                      {{
+                        fasterWhisperCapability?.recommended_device || "cpu"
+                      }}
+                      /
+                      {{
+                        fasterWhisperCapability?.recommended_compute_type ||
+                        "int8"
+                      }}。
+                      如果之前一直保留 `auto` 或 `default`，运行时也会自动按这个推荐值执行。
+                    </p>
                   </div>
-                </div>
 
                 <div v-else class="space-y-6">
                   <div class="space-y-2">
@@ -1649,9 +1792,15 @@ onMounted(async () => {
                   >
                   <Input
                     v-model="currentVideoProvider.base_url"
-                    placeholder="填写接口地址"
+                    :placeholder="videoBaseUrlPlaceholder"
                     class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
                   />
+                  <p
+                    v-if="videoBaseUrlHint"
+                    class="text-[11px] leading-5 text-zinc-500 dark:text-zinc-400"
+                  >
+                    {{ videoBaseUrlHint }}
+                  </p>
                 </div>
 
                 <!-- API Key -->
@@ -1663,7 +1812,7 @@ onMounted(async () => {
                     <Input
                       v-model="currentVideoProvider.api_key"
                       :type="showVideoApiKey ? 'text' : 'password'"
-                      placeholder="填写密钥"
+                      :placeholder="videoApiKeyPlaceholder"
                       class="h-11 rounded-lg border-zinc-200 bg-white px-4 pr-12 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
                     />
                     <button
@@ -1675,6 +1824,12 @@ onMounted(async () => {
                       <Eye v-else class="size-4" />
                     </button>
                   </div>
+                  <p
+                    v-if="videoApiKeyHint"
+                    class="text-[11px] leading-5 text-zinc-500 dark:text-zinc-400"
+                  >
+                    {{ videoApiKeyHint }}
+                  </p>
                 </div>
               </template>
 

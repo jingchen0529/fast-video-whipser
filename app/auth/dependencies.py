@@ -2,7 +2,7 @@ import hmac
 import sqlite3
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, Request
+from fastapi import Depends, HTTPException, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.auth.security import decode_jwt_token
@@ -12,6 +12,7 @@ from app.db import get_db
 
 bearer_scheme = HTTPBearer(auto_error=False)
 SAFE_HTTP_METHODS = {"GET", "HEAD", "OPTIONS"}
+ADMIN_ROLE_CODES = {"super_admin", "admin"}
 
 
 def get_access_token_from_request(
@@ -54,6 +55,31 @@ def validate_csrf_request(
         raise HTTPException(status_code=403, detail="CSRF 会话令牌校验失败。")
 
 
+def clear_auth_cookies(
+    response: Response,
+    *,
+    clear_access: bool = True,
+    clear_refresh: bool = True,
+    clear_csrf: bool = True,
+) -> None:
+    cookie_targets = []
+    if clear_access:
+        cookie_targets.append(settings.auth_cookie_access_name)
+    if clear_refresh:
+        cookie_targets.append(settings.auth_cookie_refresh_name)
+    if clear_csrf:
+        cookie_targets.append(settings.auth_cookie_csrf_name)
+
+    for cookie_name in cookie_targets:
+        response.delete_cookie(
+            cookie_name,
+            domain=settings.auth_cookie_domain,
+            path=settings.auth_cookie_path,
+            secure=settings.auth_cookie_secure,
+            samesite=settings.auth_cookie_samesite,
+        )
+
+
 def get_current_user(
     request: Request,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
@@ -83,6 +109,22 @@ def get_current_user(
     return user
 
 
+def require_admin_access(
+    current_user: Annotated[dict, Depends(get_current_user)],
+) -> dict:
+    if bool(current_user.get("is_superuser")):
+        return current_user
+
+    role_codes = {
+        str(role.get("code") or "").strip().lower()
+        for role in current_user.get("roles") or []
+    }
+    if role_codes & ADMIN_ROLE_CODES:
+        return current_user
+
+    raise HTTPException(status_code=403, detail="当前账号没有访问该资源的权限。")
+
+
 def require_csrf_protection(
     request: Request,
     _: Annotated[dict, Depends(get_current_user)],
@@ -90,30 +132,4 @@ def require_csrf_protection(
     session = getattr(request.state, "auth_session", None)
     expected_token = session["csrf_token"] if session else None
     validate_csrf_request(request, expected_token=expected_token)
-
-
-def require_permissions(*permission_codes: str):
-    def dependency(
-        current_user: Annotated[dict, Depends(get_current_user)],
-    ) -> dict:
-        if current_user["is_superuser"]:
-            return current_user
-
-        current_permission_codes = {
-            permission["code"]
-            for permission in current_user["permissions"]
-        }
-        missing_codes = [
-            permission_code
-            for permission_code in permission_codes
-            if permission_code not in current_permission_codes
-        ]
-        if missing_codes:
-            raise HTTPException(
-                status_code=403,
-                detail=f"缺少权限: {', '.join(missing_codes)}",
-            )
-        return current_user
-
-    return dependency
 

@@ -1,5 +1,6 @@
 import sqlite3
 
+from app.services.system_settings_service import SystemSettingsService
 from tests.test_auth_api import _build_test_client, _csrf_headers, _login
 
 
@@ -214,6 +215,106 @@ def test_update_settings_persists_configuration(tmp_path) -> None:
         assert preview_response.status_code == 200
         preview_payload = preview_response.json()["data"]
         assert preview_payload["default_provider"] == "openai_whisper_api"
+
+
+def test_transcription_capabilities_recommend_cpu_int8_when_cuda_unavailable(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        SystemSettingsService,
+        "_inspect_ctranslate2_cuda",
+        staticmethod(lambda: {"cuda_available": False, "cuda_device_count": 0}),
+    )
+
+    with _build_test_client(tmp_path) as client:
+        login_response = _login(
+            client,
+            login="admin",
+            password="Admin12345!",
+        )
+        assert login_response.status_code == 200
+
+        capability_response = client.get("/api/settings/transcription/capabilities")
+
+        assert capability_response.status_code == 200
+        faster_whisper = capability_response.json()["data"]["providers"]["faster_whisper"]
+        assert faster_whisper["recommended_device"] == "cpu"
+        assert faster_whisper["recommended_compute_type"] == "int8"
+        assert faster_whisper["available_compute_types"] == [
+            "auto",
+            "default",
+            "int8",
+            "float32",
+        ]
+        assert any("cpu + int8" in issue for issue in faster_whisper["issues"])
+
+
+def test_update_settings_rejects_invalid_provider_base_url(tmp_path) -> None:
+    with _build_test_client(tmp_path) as client:
+        login_response = _login(
+            client,
+            login="admin",
+            password="Admin12345!",
+        )
+        assert login_response.status_code == 200
+
+        initial_response = client.get("/api/settings")
+        assert initial_response.status_code == 200
+        payload = initial_response.json()["data"]
+
+        for provider in payload["remake"]["providers"]:
+            if provider["provider"] == "doubao":
+                provider["enabled"] = True
+                provider["base_url"] = "doubao-seedance-1-5-pro-251215"
+
+        update_response = client.patch(
+            "/api/settings",
+            headers=_csrf_headers(client),
+            json=payload,
+        )
+
+        assert update_response.status_code == 400
+        assert (
+            update_response.json()["message"]
+            == "豆包 的 API Base Endpoint 必须以 http:// 或 https:// 开头。"
+        )
+
+
+def test_update_settings_normalizes_doubao_remake_task_endpoint(tmp_path) -> None:
+    with _build_test_client(tmp_path) as client:
+        login_response = _login(
+            client,
+            login="admin",
+            password="Admin12345!",
+        )
+        assert login_response.status_code == 200
+
+        initial_response = client.get("/api/settings")
+        assert initial_response.status_code == 200
+        payload = initial_response.json()["data"]
+
+        for provider in payload["remake"]["providers"]:
+            if provider["provider"] == "doubao":
+                provider["enabled"] = True
+                provider["base_url"] = (
+                    "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
+                )
+                provider["default_model"] = "doubao-seedance-1-5-pro-251215"
+
+        update_response = client.patch(
+            "/api/settings",
+            headers=_csrf_headers(client),
+            json=payload,
+        )
+
+        assert update_response.status_code == 200
+        updated = update_response.json()["data"]
+        doubao_provider = next(
+            item
+            for item in updated["remake"]["providers"]
+            if item["provider"] == "doubao"
+        )
+        assert doubao_provider["base_url"] == "https://ark.cn-beijing.volces.com/api/v3"
 
 
 def test_regular_user_cannot_access_settings(tmp_path) -> None:

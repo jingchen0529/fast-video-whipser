@@ -11,7 +11,7 @@ Minimal FastAPI skeleton for file ingestion and future transcription workflows.
 - Media duration probing via `ffprobe`, with a WAV-only local fallback
 - Health endpoint and temporary upload endpoint
 - SQLite user database with cookie-based JWT sessions
-- Role and permission based access control (RBAC)
+- Role and menu based access control
 - HttpOnly access/refresh cookies with CSRF protection
 - Login captcha validation and rate limiting
 - Unified success/error response envelopes
@@ -115,9 +115,8 @@ If it is missing, the project falls back to Python's built-in `wave` module for 
 - `GET /api/auth/roles`
 - `POST /api/auth/roles`
 - `PATCH /api/auth/roles/{role_id}`
-- `PUT /api/auth/roles/{role_id}/permissions`
-- `GET /api/auth/permissions`
-- `POST /api/auth/permissions`
+- `GET /api/auth/roles/{role_id}/menus`
+- `PUT /api/auth/roles/{role_id}/menus`
 - `GET /api/common/captcha`
 - `POST /api/common/captcha/verify`
 - `POST /api/common/upload`

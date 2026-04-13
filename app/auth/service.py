@@ -1,3 +1,4 @@
+import json
 import re
 import secrets
 import sqlite3
@@ -18,10 +19,12 @@ from app.core.config import settings
 from app.core.logging import configure_logging
 
 USERNAME_PATTERN = re.compile(r"^[a-z0-9_.-]{3,50}$")
-PERMISSION_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{2,99}$")
+
 ROLE_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{2,99}$")
+MENU_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{2,99}$")
 LOGIN_BLOCK_MESSAGE = "登录尝试过于频繁，请稍后再试。"
 logger = configure_logging(__name__)
+_UNSET = object()
 
 
 def normalize_username(username: str) -> str:
@@ -38,17 +41,18 @@ def normalize_email(email: str) -> str:
     return normalized
 
 
-def normalize_permission_code(code: str) -> str:
-    normalized = code.strip().lower()
-    if not PERMISSION_CODE_PATTERN.fullmatch(normalized):
-        raise ValueError("权限编码格式不正确。")
-    return normalized
-
 
 def normalize_role_code(code: str) -> str:
     normalized = code.strip().lower()
     if not ROLE_CODE_PATTERN.fullmatch(normalized):
         raise ValueError("角色编码格式不正确。")
+    return normalized
+
+
+def normalize_menu_code(code: str) -> str:
+    normalized = code.strip().lower()
+    if not MENU_CODE_PATTERN.fullmatch(normalized):
+        raise ValueError("菜单编码格式不正确。")
     return normalized
 
 
@@ -236,17 +240,6 @@ def clear_login_failures(
     connection.commit()
 
 
-def _row_to_permission(row: sqlite3.Row) -> dict[str, Any]:
-    return {
-        "id": row["id"],
-        "code": row["code"],
-        "name": row["name"],
-        "group_name": row["group_name"],
-        "description": row["description"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
-    }
-
 
 def _row_to_role(row: sqlite3.Row) -> dict[str, Any]:
     return {
@@ -255,6 +248,44 @@ def _row_to_role(row: sqlite3.Row) -> dict[str, Any]:
         "name": row["name"],
         "description": row["description"],
         "is_system": bool(row["is_system"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _row_to_menu(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        meta_json = json.loads(row["meta_json"] or "{}")
+    except json.JSONDecodeError:
+        meta_json = {}
+
+    row_keys = set(row.keys())
+
+    return {
+        "id": row["id"],
+        "parent_id": row["parent_id"],
+        "code": row["code"],
+        "title": row["title"],
+        "menu_type": row["menu_type"],
+        "route_path": row["route_path"] or "",
+        "route_name": row["route_name"],
+        "redirect_path": row["redirect_path"],
+        "icon": row["icon"],
+        "component_key": row["component_key"],
+        "permission_code": row["permission_code"] if "permission_code" in row_keys else None,
+
+        "sort_order": int(row["sort_order"] or 0),
+        "is_visible": bool(row["is_visible"]),
+        "is_enabled": bool(row["is_enabled"]),
+        "is_external": bool(row["is_external"]),
+        "open_mode": row["open_mode"] or "self",
+        "is_cacheable": bool(row["is_cacheable"]),
+        "is_affix": bool(row["is_affix"]),
+        "active_menu_path": row["active_menu_path"],
+        "badge_text": row["badge_text"],
+        "badge_type": row["badge_type"],
+        "remark": row["remark"],
+        "meta_json": meta_json,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -299,45 +330,6 @@ def get_user_roles(connection: sqlite3.Connection, user_id: str) -> list[dict[st
     return [_row_to_role(row) for row in rows]
 
 
-def get_role_permissions(
-    connection: sqlite3.Connection,
-    role_id: str,
-) -> list[dict[str, Any]]:
-    rows = connection.execute(
-        """
-        SELECT p.*
-        FROM permissions p
-        INNER JOIN role_permissions rp ON rp.permission_id = p.id
-        WHERE rp.role_id = ?
-        ORDER BY p.group_name ASC, p.code ASC
-        """,
-        (role_id,),
-    ).fetchall()
-    return [_row_to_permission(row) for row in rows]
-
-
-def get_user_permissions(
-    connection: sqlite3.Connection,
-    user_id: str,
-    *,
-    is_superuser: bool,
-) -> list[dict[str, Any]]:
-    if is_superuser:
-        return list_permissions(connection)
-
-    rows = connection.execute(
-        """
-        SELECT DISTINCT p.*
-        FROM permissions p
-        INNER JOIN role_permissions rp ON rp.permission_id = p.id
-        INNER JOIN user_roles ur ON ur.role_id = rp.role_id
-        WHERE ur.user_id = ?
-        ORDER BY p.group_name ASC, p.code ASC
-        """,
-        (user_id,),
-    ).fetchall()
-    return [_row_to_permission(row) for row in rows]
-
 
 def build_user_profile(
     connection: sqlite3.Connection,
@@ -348,85 +340,455 @@ def build_user_profile(
         return None
 
     roles = get_user_roles(connection, user_id)
-    permissions = get_user_permissions(
-        connection,
-        user_id,
-        is_superuser=user["is_superuser"],
-    )
     user["roles"] = roles
-    user["permissions"] = permissions
     return user
 
 
-def list_permissions(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+
+def list_menus(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = connection.execute(
         """
         SELECT *
-        FROM permissions
-        ORDER BY group_name ASC, code ASC
+        FROM menus
+        ORDER BY sort_order ASC, created_at ASC, id ASC
         """
     ).fetchall()
-    return [_row_to_permission(row) for row in rows]
+    return [_row_to_menu(row) for row in rows]
 
 
-def create_permission(
+def build_menu_tree(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    nodes = []
+    by_id: dict[str, dict[str, Any]] = {}
+
+    for item in items:
+        node = {
+            **item,
+            "children": [],
+        }
+        by_id[node["id"]] = node
+
+    for node in by_id.values():
+        parent_id = node["parent_id"]
+        if parent_id and parent_id in by_id:
+            by_id[parent_id]["children"].append(node)
+        else:
+            nodes.append(node)
+
+    def sort_nodes(target: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        target.sort(key=lambda item: (int(item.get("sort_order") or 0), str(item.get("title") or ""), str(item.get("id") or "")))
+        for child in target:
+            sort_nodes(child["children"])
+        return target
+
+    return sort_nodes(nodes)
+
+
+def list_menu_tree(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    return build_menu_tree(list_menus(connection))
+
+
+def _get_menu_by_id(connection: sqlite3.Connection, menu_id: str) -> sqlite3.Row | None:
+    return connection.execute(
+        "SELECT * FROM menus WHERE id = ? LIMIT 1",
+        (menu_id,),
+    ).fetchone()
+
+
+def _get_menu_by_code(connection: sqlite3.Connection, code: str) -> sqlite3.Row | None:
+    return connection.execute(
+        "SELECT * FROM menus WHERE code = ? LIMIT 1",
+        (normalize_menu_code(code),),
+    ).fetchone()
+
+
+
+def _assert_menu_parent_available(
+    connection: sqlite3.Connection,
+    *,
+    parent_id: str | None,
+    menu_id: str | None = None,
+) -> sqlite3.Row | None:
+    if not parent_id:
+        return None
+    parent_row = _get_menu_by_id(connection, parent_id)
+    if parent_row is None:
+        raise HTTPException(status_code=404, detail="父级菜单不存在。")
+    if menu_id and parent_id == menu_id:
+        raise HTTPException(status_code=400, detail="菜单不能将自己设置为父级。")
+    return parent_row
+
+
+def _assert_menu_parent_chain(
+    connection: sqlite3.Connection,
+    *,
+    menu_id: str,
+    parent_id: str | None,
+) -> None:
+    current_parent_id = parent_id
+    while current_parent_id:
+        if current_parent_id == menu_id:
+            raise HTTPException(status_code=400, detail="菜单父级关系不能形成循环。")
+        parent_row = _get_menu_by_id(connection, current_parent_id)
+        if parent_row is None:
+            break
+        current_parent_id = parent_row["parent_id"]
+
+
+def create_menu(
     connection: sqlite3.Connection,
     *,
     code: str,
-    name: str,
-    group_name: str,
-    description: str | None = None,
+    title: str,
+    menu_type: str,
+    route_path: str = "",
+    route_name: str | None = None,
+    redirect_path: str | None = None,
+    icon: str | None = None,
+    component_key: str | None = None,
+
+    parent_id: str | None = None,
+    sort_order: int = 0,
+    is_visible: bool = True,
+    is_enabled: bool = True,
+    is_external: bool = False,
+    open_mode: str = "self",
+    is_cacheable: bool = False,
+    is_affix: bool = False,
+    active_menu_path: str | None = None,
+    badge_text: str | None = None,
+    badge_type: str | None = None,
+    remark: str | None = None,
+    meta_json: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    normalized_code = normalize_permission_code(code)
-    normalized_group = group_name.strip().lower()
-    normalized_name = name.strip()
-    if not normalized_name:
-        raise ValueError("权限名称不能为空。")
-    if not normalized_group:
-        raise ValueError("权限分组不能为空。")
+    normalized_code = normalize_menu_code(code)
+    normalized_title = title.strip()
+    if not normalized_title:
+        raise ValueError("菜单名称不能为空。")
+    normalized_menu_type = (menu_type or "").strip().lower()
+    if normalized_menu_type not in {"directory", "menu", "link"}:
+        raise ValueError("菜单类型仅支持 directory、menu、link。")
+    normalized_open_mode = (open_mode or "self").strip().lower()
+    if normalized_open_mode not in {"self", "blank"}:
+        raise ValueError("打开方式仅支持 self 或 blank。")
 
-    exists = connection.execute(
-        "SELECT id FROM permissions WHERE code = ? LIMIT 1",
-        (normalized_code,),
-    ).fetchone()
-    if exists is not None:
-        raise HTTPException(status_code=409, detail="权限编码已存在。")
+    if _get_menu_by_code(connection, normalized_code) is not None:
+        raise HTTPException(status_code=409, detail="菜单编码已存在。")
 
+    _assert_menu_parent_available(connection, parent_id=parent_id)
     now = utcnow_iso()
-    permission_id = uuid.uuid4().hex
+    menu_id = uuid.uuid4().hex
     connection.execute(
         """
-        INSERT INTO permissions (
-            id, code, name, group_name, description, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO menus (
+            id, parent_id, code, title, menu_type, route_path, route_name,
+            redirect_path, icon, component_key, sort_order,
+            is_visible, is_enabled, is_external, open_mode, is_cacheable,
+            is_affix, active_menu_path, badge_text, badge_type, remark,
+            meta_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            permission_id,
+            menu_id,
+            parent_id,
             normalized_code,
-            normalized_name,
-            normalized_group,
-            description.strip() if description else None,
+            normalized_title,
+            normalized_menu_type,
+            route_path.strip(),
+            route_name.strip() if route_name else None,
+            redirect_path.strip() if redirect_path else None,
+            icon.strip() if icon else None,
+            component_key.strip() if component_key else None,
+            int(sort_order),
+            int(is_visible),
+            int(is_enabled),
+            int(is_external),
+            normalized_open_mode,
+            int(is_cacheable),
+            int(is_affix),
+            active_menu_path.strip() if active_menu_path else None,
+            badge_text.strip() if badge_text else None,
+            badge_type.strip() if badge_type else None,
+            remark.strip() if remark else None,
+            json.dumps(meta_json or {}, ensure_ascii=False),
             now,
             now,
         ),
     )
-    super_admin_role = _get_role_by_code(connection, "super_admin")
-    if super_admin_role is not None:
+    connection.commit()
+    row = _get_menu_by_id(connection, menu_id)
+    _issue_audit_log("menu_create", outcome="success", detail=normalized_code)
+    return _row_to_menu(row)
+
+
+def update_menu(
+    connection: sqlite3.Connection,
+    menu_id: str,
+    *,
+    title: Any = _UNSET,
+    menu_type: Any = _UNSET,
+    route_path: Any = _UNSET,
+    route_name: Any = _UNSET,
+    redirect_path: Any = _UNSET,
+    icon: Any = _UNSET,
+    component_key: Any = _UNSET,
+
+    parent_id: Any = _UNSET,
+    sort_order: Any = _UNSET,
+    is_visible: Any = _UNSET,
+    is_enabled: Any = _UNSET,
+    is_external: Any = _UNSET,
+    open_mode: Any = _UNSET,
+    is_cacheable: Any = _UNSET,
+    is_affix: Any = _UNSET,
+    active_menu_path: Any = _UNSET,
+    badge_text: Any = _UNSET,
+    badge_type: Any = _UNSET,
+    remark: Any = _UNSET,
+    meta_json: Any = _UNSET,
+) -> dict[str, Any]:
+    menu_row = _get_menu_by_id(connection, menu_id)
+    if menu_row is None:
+        raise HTTPException(status_code=404, detail="菜单不存在。")
+
+    updates: list[str] = []
+    values: list[Any] = []
+    if title is not _UNSET:
+        normalized_title = title.strip()
+        if not normalized_title:
+            raise ValueError("菜单名称不能为空。")
+        updates.append("title = ?")
+        values.append(normalized_title)
+    if menu_type is not _UNSET:
+        normalized_menu_type = menu_type.strip().lower()
+        if normalized_menu_type not in {"directory", "menu", "link"}:
+            raise ValueError("菜单类型仅支持 directory、menu、link。")
+        updates.append("menu_type = ?")
+        values.append(normalized_menu_type)
+    if route_path is not _UNSET:
+        updates.append("route_path = ?")
+        values.append((route_path or "").strip())
+    if route_name is not _UNSET:
+        updates.append("route_name = ?")
+        values.append((route_name or "").strip() or None)
+    if redirect_path is not _UNSET:
+        updates.append("redirect_path = ?")
+        values.append((redirect_path or "").strip() or None)
+    if icon is not _UNSET:
+        updates.append("icon = ?")
+        values.append((icon or "").strip() or None)
+    if component_key is not _UNSET:
+        updates.append("component_key = ?")
+        values.append((component_key or "").strip() or None)
+
+    if parent_id is not _UNSET:
+        _assert_menu_parent_available(connection, parent_id=parent_id, menu_id=menu_id)
+        _assert_menu_parent_chain(connection, menu_id=menu_id, parent_id=parent_id)
+        updates.append("parent_id = ?")
+        values.append(parent_id or None)
+    if sort_order is not _UNSET:
+        updates.append("sort_order = ?")
+        values.append(int(sort_order))
+    if is_visible is not _UNSET:
+        updates.append("is_visible = ?")
+        values.append(int(is_visible))
+    if is_enabled is not _UNSET:
+        updates.append("is_enabled = ?")
+        values.append(int(is_enabled))
+    if is_external is not _UNSET:
+        updates.append("is_external = ?")
+        values.append(int(is_external))
+    if open_mode is not _UNSET:
+        normalized_open_mode = open_mode.strip().lower()
+        if normalized_open_mode not in {"self", "blank"}:
+            raise ValueError("打开方式仅支持 self 或 blank。")
+        updates.append("open_mode = ?")
+        values.append(normalized_open_mode)
+    if is_cacheable is not _UNSET:
+        updates.append("is_cacheable = ?")
+        values.append(int(is_cacheable))
+    if is_affix is not _UNSET:
+        updates.append("is_affix = ?")
+        values.append(int(is_affix))
+    if active_menu_path is not _UNSET:
+        updates.append("active_menu_path = ?")
+        values.append((active_menu_path or "").strip() or None)
+    if badge_text is not _UNSET:
+        updates.append("badge_text = ?")
+        values.append((badge_text or "").strip() or None)
+    if badge_type is not _UNSET:
+        updates.append("badge_type = ?")
+        values.append((badge_type or "").strip() or None)
+    if remark is not _UNSET:
+        updates.append("remark = ?")
+        values.append((remark or "").strip() or None)
+    if meta_json is not _UNSET:
+        updates.append("meta_json = ?")
+        values.append(json.dumps(meta_json or {}, ensure_ascii=False))
+
+    if updates:
+        updates.append("updated_at = ?")
+        values.append(utcnow_iso())
+        values.append(menu_id)
+        connection.execute(
+            f"UPDATE menus SET {', '.join(updates)} WHERE id = ?",
+            tuple(values),
+        )
+        connection.commit()
+
+    row = _get_menu_by_id(connection, menu_id)
+    _issue_audit_log("menu_update", outcome="success", detail=menu_id)
+    return _row_to_menu(row)
+
+
+def delete_menu(connection: sqlite3.Connection, menu_id: str) -> dict[str, Any]:
+    menu_row = _get_menu_by_id(connection, menu_id)
+    if menu_row is None:
+        raise HTTPException(status_code=404, detail="菜单不存在。")
+
+    child_count = int(
+        connection.execute(
+            "SELECT COUNT(1) AS count FROM menus WHERE parent_id = ?",
+            (menu_id,),
+        ).fetchone()["count"]
+    )
+    if child_count > 0:
+        raise HTTPException(status_code=400, detail="当前菜单仍存在子节点，无法删除。")
+
+    menu = _row_to_menu(menu_row)
+    connection.execute("DELETE FROM menus WHERE id = ?", (menu_id,))
+    connection.commit()
+    _issue_audit_log("menu_delete", outcome="success", detail=menu_id)
+    return {
+        "id": menu["id"],
+        "code": menu["code"],
+        "title": menu["title"],
+        "deleted": True,
+    }
+
+
+def get_role_menus(connection: sqlite3.Connection, role_id: str) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT m.*
+        FROM menus m
+        INNER JOIN role_menus rm ON rm.menu_id = m.id
+        WHERE rm.role_id = ?
+        ORDER BY m.sort_order ASC, m.created_at ASC, m.id ASC
+        """,
+        (role_id,),
+    ).fetchall()
+    return [_row_to_menu(row) for row in rows]
+
+
+def assign_menus_to_role(
+    connection: sqlite3.Connection,
+    role_id: str,
+    menu_ids: list[str],
+) -> dict[str, Any]:
+    role_row = _get_role_by_id(connection, role_id)
+    if role_row is None:
+        raise HTTPException(status_code=404, detail="角色不存在。")
+
+    normalized_menu_ids = [menu_id.strip() for menu_id in menu_ids if menu_id and menu_id.strip()]
+    normalized_menu_ids = list(dict.fromkeys(normalized_menu_ids))
+    if normalized_menu_ids:
+        placeholders = ", ".join("?" for _ in normalized_menu_ids)
+        menu_rows = connection.execute(
+            f"SELECT id, parent_id FROM menus WHERE id IN ({placeholders})",
+            tuple(normalized_menu_ids),
+        ).fetchall()
+    else:
+        menu_rows = []
+
+    found_ids = {row["id"] for row in menu_rows}
+    missing_ids = [menu_id for menu_id in normalized_menu_ids if menu_id not in found_ids]
+    if missing_ids:
+        raise HTTPException(status_code=404, detail=f"以下菜单不存在: {', '.join(missing_ids)}")
+
+    all_ids = set(normalized_menu_ids)
+    parent_lookup = {row["id"]: row["parent_id"] for row in menu_rows}
+    pending_parent_ids = {parent_id for parent_id in parent_lookup.values() if parent_id}
+
+    while pending_parent_ids:
+        placeholders = ", ".join("?" for _ in pending_parent_ids)
+        parent_rows = connection.execute(
+            f"SELECT id, parent_id FROM menus WHERE id IN ({placeholders})",
+            tuple(pending_parent_ids),
+        ).fetchall()
+        if not parent_rows:
+            break
+        pending_parent_ids = set()
+        for row in parent_rows:
+            menu_id_value = row["id"]
+            if menu_id_value in all_ids:
+                continue
+            all_ids.add(menu_id_value)
+            if row["parent_id"]:
+                pending_parent_ids.add(row["parent_id"])
+
+    connection.execute("DELETE FROM role_menus WHERE role_id = ?", (role_id,))
+    now = utcnow_iso()
+    for menu_id_value in all_ids:
         connection.execute(
             """
-            INSERT OR IGNORE INTO role_permissions (role_id, permission_id, created_at)
+            INSERT INTO role_menus (role_id, menu_id, created_at)
             VALUES (?, ?, ?)
             """,
-            (super_admin_role["id"], permission_id, now),
+            (role_id, menu_id_value, now),
         )
     connection.commit()
 
-    row = connection.execute(
-        "SELECT * FROM permissions WHERE id = ? LIMIT 1",
-        (permission_id,),
-    ).fetchone()
-    _issue_audit_log("permission_create", outcome="success", detail=normalized_code)
-    return _row_to_permission(row)
+    role = _row_to_role(_get_role_by_id(connection, role_id))
+
+    role["menus"] = get_role_menus(connection, role_id)
+    _issue_audit_log("role_assign_menus", outcome="success", detail=role_id)
+    return role
+
+
+def list_user_navigation(
+    connection: sqlite3.Connection,
+    *,
+    user_id: str,
+    is_superuser: bool,
+) -> list[dict[str, Any]]:
+    if is_superuser:
+        candidate_rows = connection.execute(
+            """
+            SELECT *
+            FROM menus
+            WHERE is_enabled = 1 AND is_visible = 1
+            ORDER BY sort_order ASC, created_at ASC, id ASC
+            """
+        ).fetchall()
+    else:
+        candidate_rows = connection.execute(
+            """
+            SELECT DISTINCT m.*
+            FROM menus m
+            INNER JOIN role_menus rm ON rm.menu_id = m.id
+            INNER JOIN user_roles ur ON ur.role_id = rm.role_id
+            WHERE ur.user_id = ?
+              AND m.is_enabled = 1
+              AND m.is_visible = 1
+            ORDER BY m.sort_order ASC, m.created_at ASC, m.id ASC
+            """,
+            (user_id,),
+        ).fetchall()
+
+    candidate_menus = [_row_to_menu(row) for row in candidate_rows]
+    visible_menu_ids: set[str] = set()
+    by_id = {menu["id"]: menu for menu in candidate_menus}
+
+    for menu in candidate_menus:
+        visible_menu_ids.add(menu["id"])
+        parent_id = menu.get("parent_id")
+        while parent_id and parent_id in by_id:
+            visible_menu_ids.add(parent_id)
+            parent_id = by_id[parent_id].get("parent_id")
+
+    filtered_menus = [menu for menu in candidate_menus if menu["id"] in visible_menu_ids]
+    return build_menu_tree(filtered_menus)
+
 
 
 def list_roles(connection: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -440,10 +802,8 @@ def list_roles(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     roles = []
     for row in rows:
         role = _row_to_role(row)
-        if role["code"] == "super_admin":
-            role["permissions"] = list_permissions(connection)
-        else:
-            role["permissions"] = get_role_permissions(connection, role["id"])
+
+        role["menus"] = get_role_menus(connection, role["id"])
         roles.append(role)
     return roles
 
@@ -468,7 +828,7 @@ def create_role(
     code: str,
     name: str,
     description: str | None = None,
-    permission_codes: list[str] | None = None,
+
 ) -> dict[str, Any]:
     normalized_code = normalize_role_code(code)
     normalized_name = name.strip()
@@ -498,13 +858,12 @@ def create_role(
         ),
     )
 
-    if permission_codes is not None:
-        _sync_role_permissions(connection, role_id, permission_codes)
 
     connection.commit()
     role_row = _get_role_by_id(connection, role_id)
     role = _row_to_role(role_row)
-    role["permissions"] = get_role_permissions(connection, role_id)
+
+    role["menus"] = get_role_menus(connection, role_id)
     _issue_audit_log("role_create", outcome="success", detail=normalized_code)
     return role
 
@@ -543,7 +902,8 @@ def update_role(
         connection.commit()
 
     role = _row_to_role(_get_role_by_id(connection, role_id))
-    role["permissions"] = get_role_permissions(connection, role_id)
+
+    role["menus"] = get_role_menus(connection, role_id)
     _issue_audit_log("role_update", outcome="success", detail=role_id)
     return role
 
@@ -582,66 +942,6 @@ def delete_role(
     }
 
 
-def assign_permissions_to_role(
-    connection: sqlite3.Connection,
-    role_id: str,
-    permission_codes: list[str],
-) -> dict[str, Any]:
-    role_row = _get_role_by_id(connection, role_id)
-    if role_row is None:
-        raise HTTPException(status_code=404, detail="角色不存在。")
-    if role_row["code"] == "super_admin":
-        raise HTTPException(
-            status_code=400,
-            detail="super_admin 角色默认拥有全部权限，无需单独分配。",
-        )
-
-    _sync_role_permissions(connection, role_id, permission_codes)
-    connection.commit()
-
-    role = _row_to_role(_get_role_by_id(connection, role_id))
-    role["permissions"] = get_role_permissions(connection, role_id)
-    _issue_audit_log("role_assign_permissions", outcome="success", detail=role_id)
-    return role
-
-
-def _sync_role_permissions(
-    connection: sqlite3.Connection,
-    role_id: str,
-    permission_codes: list[str],
-) -> None:
-    now = utcnow_iso()
-    normalized_codes = [normalize_permission_code(code) for code in permission_codes]
-    normalized_codes = list(dict.fromkeys(normalized_codes))
-    if normalized_codes:
-        placeholders = ", ".join("?" for _ in normalized_codes)
-        permission_rows = connection.execute(
-            f"SELECT id, code FROM permissions WHERE code IN ({placeholders})",
-            tuple(normalized_codes),
-        ).fetchall()
-    else:
-        permission_rows = []
-
-    permission_id_by_code = {row["code"]: row["id"] for row in permission_rows}
-    missing_codes = [code for code in normalized_codes if code not in permission_id_by_code]
-    if missing_codes:
-        raise HTTPException(
-            status_code=404,
-            detail=f"以下权限不存在: {', '.join(missing_codes)}",
-        )
-
-    connection.execute(
-        "DELETE FROM role_permissions WHERE role_id = ?",
-        (role_id,),
-    )
-    for permission_code in normalized_codes:
-        connection.execute(
-            """
-            INSERT INTO role_permissions (role_id, permission_id, created_at)
-            VALUES (?, ?, ?)
-            """,
-            (role_id, permission_id_by_code[permission_code], now),
-        )
 
 
 def list_users(connection: sqlite3.Connection) -> list[dict[str, Any]]:

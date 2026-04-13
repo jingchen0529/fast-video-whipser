@@ -111,6 +111,16 @@ const getStepIcon = (stepKey: string): Component => {
     generate_storyboard: BrainCircuit,
     generate_response: MessageSquareText,
     generate_suggestions: Lightbulb,
+    select_source_asset: Link2,
+    analyze_reference_video: ScanSearch,
+    define_remake_intent: ShieldCheck,
+    build_remake_prompt: MessageSquareText,
+    generate_video: Clapperboard,
+    poll_generation_result: BrainCircuit,
+    define_objective: Lightbulb,
+    generate_script: MessageSquareText,
+    select_style_reference: ScanSearch,
+    post_production: Captions,
     finish: PartyPopper,
   };
   return iconMap[stepKey] || BrainCircuit;

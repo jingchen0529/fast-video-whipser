@@ -25,7 +25,7 @@ const chatStore = useChatStore();
 const route = useRoute();
 
 useHead({
-  title: "视频分析工作台",
+  title: "视频工作台",
 });
 
 type ModeTab = "script" | "remake" | "create" | "";
@@ -48,7 +48,8 @@ const projects = computed(() => chatStore.projects);
 const modePrefills: Record<Exclude<ModeTab, "">, () => string> = {
   script: () =>
     "从这个视频中提取完整的文本脚本，包括对话、旁白以及所有文字字幕：",
-  remake: () => "复刻这个视频的画面细节，包括画面构图、色彩、光影等：",
+  remake: () =>
+    "复刻这个视频的画面细节，包括画面构图、色彩、光影等：",
   create: () =>
     "我希望创作的视频类型：[UGC种草/产品口播/产品演示/痛点-解决/前后对比/反应展示/故事讲述]\n我的目标客群：[种族/地区/职业/生理特征等]\n我的商品名称：\n我的商品卖点：\n我倾向的视频风格：",
 };
@@ -164,9 +165,10 @@ const handleSend = async () => {
       inputText.value = "";
       selectedFile.value = null;
       selectedUrls.value = [];
-      const res = await api<any[]>("/projects");
-      chatStore.projects = res;
-      await navigateTo(`/video/history?id=${project.id}`);
+      if (!chatStore.projects.find(p => p.id === project.id)) {
+        chatStore.projects.unshift(project);
+      }
+      useRouter().push({ path: "/video/history", query: { id: project.id } });
     }
   } catch (error) {
     errorMessage.value = apiService.normalizeError(error);
@@ -180,13 +182,18 @@ const resolveAssetUrl = (value: string | null | undefined): string | null => {
   if (!normalized) return null;
   if (/^(https?:|data:|blob:)/i.test(normalized)) return normalized;
   const apiBase = (runtimeConfig.public.apiBase || "").trim();
-  let origin = window.location.origin;
-  if (apiBase) {
+  let origin = "";
+  if (import.meta.client) {
     try {
-      origin = new URL(apiBase, window.location.origin).origin;
+      origin = apiBase
+        ? new URL(apiBase, window.location.origin).origin
+        : window.location.origin;
     } catch {
       origin = window.location.origin;
     }
+  }
+  if (!origin) {
+    return normalized.startsWith("/") ? normalized : `/${normalized}`;
   }
   try {
     return new URL(normalized, `${origin}/`).toString();
@@ -592,29 +599,31 @@ const confirmLink = () => {
     <!-- Link Modal -->
     <Dialog v-model:open="showLinkModal">
       <DialogContent
-        class="sm:max-w-[425px] rounded-[32px] border-zinc-100 bg-white/80 px-6 py-6 shadow-2xl backdrop-blur-xl dark:border-zinc-800 dark:bg-zinc-900/80 sm:px-7 sm:py-7"
+        class="sm:max-w-[425px] rounded-[32px] border-zinc-100 bg-white px-6 py-6 shadow-2xl backdrop-blur-xl dark:border-zinc-800 dark:bg-zinc-900/80 sm:px-7 sm:py-7"
       >
         <DialogHeader class="pr-12">
           <DialogTitle class="text-xl font-bold">添加视频链接</DialogTitle>
         </DialogHeader>
         <div class="py-2">
-          <input
+          <Textarea
             v-model="linkDraft"
-            type="text"
-            class="w-full h-12 rounded-2xl border bg-zinc-50 dark:bg-zinc-800/50 px-4 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/10 dark:border-zinc-700"
+            rows="4"
+            class="w-full rounded-2xl border bg-zinc-50 px-4 py-3 text-sm focus-visible:ring-2 focus-visible:ring-blue-500/10 dark:border-zinc-700 dark:bg-zinc-800/50"
             placeholder="https://..."
           />
         </div>
         <DialogFooter class="mt-2 gap-3">
           <Button
             variant="outline"
+            size="sm"
             @click="showLinkModal = false"
-            class="h-12 rounded-full px-7"
+            class="rounded-lg px-4 shadow-none"
             >取消</Button
           >
           <Button
+            size="sm"
             @click="confirmLink"
-            class="h-12 rounded-full px-7 bg-zinc-900 text-white dark:bg-white dark:text-zinc-900"
+            class="rounded-lg px-4 shadow-none bg-zinc-900 text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200"
             >确认</Button
           >
         </DialogFooter>

@@ -11,20 +11,18 @@ const env = (
 const serverApiBase = env.NUXT_API_BASE || "http://127.0.0.1:8000";
 const publicApiDocsUrl =
   env.NUXT_API_DOCS_URL || `${serverApiBase}/docs`;
+const enableDevtools = env.NUXT_ENABLE_DEVTOOLS === "true";
 
 // https://nuxt.com/docs/api/configuration/nuxt-config
 export default defineNuxtConfig({
   compatibilityDate: "2025-07-15",
-  devtools: { enabled: true },
+  devtools: { enabled: enableDevtools },
   routeRules: {
     "/dashboard": { prerender: false },
     "/dashboard/**": { prerender: false },
     "/users": { prerender: false },
     "/users/**": { prerender: false },
-    "/permissions": { prerender: false },
-    "/permissions/**": { prerender: false },
     "/auth/users": { prerender: false },
-    "/auth/permissions": { prerender: false },
   },
   app: {
     head: {

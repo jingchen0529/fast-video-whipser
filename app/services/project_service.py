@@ -1,14 +1,20 @@
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import mimetypes
 import os
+import re
+import shutil
 import sqlite3
+import time
 import uuid
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from fastapi import HTTPException, UploadFile
 
@@ -61,6 +67,7 @@ DEFAULT_VIDEO_GENERATION = {
     "asset_type": None,
     "asset_name": None,
     "asset_url": None,
+    "output_asset_id": None,
     "audio_name": None,
     "audio_url": None,
     "reference_frames": [],
@@ -71,6 +78,33 @@ DEFAULT_VIDEO_GENERATION = {
     "result_video_url": None,
     "error_detail": None,
     "updated_at": None,
+}
+
+REMAKE_INTENT_LABELS = {
+    "video_remake": "视频复刻",
+    "viral_remake": "爆款复刻",
+}
+
+DEFAULT_DOUBAO_VIDEO_BASE_URL = "https://operator.las.cn-beijing.volces.com"
+DEFAULT_KLING_VIDEO_BASE_URL = "https://api-beijing.klingai.com"
+DEFAULT_WANXIANG_VIDEO_BASE_URL = "https://dashscope.aliyuncs.com"
+DOUBAO_VIDEO_TASK_PATHS = (
+    "/api/v1/contents/generations/tasks",
+    "/contents/generations/tasks",
+)
+
+VIDEO_PROVIDER_MODEL_ALIASES = {
+    "kling": {
+        "kling-v1": "kling-v3",
+        "kling-master": "kling-v3-omni",
+    },
+    "veo": {
+        "veo-2": "veo-2.0-generate-001",
+        "veo-3": "veo-3.0-generate-001",
+        "veo-3-fast": "veo-3.0-fast-generate-001",
+        "veo-3.1": "veo-3.1-generate-001",
+        "veo-3.1-fast": "veo-3.1-fast-generate-001",
+    },
 }
 
 JSON_PROJECT_COLUMNS = {
@@ -275,7 +309,10 @@ class ProjectService:
                 conversation_id=conversation_id,
                 role="assistant",
                 message_type="workflow_status",
-                content="收到，我会先提取视频链接并完成脚本分析，然后把拆解结果和优化建议整理给你。",
+                content=self._build_workflow_acceptance_message(
+                    workflow_type=normalized_workflow,
+                    objective=normalized_objective,
+                ),
                 content_json={
                     "project_id": project_id,
                     "workflow_type": normalized_workflow,
@@ -498,6 +535,34 @@ class ProjectService:
         project_id: int,
     ) -> dict[str, Any]:
         now = utcnow_iso()
+        rows_by_key = {
+            str(row.get("step_key") or "").strip(): row
+            for row in existing_rows
+            if str(row.get("step_key") or "").strip()
+        }
+
+        if workflow_type == "analysis":
+            legacy_analyze_row = rows_by_key.get("analyze_video_content")
+            if legacy_analyze_row is not None and definition.step_key in {
+                "segment_video_shots",
+                "generate_storyboard",
+            }:
+                detail = {
+                    "segment_video_shots": "旧版任务兼容补齐：已根据历史项目状态补齐镜头切分步骤，并沿用既有画面分析进度。",
+                    "generate_storyboard": "旧版任务兼容补齐：已根据历史项目状态补齐分镜生成步骤，并沿用既有画面分析进度。",
+                }[definition.step_key]
+                return {
+                    "step_key": definition.step_key,
+                    "title": definition.title,
+                    "detail": detail,
+                    "status": legacy_analyze_row.get("status") or "pending",
+                    "error_detail": legacy_analyze_row.get("error_detail"),
+                    "output_json": legacy_analyze_row.get("output_json"),
+                    "display_order": display_order,
+                    "created_at": legacy_analyze_row.get("created_at") or now,
+                    "updated_at": legacy_analyze_row.get("updated_at") or now,
+                }
+
         return {
             "step_key": definition.step_key,
             "title": definition.title,
@@ -614,6 +679,11 @@ class ProjectService:
         raw_items = raw_storyboard if isinstance(raw_storyboard, list) else (
             raw_storyboard.get("items") if isinstance(raw_storyboard, dict) else []
         )
+        summary = (
+            str(raw_storyboard.get("summary") or "").strip()
+            if isinstance(raw_storyboard, dict)
+            else ""
+        )
         if isinstance(raw_items, list) and raw_items:
             items: list[dict[str, Any]] = []
             for index, raw_item in enumerate(raw_items, start=1):
@@ -651,7 +721,7 @@ class ProjectService:
                 "id": None,
                 "version_no": 0,
                 "status": "legacy",
-                "summary": "",
+                "summary": summary or f"已回放 {len(items)} 条历史分镜。",
                 "items": items,
             }
 
@@ -775,7 +845,7 @@ class ProjectService:
             source_asset=source_asset,
             video_info=remote_video_info.get("video_info") or {},
         )
-        shot_segments = self._detect_shot_segments(
+        shot_segments = await self._detect_shot_segments(
             project=project,
             source_asset=source_asset,
             video_meta=video_meta,
@@ -1215,8 +1285,7 @@ class ProjectService:
         beam_size = int(provider.get("beam_size") or 5)
         vad_filter = bool(provider.get("vad_filter", True))
         resolved_device = self._resolve_faster_whisper_device(provider)
-        compute_type = (provider.get("compute_type") or "auto").strip().lower()
-        resolved_compute_type = "default" if compute_type in {"", "auto"} else compute_type
+        resolved_compute_type = self._resolve_faster_whisper_compute_type(provider)
 
         from app.utils.process_pool import run_in_process, run_whisper_transcription_worker
 
@@ -1344,6 +1413,20 @@ class ProjectService:
         recommended_device = str(capability.get("recommended_device") or "").strip().lower()
         return recommended_device or "cpu"
 
+    def _resolve_faster_whisper_compute_type(self, provider: dict[str, Any]) -> str:
+        requested = str(provider.get("compute_type") or "auto").strip().lower()
+        if requested not in {"", "auto", "default"}:
+            return requested
+
+        capability = SystemSettingsService().get_transcription_capabilities()["providers"].get(
+            "faster_whisper",
+            {},
+        )
+        recommended_compute_type = str(
+            capability.get("recommended_compute_type") or ""
+        ).strip().lower()
+        return recommended_compute_type or "int8"
+
     def _extract_openai_transcription_segments(
         self,
         *,
@@ -1407,10 +1490,42 @@ class ProjectService:
             context["source_asset"] = asset
             return asset
 
-        download_url = (
-            context.get("validate_video_link", {}).get("download_url")
-            or project["source_url"]
-        )
+        validate_context = context.get("validate_video_link", {})
+        remote_video_info = validate_context.get("remote_video_info") or {}
+        download_url = validate_context.get("download_url") or project["source_url"]
+        source_url = str(project.get("source_url") or "").strip()
+        platform = self._detect_platform(source_url)
+        if (
+            not remote_video_info
+            and source_url
+            and platform == "tiktok"
+            and not str(download_url or "").strip().lower().endswith(".mp4")
+        ):
+            crawler_result = await TikTokAPPCrawler().fetch_video_info(source_url)
+            remote_video_info = crawler_result
+            context.setdefault("validate_video_link", {})
+            context["validate_video_link"]["remote_video_info"] = crawler_result
+            context["validate_video_link"]["download_url"] = (
+                crawler_result.get("download_url") or source_url
+            )
+            download_url = context["validate_video_link"]["download_url"]
+
+            video_info = crawler_result.get("video_info") or {}
+            source_name = (
+                str(video_info.get("desc") or "").strip()
+                or project.get("source_name")
+                or source_url
+            )
+            self._update_project(
+                project_id=project["id"],
+                source_platform=platform,
+                source_name=source_name,
+                title=self._build_project_title(
+                    source_name=source_name,
+                    workflow_type=project["workflow_type"],
+                ),
+            )
+
         if not download_url:
             raise ValueError("缺少可下载的视频地址，无法继续执行视频分析。")
 
@@ -1729,7 +1844,7 @@ class ProjectService:
     ) -> str:
         workflow_label = {
             "analysis": "分析脚本",
-            "remake": "复刻爆款",
+            "remake": "视频复刻",
             "create": "创作爆款",
         }.get(workflow_type, workflow_type)
         lines = [f"任务类型：{workflow_label}"]
@@ -1740,6 +1855,22 @@ class ProjectService:
         elif source_name:
             lines.append(f"上传素材：{source_name}")
         return "\n".join(lines)
+
+    def _build_workflow_acceptance_message(
+        self,
+        *,
+        workflow_type: str,
+        objective: str,
+    ) -> str:
+        if workflow_type == "remake":
+            remake_intent = self._parse_remake_objective(objective)["intent_label"]
+            return (
+                f"收到，我会先确认参考素材和复刻意图，再调用系统配置的视频模型执行{remake_intent}，"
+                "最后把结果写回动态资产。"
+            )
+        if workflow_type == "create":
+            return "收到，我会先拆解创作目标并生成脚本，再调用视频模型产出初版素材。"
+        return "收到，我会先提取视频链接并完成脚本分析，然后把拆解结果和优化建议整理给你。"
 
     def _require_project(self, *, project_id: int) -> dict[str, Any]:
         project = self._get_project_for_execution(project_id=project_id)
@@ -1822,7 +1953,7 @@ class ProjectService:
         }
         return labels.get((value or "").strip(), value or "未标注")
 
-    def _detect_shot_segments(
+    async def _detect_shot_segments(
         self,
         *,
         project: dict[str, Any],
@@ -2837,54 +2968,2114 @@ class ProjectService:
     # ── Remake Workflow Steps ──
 
     async def _step_remake_select_source(self, *, project_id: int) -> dict[str, Any]:
-        """Step 1: Select the source motion asset to remake."""
-        # Placeholder logic
-        return {"detail": "已确认复刻参照的动作资产。"}
+        project = self._require_project(project_id=project_id)
+        source_asset = await self._ensure_source_asset(
+            project=project,
+            context={},
+        )
+        intent = self._parse_remake_objective(project.get("objective") or "")
+        public_url = source_asset.get("public_url") or self._extract_asset_public_url(source_asset)
+        video_generation = self._update_video_generation_state(
+            project_id=project_id,
+            project=project,
+            status="preparing",
+            provider=None,
+            model=None,
+            objective=intent["intent_label"],
+            asset_type="video",
+            asset_name=None,
+            asset_url=None,
+            output_asset_id=None,
+            prompt=None,
+            provider_task_id=None,
+            result_video_url=None,
+            error_detail=None,
+            reference_frames=[public_url] if public_url else [],
+        )
+        detail = f"已确认参考素材 {source_asset['file_name']}，后续将基于该素材的节奏和镜头结构执行{intent['intent_label']}。"
+        self._update_project(
+            project_id=project_id,
+            summary=detail,
+            media_url=public_url or project.get("media_url"),
+            source_asset_id=source_asset["id"],
+            video_generation=video_generation,
+        )
+        return {
+            "source_asset_id": source_asset["id"],
+            "reference_frames": video_generation.get("reference_frames") or [],
+            "intent": intent,
+            "detail": detail,
+        }
 
-    async def _step_remake_define_intent(self, *, project_id: int) -> dict[str, Any]:
-        """Step 2: Define what to keep and what to change."""
-        return {"detail": "已确认复刻意图：保留镜头动作与节奏，改写人物与场景风格。"}
+    async def _step_remake_analyze_reference(
+        self,
+        *,
+        project_id: int,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        project = self._require_project(project_id=project_id)
+        source_asset = await self._ensure_source_asset(
+            project=project,
+            context=context,
+        )
+        intent = self._parse_remake_objective(project.get("objective") or "")
+        public_url = source_asset.get("public_url") or self._extract_asset_public_url(source_asset)
+        preparing_generation = self._update_video_generation_state(
+            project_id=project_id,
+            project=project,
+            status="preparing",
+            provider=None,
+            model=None,
+            objective=intent["intent_label"],
+            asset_type="video",
+            asset_name=None,
+            asset_url=None,
+            output_asset_id=None,
+            prompt=None,
+            provider_task_id=None,
+            result_video_url=None,
+            error_detail=None,
+            reference_frames=[public_url] if public_url else [],
+        )
+        video_meta = self._build_video_meta(
+            project=project,
+            source_asset=source_asset,
+            video_info={},
+        )
+        shot_segments = await self._detect_shot_segments(
+            project=project,
+            source_asset=source_asset,
+            video_meta=video_meta,
+        )
+        if not shot_segments:
+            shot_segments = self._build_fallback_shot_segments(
+                video_meta=video_meta,
+                objective=project["objective"],
+                source_name=project["source_name"],
+            )
+        shot_segments = self._replace_shot_segments(
+            project_id=project_id,
+            project=project,
+            source_asset=source_asset,
+            shot_segments=shot_segments,
+        )
+        shot_segments = self._enrich_shot_segments(
+            shot_segments=shot_segments,
+            video_meta=video_meta,
+            objective=project["objective"],
+            source_name=project["source_name"],
+        )
+        timeline_segments: list[dict[str, Any]] = []
+        script_overview = deepcopy(DEFAULT_SCRIPT_OVERVIEW)
+        transcription_failed = False
+        try:
+            transcription_result = await self._transcribe_source_media(
+                project=project,
+                source_asset=source_asset,
+            )
+            timeline_segments = transcription_result.get("timeline_segments") or []
+            script_overview = self._build_script_overview(
+                timeline_segments=timeline_segments,
+                video_desc=project["objective"] or project["source_name"],
+            )
+        except Exception as exc:
+            transcription_failed = True
+            logger.warning("Reference transcription skipped for project %s: %s", project_id, exc)
+        if not timeline_segments:
+            timeline_segments = self._build_reference_fallback_timeline_segments(
+                shot_segments=shot_segments,
+                objective=project["objective"],
+                source_name=project["source_name"],
+            )
+            script_overview = self._build_script_overview(
+                timeline_segments=timeline_segments,
+                video_desc=project["objective"] or project["source_name"],
+            )
 
-    async def _step_remake_build_prompt(self, *, project_id: int) -> dict[str, Any]:
-        """Step 3: Construct the structured prompt for video generation."""
-        return {"detail": "已基于动作特征与用户指令构造出结构化 Prompt。"}
+        storyboard = self._build_reference_storyboard(
+            shot_segments=shot_segments,
+            objective=project["objective"],
+            source_name=project["source_name"],
+        )
+        source_analysis = {
+            "reference_frames": [],
+            "visual_features": self._build_visual_features(
+                video_meta=video_meta,
+                shot_segments=shot_segments,
+            ),
+            "shot_segment_count": len(shot_segments),
+            "reference_summary": storyboard.get("summary") or "",
+        }
+        video_generation = self._update_video_generation_state(
+            project_id=project_id,
+            project=project,
+            status="analyzing_reference",
+            objective=preparing_generation.get("objective"),
+            reference_frames=preparing_generation.get("reference_frames") or [],
+            storyboard=storyboard,
+        )
+        detail = f"已完成参考视频分析，整理出 {len(shot_segments)} 个镜头段和可用于生成的视频结构信息。"
+        if transcription_failed and timeline_segments:
+            detail += " 音频脚本未识别到有效口播，已根据镜头描述回填参考脚本。"
+        self._update_project(
+            project_id=project_id,
+            source_analysis=source_analysis,
+            script_overview=script_overview,
+            timeline_segments=timeline_segments,
+            summary=detail,
+            video_generation=video_generation,
+        )
+        return {
+            "video_meta": video_meta,
+            "shot_segments": shot_segments,
+            "timeline_segments": timeline_segments,
+            "script_overview": script_overview,
+            "source_analysis": source_analysis,
+            "storyboard": storyboard,
+            "detail": detail,
+        }
 
-    async def _step_remake_generate_video(self, *, project_id: int) -> dict[str, Any]:
-        """Step 4: Call video generation API."""
-        # This would be a long-running task
-        return {"detail": "视频生成引擎任务已提交，正在排队生产中。"}
+    async def _step_remake_define_intent(
+        self,
+        *,
+        project_id: int,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        project = self._require_project(project_id=project_id)
+        intent = self._parse_remake_objective(project.get("objective") or "")
+        video_generation = self._update_video_generation_state(
+            project_id=project_id,
+            project=project,
+            objective=intent["intent_label"],
+        )
+        keep_text = "、".join(intent["keep_items"]) if intent["keep_items"] else "镜头节奏"
+        change_text = "、".join(intent["change_items"]) if intent["change_items"] else "人物与场景"
+        detail = f"已确认复刻意图：保留 {keep_text}，改写 {change_text}。"
+        self._update_project(
+            project_id=project_id,
+            summary=detail,
+            video_generation=video_generation,
+        )
+        return {
+            "intent": intent,
+            "detail": detail,
+        }
 
-    async def _step_remake_evaluate_copyright(self, *, project_id: int) -> dict[str, Any]:
-        """Step 5: Evaluate visual similarity for copyright safety."""
-        return {"detail": "版权距离评估完成：原创性合规，风险等级：低。"}
+    async def _step_remake_build_prompt(
+        self,
+        *,
+        project_id: int,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        project = self._require_project(project_id=project_id)
+        intent = (
+            context.get("define_remake_intent", {}).get("intent")
+            or self._parse_remake_objective(project.get("objective") or "")
+        )
+        source_analysis = context.get("analyze_reference_video", {}).get("source_analysis") or DEFAULT_SOURCE_ANALYSIS
+        storyboard = context.get("analyze_reference_video", {}).get("storyboard") or deepcopy(DEFAULT_STORYBOARD)
+        script_overview = context.get("analyze_reference_video", {}).get("script_overview") or deepcopy(DEFAULT_SCRIPT_OVERVIEW)
+        video_meta = context.get("analyze_reference_video", {}).get("video_meta") or {
+            "width": 1080,
+            "height": 1920,
+            "duration_ms": 5000,
+        }
+        source_asset = None
+        if project.get("source_asset_id"):
+            source_asset = AssetService().get_asset(asset_id=project["source_asset_id"])
 
-    async def _step_remake_save_result(self, *, project_id: int) -> dict[str, Any]:
-        """Step 6: Save the resulting video asset."""
-        return {"detail": "复刻视频已成功保存至素材库，并关联血缘关系。"}
+        aspect_ratio = self._aspect_ratio_from_meta(
+            width=video_meta.get("width"),
+            height=video_meta.get("height"),
+        )
+        duration_seconds = self._duration_seconds_from_meta(video_meta.get("duration_ms"))
+        resolution = self._resolution_from_aspect_ratio(aspect_ratio)
+        prompt = self._build_remake_prompt(
+            intent=intent,
+            source_analysis=source_analysis,
+            storyboard=storyboard,
+            script_overview=script_overview,
+        )
+        negative_prompt = self._build_default_negative_prompt(intent_label=intent["intent_label"])
+        source_url = self._extract_generation_source_url(
+            project=project,
+            source_asset=source_asset,
+        )
+        reference_frames = self._filter_remote_media_urls(
+            (self._load_video_generation_state(project=project).get("reference_frames") or [])
+        )
+        request_payload = {
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
+            "duration_seconds": duration_seconds,
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+            "reference_frames": reference_frames,
+            "source_url": source_url,
+            "storyboard": storyboard,
+            "script": script_overview,
+            "mode": "remake",
+            "objective": intent["intent_label"],
+        }
+        video_generation = self._update_video_generation_state(
+            project_id=project_id,
+            project=project,
+            prompt=prompt,
+            storyboard=storyboard,
+            script=script_overview,
+            status="prompt_ready",
+            error_detail=None,
+        )
+        detail = "已结合参考视频结构、保留项和改写项构造出可直接提交给视频模型的生成指令。"
+        self._update_project(
+            project_id=project_id,
+            summary=detail,
+            video_generation=video_generation,
+        )
+        return {
+            "request_payload": request_payload,
+            "detail": detail,
+        }
+
+    async def _step_remake_generate_video(
+        self,
+        *,
+        project_id: int,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        project = self._require_project(project_id=project_id)
+        request_payload = context.get("build_remake_prompt", {}).get("request_payload") or {}
+        if not request_payload:
+            raise ValueError("缺少视频生成指令，无法提交复刻任务。")
+        provider = self._resolve_video_generation_provider()
+        submit_result = await self._submit_video_generation_task(
+            provider=provider,
+            request_payload=request_payload,
+        )
+        video_generation = self._update_video_generation_state(
+            project_id=project_id,
+            project=project,
+            status="running",
+            provider=provider["provider"],
+            model=provider["display_model"],
+            asset_type="video",
+            prompt=request_payload.get("prompt"),
+            provider_task_id=submit_result.get("provider_task_id"),
+            result_video_url=submit_result.get("result_video_url"),
+            error_detail=None,
+        )
+        detail = (
+            f"已向 {provider['label']} 提交视频生成任务。"
+            if submit_result.get("provider_task_id")
+            else f"{provider['label']} 已直接返回生成结果，准备下载入库。"
+        )
+        self._update_project(
+            project_id=project_id,
+            summary=detail,
+            video_generation=video_generation,
+        )
+        return {
+            "provider": provider,
+            "submit_result": submit_result,
+            "request_payload": request_payload,
+            "detail": detail,
+        }
+
+    async def _step_remake_poll_generation_result(
+        self,
+        *,
+        project_id: int,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        project = self._require_project(project_id=project_id)
+        current_generation = self._load_video_generation_state(project=project)
+        request_payload = (
+            context.get("build_remake_prompt", {}).get("request_payload")
+            or {}
+        )
+        provider = context.get("generate_video", {}).get("provider")
+        if not provider:
+            provider = self._resolve_video_generation_provider(
+                preferred_provider=str(current_generation.get("provider") or ""),
+            )
+        poll_result = await self._wait_for_video_generation_result(
+            provider=provider,
+            provider_task_id=str(current_generation.get("provider_task_id") or ""),
+            existing_result_url=str(current_generation.get("result_video_url") or ""),
+        )
+        asset = await self._persist_generated_video_asset(
+            project=project,
+            request_payload=request_payload,
+            provider=provider,
+            generation_result=poll_result,
+        )
+        video_generation = self._update_video_generation_state(
+            project_id=project_id,
+            project=project,
+            status="succeeded",
+            provider=provider["provider"],
+            model=provider["display_model"],
+            asset_type="video",
+            asset_name=asset["file_name"],
+            asset_url=asset["public_url"],
+            output_asset_id=asset["id"],
+            result_video_url=poll_result.get("result_video_url"),
+            error_detail=None,
+        )
+        detail = "视频生成完成，结果已下载并写入动态资产。"
+        self._update_project(
+            project_id=project_id,
+            media_url=asset["public_url"],
+            summary=detail,
+            video_generation=video_generation,
+        )
+        self._append_project_message(
+            project_id=project_id,
+            role="assistant",
+            message_type="video_generation_result",
+            content="复刻视频已生成完成。",
+            content_json={
+                "result_video_url": poll_result.get("result_video_url"),
+                "asset_url": asset["public_url"],
+                "output_asset_id": asset["id"],
+                "provider": provider["provider"],
+                "model": provider["display_model"],
+            },
+        )
+        return {
+            "asset": asset,
+            "generation_result": poll_result,
+            "detail": detail,
+        }
+
+    async def _step_remake_finish(
+        self,
+        *,
+        project_id: int,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        final_summary = "视频复刻工作流已完成，生成结果已入库到动态资产。"
+        self._update_project(
+            project_id=project_id,
+            status="succeeded",
+            summary=final_summary,
+            error_message=None,
+        )
+        return {"detail": final_summary}
 
     # ── Create Workflow Steps ──
 
     async def _step_create_define_objective(self, *, project_id: int) -> dict[str, Any]:
-        """Step 1: Parse creation objective."""
-        return {"detail": "已解析创作目标，识别出核心带货主题与受众定位。"}
+        project = self._require_project(project_id=project_id)
+        creative_brief = self._parse_create_objective(project.get("objective") or "")
+        project_reference_frames: list[str] = []
+        if project.get("media_url"):
+            project_reference_frames = [project["media_url"]]
+        video_generation = self._update_video_generation_state(
+            project_id=project_id,
+            project=project,
+            status="preparing",
+            objective="爆款创作",
+            asset_type="video",
+            reference_frames=project_reference_frames,
+            error_detail=None,
+            asset_name=None,
+            asset_url=None,
+            output_asset_id=None,
+            result_video_url=None,
+            provider=None,
+            model=None,
+            provider_task_id=None,
+        )
+        detail = "已解析创作目标，确认视频类型、目标人群和商品卖点。"
+        self._update_project(
+            project_id=project_id,
+            summary=detail,
+            video_generation=video_generation,
+        )
+        return {
+            "creative_brief": creative_brief,
+            "detail": detail,
+        }
 
-    async def _step_create_generate_script(self, *, project_id: int) -> dict[str, Any]:
-        """Step 2: Generate creative script and storyboard."""
-        return {"detail": "AI 已生成创意剧本、分镜描述和口播文案。"}
+    async def _step_create_generate_script(
+        self,
+        *,
+        project_id: int,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        project = self._require_project(project_id=project_id)
+        creative_brief = (
+            context.get("define_objective", {}).get("creative_brief")
+            or self._parse_create_objective(project.get("objective") or "")
+        )
+        timeline_segments = self._build_create_timeline_segments(
+            creative_brief=creative_brief,
+        )
+        script_overview = self._build_script_overview(
+            timeline_segments=timeline_segments,
+            video_desc=creative_brief.get("product_name") or project["objective"],
+        )
+        storyboard = self._build_create_storyboard(
+            timeline_segments=timeline_segments,
+            creative_brief=creative_brief,
+        )
+        prompt = self._build_create_prompt(
+            creative_brief=creative_brief,
+            storyboard=storyboard,
+        )
+        video_generation = self._update_video_generation_state(
+            project_id=project_id,
+            project=project,
+            script=script_overview,
+            storyboard=storyboard,
+            prompt=prompt,
+            status="script_ready",
+        )
+        detail = "已生成创作脚本、时间轴和基础分镜，可直接用于调用视频模型。"
+        self._update_project(
+            project_id=project_id,
+            script_overview=script_overview,
+            timeline_segments=timeline_segments,
+            summary=detail,
+            video_generation=video_generation,
+        )
+        return {
+            "creative_brief": creative_brief,
+            "timeline_segments": timeline_segments,
+            "script_overview": script_overview,
+            "storyboard": storyboard,
+            "prompt": prompt,
+            "detail": detail,
+        }
 
-    async def _step_create_select_style(self, *, project_id: int) -> dict[str, Any]:
-        """Step 3: Select or associate visual style references."""
-        return {"detail": "已关联视觉风格参考素材，确定了色调与运镜方案。"}
+    async def _step_create_select_style(
+        self,
+        *,
+        project_id: int,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        project = self._require_project(project_id=project_id)
+        creative_brief = (
+            context.get("generate_script", {}).get("creative_brief")
+            or context.get("define_objective", {}).get("creative_brief")
+            or self._parse_create_objective(project.get("objective") or "")
+        )
+        reference_frames = list(
+            self._load_video_generation_state(project=project).get("reference_frames") or []
+        )
+        style_profile = {
+            "video_type": creative_brief.get("video_type"),
+            "style_preference": creative_brief.get("style_preference"),
+            "target_audience": creative_brief.get("target_audience"),
+            "reference_mode": "local_reference" if reference_frames else "prompt_only",
+        }
+        detail = (
+            "已关联上传素材作为风格参考。"
+            if reference_frames
+            else "未提供额外参考素材，本次将按创作 Brief 直接生成。"
+        )
+        video_generation = self._update_video_generation_state(
+            project_id=project_id,
+            project=project,
+            reference_frames=reference_frames,
+        )
+        self._update_project(
+            project_id=project_id,
+            summary=detail,
+            video_generation=video_generation,
+        )
+        return {
+            "style_profile": style_profile,
+            "reference_frames": reference_frames,
+            "detail": detail,
+        }
 
-    async def _step_create_generate_video(self, *, project_id: int) -> dict[str, Any]:
-        """Step 4: Execute video generation."""
-        return {"detail": "创作视频生成任务已启动。"}
+    async def _step_create_generate_video(
+        self,
+        *,
+        project_id: int,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        project = self._require_project(project_id=project_id)
+        creative_brief = (
+            context.get("generate_script", {}).get("creative_brief")
+            or context.get("define_objective", {}).get("creative_brief")
+            or self._parse_create_objective(project.get("objective") or "")
+        )
+        storyboard = context.get("generate_script", {}).get("storyboard") or deepcopy(DEFAULT_STORYBOARD)
+        script_overview = context.get("generate_script", {}).get("script_overview") or deepcopy(DEFAULT_SCRIPT_OVERVIEW)
+        prompt = (
+            context.get("generate_script", {}).get("prompt")
+            or self._load_video_generation_state(project=project).get("prompt")
+            or self._build_create_prompt(
+                creative_brief=creative_brief,
+                storyboard=storyboard,
+            )
+        )
+        aspect_ratio = "9:16"
+        duration_seconds = 5
+        resolution = self._resolution_from_aspect_ratio(aspect_ratio)
+        request_payload = {
+            "prompt": prompt,
+            "negative_prompt": self._build_default_negative_prompt(intent_label="爆款创作"),
+            "duration_seconds": duration_seconds,
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+            "reference_frames": self._filter_remote_media_urls(
+                context.get("select_style_reference", {}).get("reference_frames") or []
+            ),
+            "source_url": "",
+            "storyboard": storyboard,
+            "script": script_overview,
+            "mode": "create",
+            "objective": "爆款创作",
+        }
+        provider = self._resolve_video_generation_provider()
+        submit_result = await self._submit_video_generation_task(
+            provider=provider,
+            request_payload=request_payload,
+        )
+        project = self._require_project(project_id=project_id)
+        running_generation = self._update_video_generation_state(
+            project_id=project_id,
+            project=project,
+            status="running",
+            provider=provider["provider"],
+            model=provider["display_model"],
+            prompt=prompt,
+            storyboard=storyboard,
+            script=script_overview,
+            provider_task_id=submit_result.get("provider_task_id"),
+            result_video_url=submit_result.get("result_video_url"),
+            error_detail=None,
+        )
+        self._update_project(
+            project_id=project_id,
+            summary=f"已向 {provider['label']} 提交创作视频生成任务。",
+            video_generation=running_generation,
+        )
+        poll_result = await self._wait_for_video_generation_result(
+            provider=provider,
+            provider_task_id=str(running_generation.get("provider_task_id") or ""),
+            existing_result_url=str(running_generation.get("result_video_url") or ""),
+        )
+        project = self._require_project(project_id=project_id)
+        asset = await self._persist_generated_video_asset(
+            project=project,
+            request_payload=request_payload,
+            provider=provider,
+            generation_result=poll_result,
+        )
+        video_generation = self._update_video_generation_state(
+            project_id=project_id,
+            project=project,
+            status="succeeded",
+            provider=provider["provider"],
+            model=provider["display_model"],
+            asset_type="video",
+            asset_name=asset["file_name"],
+            asset_url=asset["public_url"],
+            output_asset_id=asset["id"],
+            result_video_url=poll_result.get("result_video_url"),
+            error_detail=None,
+        )
+        detail = "创作视频已生成完成，并已写入动态资产。"
+        self._update_project(
+            project_id=project_id,
+            media_url=asset["public_url"],
+            summary=detail,
+            video_generation=video_generation,
+        )
+        self._append_project_message(
+            project_id=project_id,
+            role="assistant",
+            message_type="video_generation_result",
+            content="创作视频已生成完成。",
+            content_json={
+                "result_video_url": poll_result.get("result_video_url"),
+                "asset_url": asset["public_url"],
+                "output_asset_id": asset["id"],
+                "provider": provider["provider"],
+                "model": provider["display_model"],
+            },
+        )
+        return {
+            "provider": provider,
+            "asset": asset,
+            "generation_result": poll_result,
+            "detail": detail,
+        }
 
-    async def _step_create_post_production(self, *, project_id: int) -> dict[str, Any]:
-        """Step 5: Post-production processing (BGM, Captions)."""
-        return {"detail": "已完成背景音乐匹配、字幕压制与后期合成。"}
+    async def _step_create_post_production(
+        self,
+        *,
+        project_id: int,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        project = self._require_project(project_id=project_id)
+        video_generation = self._load_video_generation_state(project=project)
+        detail = (
+            "已完成生成结果整理，当前版本沿用模型返回的成片音轨，并保留后续字幕压制扩展位。"
+        )
+        self._update_project(
+            project_id=project_id,
+            summary=detail,
+            video_generation=video_generation,
+        )
+        return {"detail": detail}
 
-    async def _step_create_finish(self, *, project_id: int) -> dict[str, Any]:
-        """Step 6: Complete the creation workflow."""
-        self._update_project(project_id=project_id, status="completed")
-        return {"detail": "爆款创作工作流全部完成。"}
+    async def _step_create_finish(
+        self,
+        *,
+        project_id: int,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        final_summary = "爆款创作工作流已完成，生成结果已入库到动态资产。"
+        self._update_project(
+            project_id=project_id,
+            status="succeeded",
+            summary=final_summary,
+            error_message=None,
+        )
+        return {"detail": final_summary}
+
+    def _parse_key_value_objective(self, objective: str) -> dict[str, str]:
+        pairs: dict[str, str] = {}
+        for raw_line in (objective or "").splitlines():
+            line = raw_line.strip().strip("；;")
+            if not line:
+                continue
+            delimiter = "：" if "：" in line else ":" if ":" in line else None
+            if not delimiter:
+                continue
+            key, value = line.split(delimiter, 1)
+            normalized_key = key.strip()
+            normalized_value = value.strip()
+            if normalized_key and normalized_value:
+                pairs[normalized_key] = normalized_value
+        return pairs
+
+    def _split_structured_values(self, raw_value: str | None) -> list[str]:
+        normalized = str(raw_value or "").strip()
+        if not normalized:
+            return []
+        items = re.split(r"[、,，/|；;]+", normalized)
+        return [item.strip() for item in items if item and item.strip()]
+
+    def _parse_remake_objective(self, objective: str) -> dict[str, Any]:
+        kv_pairs = self._parse_key_value_objective(objective)
+        task_type_text = (
+            kv_pairs.get("任务类型")
+            or kv_pairs.get("类型")
+            or objective
+        )
+        intent_key = "viral_remake" if "爆款" in task_type_text or "viral" in task_type_text.lower() else "video_remake"
+        keep_items = self._split_structured_values(kv_pairs.get("保留项") or kv_pairs.get("保留"))
+        change_items = self._split_structured_values(kv_pairs.get("改写项") or kv_pairs.get("改动项"))
+        return {
+            "intent_key": intent_key,
+            "intent_label": REMAKE_INTENT_LABELS.get(intent_key, "视频复刻"),
+            "keep_items": keep_items or ["镜头节奏", "卖点结构"],
+            "change_items": change_items or ["人物设定", "场景风格"],
+            "target_platform": kv_pairs.get("目标平台") or "TikTok",
+            "target_audience": kv_pairs.get("目标人群") or kv_pairs.get("目标客群") or "",
+            "product_name": kv_pairs.get("商品名称") or "",
+            "selling_points": self._split_structured_values(
+                kv_pairs.get("商品卖点") or kv_pairs.get("卖点")
+            ),
+            "style_preference": kv_pairs.get("风格偏好") or kv_pairs.get("视频风格") or "",
+            "raw_objective": (objective or "").strip(),
+        }
+
+    def _parse_create_objective(self, objective: str) -> dict[str, Any]:
+        kv_pairs = self._parse_key_value_objective(objective)
+        selling_points = self._split_structured_values(
+            kv_pairs.get("我的商品卖点")
+            or kv_pairs.get("商品卖点")
+            or kv_pairs.get("卖点")
+        )
+        product_name = (
+            kv_pairs.get("我的商品名称")
+            or kv_pairs.get("商品名称")
+            or "目标商品"
+        )
+        return {
+            "video_type": kv_pairs.get("我希望创作的视频类型") or kv_pairs.get("视频类型") or "UGC种草",
+            "target_audience": kv_pairs.get("我的目标客群") or kv_pairs.get("目标客群") or kv_pairs.get("目标人群") or "",
+            "product_name": product_name,
+            "selling_points": selling_points or [objective.strip() or "突出核心卖点"],
+            "style_preference": kv_pairs.get("我倾向的视频风格") or kv_pairs.get("风格偏好") or "真实口播 + 生活化场景",
+            "hook": kv_pairs.get("开场钩子") or "",
+            "raw_objective": (objective or "").strip(),
+        }
+
+    def _build_create_timeline_segments(
+        self,
+        *,
+        creative_brief: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        product_name = creative_brief.get("product_name") or "产品"
+        selling_points = creative_brief.get("selling_points") or ["核心卖点"]
+        hook = creative_brief.get("hook") or f"{product_name}最值得被记住的好处"
+        style = creative_brief.get("style_preference") or "真实口播"
+        segment_texts = [
+            f"开场直接抛出钩子：{hook}，用 {style} 的镜头感迅速吸引停留。",
+            f"中段展示 {product_name} 的核心使用场景，重点突出 {selling_points[0]}。",
+            f"继续强化转化理由，补充 {'、'.join(selling_points[1:] or selling_points[:1])} 等细节证明。",
+            f"结尾给出明确行动召唤，强调 {product_name} 适合谁以及为什么现在就要尝试。",
+        ]
+        durations = ((0, 3000), (3000, 9000), (9000, 15000), (15000, 21000))
+        speakers = ("旁白", "口播", "口播", "旁白")
+        return [
+            {
+                "id": index,
+                "segment_type": "script",
+                "speaker": speakers[index - 1],
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "content": content,
+            }
+            for index, ((start_ms, end_ms), content) in enumerate(
+                zip(durations, segment_texts),
+                start=1,
+            )
+        ]
+
+    def _build_create_storyboard(
+        self,
+        *,
+        timeline_segments: list[dict[str, Any]],
+        creative_brief: dict[str, Any],
+    ) -> dict[str, Any]:
+        items: list[dict[str, Any]] = []
+        for index, segment in enumerate(timeline_segments, start=1):
+            items.append(
+                {
+                    "item_index": index,
+                    "title": f"创作分镜 {index}",
+                    "start_ms": int(segment.get("start_ms") or 0),
+                    "end_ms": int(segment.get("end_ms") or 0),
+                    "duration_ms": max(
+                        0,
+                        int(segment.get("end_ms") or 0) - int(segment.get("start_ms") or 0),
+                    ),
+                    "shot_type_code": "medium" if index in {2, 3} else "wide",
+                    "camera_angle_code": "eye_level",
+                    "camera_motion_code": "tracking" if index == 2 else "static",
+                    "visual_description": (
+                        f"{creative_brief.get('style_preference') or '生活化'} 场景下展示 "
+                        f"{creative_brief.get('product_name') or '产品'}，对应文案：{segment.get('content') or ''}"
+                    ),
+                    "source_segment_indexes": [index],
+                    "confidence": 0.76,
+                }
+            )
+        return {
+            "summary": f"围绕 {creative_brief.get('product_name') or '目标商品'} 生成 {len(items)} 条创作分镜。",
+            "items": items,
+        }
+
+    def _build_reference_storyboard(
+        self,
+        *,
+        shot_segments: list[dict[str, Any]],
+        objective: str,
+        source_name: str,
+    ) -> dict[str, Any]:
+        items: list[dict[str, Any]] = []
+        for index, segment in enumerate(shot_segments[:8], start=1):
+            items.append(
+                {
+                    "item_index": index,
+                    "title": segment.get("title") or self._build_shot_title(
+                        index=index - 1,
+                        total=max(len(shot_segments), 1),
+                        objective=objective,
+                        source_name=source_name,
+                    ),
+                    "start_ms": int(segment.get("start_ms") or 0),
+                    "end_ms": int(segment.get("end_ms") or 0),
+                    "duration_ms": int(segment.get("duration_ms") or 0),
+                    "shot_type_code": segment.get("shot_type_code") or "medium",
+                    "camera_angle_code": segment.get("camera_angle_code") or "eye_level",
+                    "camera_motion_code": segment.get("camera_motion_code") or "static",
+                    "visual_description": segment.get("visual_summary") or "",
+                    "source_segment_indexes": [int(segment.get("segment_index") or index)],
+                    "confidence": float(segment.get("confidence") or 0.7),
+                }
+            )
+        summary = (
+            f"已根据参考视频整理出 {len(items)} 条关键镜头，可用于保留节奏和卖点结构。"
+            if items
+            else "未提取到有效参考镜头，已退回文本描述生成。"
+        )
+        return {
+            "summary": summary,
+            "items": items,
+        }
+
+    def _build_create_prompt(
+        self,
+        *,
+        creative_brief: dict[str, Any],
+        storyboard: dict[str, Any],
+    ) -> str:
+        selling_points = "、".join(creative_brief.get("selling_points") or ["核心卖点"])
+        storyboard_lines = [
+            f"{item.get('item_index')}. {item.get('title')}: {item.get('visual_description')}"
+            for item in (storyboard.get("items") or [])[:6]
+        ]
+        return "\n".join(
+            [
+                "请生成一条适合 TikTok/短视频平台投放的竖屏商业短视频。",
+                f"视频类型：{creative_brief.get('video_type') or 'UGC种草'}",
+                f"目标人群：{creative_brief.get('target_audience') or '泛目标消费人群'}",
+                f"商品名称：{creative_brief.get('product_name') or '目标商品'}",
+                f"核心卖点：{selling_points}",
+                f"风格偏好：{creative_brief.get('style_preference') or '真实口播 + 快节奏镜头'}",
+                "分镜要求：",
+                *storyboard_lines,
+                "请突出真实使用感、明确利益点和结尾行动召唤，整体节奏紧凑，适合短视频转化。",
+            ]
+        ).strip()
+
+    def _build_remake_prompt(
+        self,
+        *,
+        intent: dict[str, Any],
+        source_analysis: dict[str, Any],
+        storyboard: dict[str, Any],
+        script_overview: dict[str, Any],
+    ) -> str:
+        keep_text = "、".join(intent.get("keep_items") or ["节奏结构"])
+        change_text = "、".join(intent.get("change_items") or ["人物与场景"])
+        storyboard_lines = [
+            f"{item.get('item_index')}. {item.get('title')}: {item.get('visual_description')}"
+            for item in (storyboard.get("items") or [])[:6]
+        ]
+        visual_summary = (
+            (source_analysis.get("visual_features") or {}).get("summary")
+            or "参考视频节奏紧凑，镜头围绕主体和卖点推进。"
+        )
+        script_text = (script_overview.get("full_text") or "").strip()
+        return "\n".join(
+            [
+                f"任务目标：{intent.get('intent_label') or '视频复刻'}",
+                f"保留项：{keep_text}",
+                f"改写项：{change_text}",
+                f"目标平台：{intent.get('target_platform') or 'TikTok'}",
+                f"目标人群：{intent.get('target_audience') or '泛电商受众'}",
+                (
+                    f"商品卖点：{'、'.join(intent.get('selling_points') or [])}"
+                    if intent.get("selling_points")
+                    else ""
+                ),
+                f"风格偏好：{intent.get('style_preference') or '真实口播 + 生活化场景'}",
+                f"参考视频视觉特征：{visual_summary}",
+                "参考分镜：",
+                *storyboard_lines,
+                f"参考脚本：{script_text or '未识别到完整脚本，按镜头节奏和卖点结构重构。'}",
+                "请在不复制原视频人物和具体场景的前提下，保留其节奏和卖点推进逻辑，生成原创版本。",
+            ]
+        ).strip()
+
+    def _build_reference_fallback_timeline_segments(
+        self,
+        *,
+        shot_segments: list[dict[str, Any]],
+        objective: str,
+        source_name: str,
+    ) -> list[dict[str, Any]]:
+        fallback_segments: list[dict[str, Any]] = []
+        seen_contents: set[str] = set()
+        for segment in shot_segments[:8]:
+            candidates = (
+                str(segment.get("transcript_text") or "").strip(),
+                str(segment.get("ocr_text") or "").strip(),
+                str(segment.get("visual_summary") or "").strip(),
+                str(segment.get("title") or "").strip(),
+            )
+            content = next((item for item in candidates if item), "")
+            normalized_content = content.strip()
+            if not normalized_content or normalized_content in seen_contents:
+                continue
+            seen_contents.add(normalized_content)
+            start_ms = int(segment.get("start_ms") or 0)
+            end_ms = max(start_ms, int(segment.get("end_ms") or start_ms))
+            fallback_segments.append(
+                {
+                    "id": len(fallback_segments) + 1,
+                    "segment_type": "caption",
+                    "speaker": "画面",
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                    "content": normalized_content,
+                }
+            )
+
+        if fallback_segments:
+            return fallback_segments
+
+        fallback_content = (
+            str(objective or "").strip()
+            or str(source_name or "").strip()
+            or "参考视频以主体展示和卖点推进为主。"
+        )
+        return [
+            {
+                "id": 1,
+                "segment_type": "caption",
+                "speaker": "画面",
+                "start_ms": 0,
+                "end_ms": 1000,
+                "content": fallback_content,
+            }
+        ]
+
+    def _build_default_negative_prompt(self, *, intent_label: str) -> str:
+        return (
+            f"避免低清晰度、避免明显畸变、避免多余肢体、避免字幕乱码、避免直接复制原视频人物肖像，"
+            f"保持 {intent_label} 的原创表达。"
+        )
+
+    def _aspect_ratio_from_meta(self, *, width: Any, height: Any) -> str:
+        safe_width = self._safe_int(width)
+        safe_height = self._safe_int(height)
+        if safe_width <= 0 or safe_height <= 0:
+            return "9:16"
+        if safe_width == safe_height:
+            return "1:1"
+        return "9:16" if safe_height > safe_width else "16:9"
+
+    def _duration_seconds_from_meta(self, duration_ms: Any) -> int:
+        safe_duration_ms = self._safe_int(duration_ms)
+        if safe_duration_ms <= 0:
+            return 5
+        return max(4, min(12, round(safe_duration_ms / 1000)))
+
+    def _resolution_from_aspect_ratio(self, aspect_ratio: str) -> str:
+        return "720P" if aspect_ratio in {"9:16", "16:9", "1:1"} else "720P"
+
+    def _safe_int(self, value: Any) -> int:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return 0
+
+    def _load_video_generation_state(self, *, project: dict[str, Any]) -> dict[str, Any]:
+        raw_value = project.get("video_generation")
+        if raw_value is None:
+            raw_value = project.get("video_generation_json")
+        return self._load_json_field(raw_value, DEFAULT_VIDEO_GENERATION)
+
+    def _update_video_generation_state(
+        self,
+        *,
+        project_id: int,
+        project: dict[str, Any],
+        **updates: Any,
+    ) -> dict[str, Any]:
+        state = self._load_video_generation_state(project=project)
+        state.update(updates)
+        state["updated_at"] = utcnow_iso()
+        self._update_project(
+            project_id=project_id,
+            video_generation=state,
+        )
+        return state
+
+    def _resolve_video_generation_provider(
+        self,
+        *,
+        preferred_provider: str = "",
+    ) -> dict[str, Any]:
+        settings_payload = SystemSettingsService().get_settings()
+        provider_group = settings_payload.get("remake") or {}
+        raw_providers = provider_group.get("providers") or []
+        providers = [
+            item
+            for item in raw_providers
+            if isinstance(item, dict) and str(item.get("provider") or "").strip()
+        ]
+        if not providers:
+            raise ValueError("系统未配置视频模型 provider，请先在设置页补齐 remake 配置。")
+
+        provider_map = {
+            str(item.get("provider") or "").strip().lower(): item
+            for item in providers
+        }
+        preferred_key = str(preferred_provider or "").strip().lower()
+        default_key = str(provider_group.get("default_provider") or "").strip().lower()
+
+        candidate = None
+        for key in (preferred_key, default_key):
+            if not key:
+                continue
+            matched = provider_map.get(key)
+            if matched and matched.get("enabled"):
+                candidate = matched
+                break
+        if candidate is None:
+            candidate = next((item for item in providers if item.get("enabled")), None)
+        if candidate is None:
+            candidate = providers[0]
+        if not candidate.get("enabled"):
+            raise ValueError("默认视频模型未启用，请先在系统设置中启用至少一个 remake provider。")
+        return self._build_video_generation_provider_payload(candidate)
+
+    def _build_video_generation_provider_payload(
+        self,
+        provider: dict[str, Any],
+    ) -> dict[str, Any]:
+        provider_key = str(provider.get("provider") or "").strip().lower()
+        base_url = str(provider.get("base_url") or "").strip()
+        if provider_key == "doubao" and not base_url:
+            base_url = DEFAULT_DOUBAO_VIDEO_BASE_URL
+        if provider_key == "kling" and not base_url:
+            base_url = DEFAULT_KLING_VIDEO_BASE_URL
+        if provider_key == "wanxiang" and not base_url:
+            base_url = DEFAULT_WANXIANG_VIDEO_BASE_URL
+        default_model = self._canonicalize_video_generation_model(
+            provider_key=provider_key,
+            model_name=str(provider.get("default_model") or "").strip(),
+        )
+        return {
+            "provider": provider_key,
+            "label": str(provider.get("label") or provider_key or "video"),
+            "base_url": base_url,
+            "api_key": str(provider.get("api_key") or "").strip(),
+            "request_model": default_model,
+            "display_model": default_model,
+        }
+
+    def _canonicalize_video_generation_model(
+        self,
+        *,
+        provider_key: str,
+        model_name: str,
+    ) -> str:
+        normalized = str(model_name or "").strip()
+        if not normalized:
+            return ""
+        aliases = VIDEO_PROVIDER_MODEL_ALIASES.get(provider_key, {})
+        return aliases.get(normalized.lower(), normalized)
+
+    def _format_bearer_authorization(self, token: str) -> str:
+        normalized = str(token or "").strip()
+        if not normalized:
+            raise ValueError("缺少 Bearer Token。")
+        return normalized if normalized.lower().startswith("bearer ") else f"Bearer {normalized}"
+
+    def _build_kling_authorization_value(self, api_key: str) -> str:
+        normalized = str(api_key or "").strip()
+        if not normalized:
+            raise ValueError("未配置可灵 API Token。也可以填写 AccessKey:SecretKey。")
+        if normalized.count(".") == 2 or normalized.lower().startswith("bearer "):
+            return self._format_bearer_authorization(normalized)
+        if ":" in normalized:
+            access_key, secret_key = normalized.split(":", 1)
+            if access_key.strip() and secret_key.strip():
+                return self._format_bearer_authorization(
+                    self._build_kling_jwt_token(
+                        access_key=access_key.strip(),
+                        secret_key=secret_key.strip(),
+                    )
+                )
+        return self._format_bearer_authorization(normalized)
+
+    def _build_kling_jwt_token(self, *, access_key: str, secret_key: str) -> str:
+        issued_at = int(time.time())
+        header = {"alg": "HS256", "typ": "JWT"}
+        payload = {
+            "iss": access_key,
+            "iat": issued_at,
+            "nbf": max(0, issued_at - 5),
+            "exp": issued_at + 30 * 60,
+        }
+        encoded_header = self._encode_jwt_segment(header)
+        encoded_payload = self._encode_jwt_segment(payload)
+        signing_input = f"{encoded_header}.{encoded_payload}"
+        signature = hmac.new(
+            secret_key.encode("utf-8"),
+            signing_input.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+        encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
+        return f"{signing_input}.{encoded_signature}"
+
+    def _encode_jwt_segment(self, value: dict[str, Any]) -> str:
+        return base64.urlsafe_b64encode(
+            json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).rstrip(b"=").decode("ascii")
+
+    def _build_veo_submit_url(self, *, base_url: str) -> str:
+        normalized = str(base_url or "").strip().rstrip("/")
+        if not normalized:
+            raise ValueError(
+                "Veo 需要配置完整的 Vertex AI publisher model endpoint，例如 "
+                "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{model_id}"
+            )
+        return normalized if normalized.endswith(":predictLongRunning") else f"{normalized}:predictLongRunning"
+
+    def _build_veo_poll_url(self, *, base_url: str) -> str:
+        normalized = str(base_url or "").strip().rstrip("/")
+        if not normalized:
+            raise ValueError("Veo 需要配置完整的 Vertex AI publisher model endpoint。")
+        if normalized.endswith(":fetchPredictOperation"):
+            return normalized
+        if normalized.endswith(":predictLongRunning"):
+            return normalized[: -len(":predictLongRunning")] + ":fetchPredictOperation"
+        return f"{normalized}:fetchPredictOperation"
+
+    def _normalize_veo_resolution(self, resolution: str) -> str:
+        normalized = str(resolution or "720P").strip().lower()
+        if normalized in {"1080p", "720p"}:
+            return normalized
+        return "720p"
+
+    def _normalize_veo_operation_status(
+        self,
+        *,
+        payload: dict[str, Any],
+        has_result: bool,
+    ) -> str:
+        if self._extract_nested_value(payload, "error", "response.error"):
+            return "failed"
+        done = self._extract_nested_value(payload, "done", "response.done")
+        if done is True:
+            return "succeeded" if has_result else "failed"
+        return "running"
+
+    def _filter_remote_media_urls(self, values: list[str]) -> list[str]:
+        return [
+            value.strip()
+            for value in values
+            if isinstance(value, str) and value.strip().startswith(("http://", "https://"))
+        ]
+
+    def _extract_generation_source_url(
+        self,
+        *,
+        project: dict[str, Any],
+        source_asset: dict[str, Any] | None,
+    ) -> str:
+        candidates: list[str] = []
+        if source_asset:
+            metadata = source_asset.get("metadata_json") or {}
+            if isinstance(metadata, dict):
+                candidates.extend(
+                    [
+                        str(metadata.get("download_url") or "").strip(),
+                        str(metadata.get("source_url") or "").strip(),
+                    ]
+                )
+        candidates.append(str(project.get("source_url") or "").strip())
+        for candidate in candidates:
+            if candidate.startswith(("http://", "https://")):
+                return candidate
+        return ""
+
+    async def _submit_video_generation_task(
+        self,
+        *,
+        provider: dict[str, Any],
+        request_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        provider_key = provider.get("provider")
+        if provider_key == "doubao":
+            return await self._submit_doubao_video_generation_task(
+                provider=provider,
+                request_payload=request_payload,
+            )
+        if provider_key == "kling":
+            return await self._submit_kling_video_generation_task(
+                provider=provider,
+                request_payload=request_payload,
+            )
+        if provider_key == "veo":
+            return await self._submit_veo_video_generation_task(
+                provider=provider,
+                request_payload=request_payload,
+            )
+        if provider_key == "wanxiang":
+            return await self._submit_wanxiang_video_generation_task(
+                provider=provider,
+                request_payload=request_payload,
+            )
+        return await self._submit_generic_video_generation_task(
+            provider=provider,
+            request_payload=request_payload,
+        )
+
+    async def _submit_doubao_video_generation_task(
+        self,
+        *,
+        provider: dict[str, Any],
+        request_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        submit_url = self._build_doubao_video_task_url(
+            base_url=str(provider.get("base_url") or DEFAULT_DOUBAO_VIDEO_BASE_URL),
+        )
+        api_key = str(provider.get("api_key") or "").strip()
+        if not api_key:
+            raise ValueError("未配置豆包视频模型 API Key。")
+        payload = {
+            "model": provider.get("request_model"),
+            "content": [
+                {
+                    "type": "text",
+                    "text": request_payload.get("prompt"),
+                }
+            ],
+            "duration": int(request_payload.get("duration_seconds") or 5),
+            "ratio": request_payload.get("aspect_ratio") or "9:16",
+        }
+        async with AsyncHttpClient(
+            follow_redirects=True,
+            headers={
+                "Authorization": self._format_bearer_authorization(api_key),
+                "Content-Type": "application/json",
+            },
+            request_timeout=120,
+        ) as client:
+            response = await client.fetch_post_json(
+                submit_url,
+                json=payload,
+            )
+        task_id = self._extract_nested_value(
+            response,
+            "id",
+            "task_id",
+            "data.id",
+            "data.task_id",
+        )
+        result_video_url = self._extract_result_video_url(response)
+        status = self._normalize_video_task_status(
+            self._extract_task_status(response),
+            has_result=bool(result_video_url),
+        )
+        return {
+            "provider_task_id": str(task_id or ""),
+            "status": status,
+            "result_video_url": result_video_url,
+            "raw_response": response,
+        }
+
+    async def _submit_kling_video_generation_task(
+        self,
+        *,
+        provider: dict[str, Any],
+        request_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        base_url = str(provider.get("base_url") or DEFAULT_KLING_VIDEO_BASE_URL).rstrip("/")
+        submit_url = (
+            base_url
+            if base_url.endswith("/v1/videos/text2video")
+            else f"{base_url}/v1/videos/text2video"
+        )
+        payload = {
+            "model_name": provider.get("request_model") or "kling-v3",
+            "prompt": request_payload.get("prompt"),
+            "negative_prompt": request_payload.get("negative_prompt"),
+            "mode": "pro",
+            "aspect_ratio": request_payload.get("aspect_ratio") or "9:16",
+            "duration": str(max(3, min(15, int(request_payload.get("duration_seconds") or 5)))),
+        }
+        async with AsyncHttpClient(
+            follow_redirects=True,
+            headers={
+                "Authorization": self._build_kling_authorization_value(
+                    str(provider.get("api_key") or "")
+                ),
+                "Content-Type": "application/json",
+            },
+            request_timeout=120,
+        ) as client:
+            response = await client.fetch_post_json(
+                submit_url,
+                json=payload,
+            )
+        task_id = self._extract_nested_value(
+            response,
+            "task_id",
+            "data.task_id",
+            "id",
+            "data.id",
+        )
+        result_video_url = self._extract_result_video_url(response)
+        status = self._normalize_video_task_status(
+            self._extract_task_status(response),
+            has_result=bool(result_video_url),
+        )
+        return {
+            "provider_task_id": str(task_id or ""),
+            "status": status,
+            "result_video_url": result_video_url,
+            "raw_response": response,
+        }
+
+    async def _submit_veo_video_generation_task(
+        self,
+        *,
+        provider: dict[str, Any],
+        request_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        submit_url = self._build_veo_submit_url(
+            base_url=str(provider.get("base_url") or "").strip(),
+        )
+        api_key = str(provider.get("api_key") or "").strip()
+        if not api_key:
+            raise ValueError("未配置 Veo Bearer Token。")
+        duration_seconds = int(request_payload.get("duration_seconds") or 5)
+        payload = {
+            "instances": [
+                {
+                    "prompt": request_payload.get("prompt"),
+                }
+            ],
+            "parameters": {
+                "sampleCount": 1,
+                "durationSeconds": duration_seconds,
+                "aspectRatio": request_payload.get("aspect_ratio") or "9:16",
+                "negativePrompt": request_payload.get("negative_prompt") or "",
+                "resolution": self._normalize_veo_resolution(
+                    str(request_payload.get("resolution") or "720P")
+                ),
+            },
+        }
+        async with AsyncHttpClient(
+            follow_redirects=True,
+            headers={
+                "Authorization": self._format_bearer_authorization(api_key),
+                "Content-Type": "application/json",
+            },
+            request_timeout=120,
+        ) as client:
+            response = await client.fetch_post_json(
+                submit_url,
+                json=payload,
+            )
+        task_id = self._extract_nested_value(
+            response,
+            "name",
+            "operation.name",
+        )
+        result_video_url = self._extract_result_video_url(response)
+        inline_video_bytes = self._extract_inline_video_bytes(response)
+        status = self._normalize_veo_operation_status(
+            payload=response,
+            has_result=bool(result_video_url or inline_video_bytes),
+        )
+        return {
+            "provider_task_id": str(task_id or ""),
+            "status": status,
+            "result_video_url": result_video_url,
+            "inline_video_bytes": inline_video_bytes,
+            "raw_response": response,
+        }
+
+    async def _submit_wanxiang_video_generation_task(
+        self,
+        *,
+        provider: dict[str, Any],
+        request_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        base_url = str(provider.get("base_url") or DEFAULT_WANXIANG_VIDEO_BASE_URL).rstrip("/")
+        submit_url = (
+            base_url
+            if "/video-synthesis" in base_url
+            else f"{base_url}/api/v1/services/aigc/video-generation/video-synthesis"
+        )
+        api_key = str(provider.get("api_key") or "").strip()
+        if not api_key:
+            raise ValueError("未配置万相视频模型 API Key。")
+        payload = {
+            "model": provider.get("request_model"),
+            "input": {
+                "prompt": request_payload.get("prompt"),
+            },
+            "parameters": {
+                "duration": int(request_payload.get("duration_seconds") or 5),
+                "resolution": request_payload.get("resolution") or "720P",
+                "watermark": False,
+            },
+        }
+        async with AsyncHttpClient(
+            follow_redirects=True,
+            headers={
+                "Authorization": self._format_bearer_authorization(api_key),
+                "Content-Type": "application/json",
+                "X-DashScope-Async": "enable",
+            },
+            request_timeout=120,
+        ) as client:
+            response = await client.fetch_post_json(
+                submit_url,
+                json=payload,
+            )
+        task_id = self._extract_nested_value(
+            response,
+            "output.task_id",
+            "task_id",
+            "data.task_id",
+            "id",
+        )
+        result_video_url = self._extract_result_video_url(response)
+        status = self._normalize_video_task_status(
+            self._extract_task_status(response),
+            has_result=bool(result_video_url),
+        )
+        return {
+            "provider_task_id": str(task_id or ""),
+            "status": status,
+            "result_video_url": result_video_url,
+            "raw_response": response,
+        }
+
+    async def _submit_generic_video_generation_task(
+        self,
+        *,
+        provider: dict[str, Any],
+        request_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        base_url = str(provider.get("base_url") or "").rstrip("/")
+        api_key = str(provider.get("api_key") or "").strip()
+        if not base_url:
+            raise ValueError("当前视频模型未配置 Base URL。")
+        submit_url = base_url if any(
+            token in base_url for token in ("/tasks", "/generations", "/video-synthesis")
+        ) else f"{base_url}/tasks"
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = self._format_bearer_authorization(api_key)
+        payload = {
+            "model": provider.get("request_model"),
+            "prompt": request_payload.get("prompt"),
+            "negative_prompt": request_payload.get("negative_prompt"),
+            "task_type": "video_generation",
+            "input": {
+                "prompt": request_payload.get("prompt"),
+                "negative_prompt": request_payload.get("negative_prompt"),
+                "source_url": request_payload.get("source_url") or "",
+                "reference_frames": request_payload.get("reference_frames") or [],
+                "storyboard": request_payload.get("storyboard") or {},
+                "script": request_payload.get("script") or {},
+            },
+            "parameters": {
+                "duration": int(request_payload.get("duration_seconds") or 5),
+                "aspect_ratio": request_payload.get("aspect_ratio") or "9:16",
+                "resolution": request_payload.get("resolution") or "720P",
+                "mode": request_payload.get("mode") or "create",
+            },
+        }
+        async with AsyncHttpClient(
+            follow_redirects=True,
+            headers=headers,
+            request_timeout=120,
+        ) as client:
+            response = await client.fetch_post_json(
+                submit_url,
+                json=payload,
+            )
+        task_id = self._extract_nested_value(
+            response,
+            "task_id",
+            "id",
+            "data.task_id",
+            "data.id",
+            "output.task_id",
+        )
+        result_video_url = self._extract_result_video_url(response)
+        status = self._normalize_video_task_status(
+            self._extract_task_status(response),
+            has_result=bool(result_video_url),
+        )
+        return {
+            "provider_task_id": str(task_id or ""),
+            "status": status,
+            "result_video_url": result_video_url,
+            "raw_response": response,
+        }
+
+    async def _wait_for_video_generation_result(
+        self,
+        *,
+        provider: dict[str, Any],
+        provider_task_id: str,
+        existing_result_url: str = "",
+        max_attempts: int = 45,
+        poll_interval_seconds: float = 2.0,
+    ) -> dict[str, Any]:
+        if existing_result_url:
+            return {
+                "status": "succeeded",
+                "provider_task_id": provider_task_id,
+                "result_video_url": existing_result_url,
+                "error_detail": None,
+                "raw_response": {},
+            }
+        if not provider_task_id:
+            raise ValueError("视频模型未返回 provider_task_id，无法继续轮询。")
+
+        last_result: dict[str, Any] = {}
+        for _ in range(max_attempts):
+            poll_result = await self._poll_video_generation_task(
+                provider=provider,
+                provider_task_id=provider_task_id,
+            )
+            last_result = poll_result
+            if poll_result["status"] == "succeeded":
+                return poll_result
+            if poll_result["status"] == "failed":
+                raise ValueError(poll_result.get("error_detail") or "第三方视频生成失败。")
+            await asyncio.sleep(poll_interval_seconds)
+        raise ValueError(
+            last_result.get("error_detail")
+            or "视频生成超时，请稍后重试或检查第三方任务状态。"
+        )
+
+    async def _poll_video_generation_task(
+        self,
+        *,
+        provider: dict[str, Any],
+        provider_task_id: str,
+    ) -> dict[str, Any]:
+        provider_key = provider.get("provider")
+        if provider_key == "doubao":
+            return await self._poll_doubao_video_generation_task(
+                provider=provider,
+                provider_task_id=provider_task_id,
+            )
+        if provider_key == "kling":
+            return await self._poll_kling_video_generation_task(
+                provider=provider,
+                provider_task_id=provider_task_id,
+            )
+        if provider_key == "veo":
+            return await self._poll_veo_video_generation_task(
+                provider=provider,
+                provider_task_id=provider_task_id,
+            )
+        if provider_key == "wanxiang":
+            return await self._poll_wanxiang_video_generation_task(
+                provider=provider,
+                provider_task_id=provider_task_id,
+            )
+        return await self._poll_generic_video_generation_task(
+            provider=provider,
+            provider_task_id=provider_task_id,
+        )
+
+    async def _poll_doubao_video_generation_task(
+        self,
+        *,
+        provider: dict[str, Any],
+        provider_task_id: str,
+    ) -> dict[str, Any]:
+        poll_url = self._build_doubao_video_task_url(
+            base_url=str(provider.get("base_url") or DEFAULT_DOUBAO_VIDEO_BASE_URL),
+            provider_task_id=provider_task_id,
+        )
+        api_key = str(provider.get("api_key") or "").strip()
+        async with AsyncHttpClient(
+            follow_redirects=True,
+            headers={
+                "Authorization": self._format_bearer_authorization(api_key),
+                "Content-Type": "application/json",
+            },
+            request_timeout=120,
+        ) as client:
+            response = await client.fetch_get_json(poll_url)
+        result_video_url = self._extract_result_video_url(response)
+        return {
+            "status": self._normalize_video_task_status(
+                self._extract_task_status(response),
+                has_result=bool(result_video_url),
+            ),
+            "provider_task_id": provider_task_id,
+            "result_video_url": result_video_url,
+            "cover_url": self._extract_cover_url(response),
+            "error_detail": self._extract_error_detail(response),
+            "raw_response": response,
+        }
+
+    def _build_doubao_video_task_url(
+        self,
+        *,
+        base_url: str,
+        provider_task_id: str | None = None,
+    ) -> str:
+        normalized_base, task_path = self._resolve_doubao_video_task_endpoint(
+            base_url=base_url,
+        )
+        task_url = f"{normalized_base}{task_path}"
+        if provider_task_id:
+            return f"{task_url.rstrip('/')}/{provider_task_id}"
+        return task_url
+
+    def _resolve_doubao_video_task_endpoint(
+        self,
+        *,
+        base_url: str,
+    ) -> tuple[str, str]:
+        normalized = str(base_url or "").strip().rstrip("/")
+        if not normalized:
+            normalized = DEFAULT_DOUBAO_VIDEO_BASE_URL
+
+        lowered = normalized.lower()
+        for task_path in DOUBAO_VIDEO_TASK_PATHS:
+            if lowered.endswith(task_path):
+                return normalized[: -len(task_path)], task_path
+
+        if "ark.cn-beijing.volces.com" in lowered or lowered.endswith("/api/v3"):
+            return normalized, "/contents/generations/tasks"
+
+        return normalized, "/api/v1/contents/generations/tasks"
+
+    async def _poll_kling_video_generation_task(
+        self,
+        *,
+        provider: dict[str, Any],
+        provider_task_id: str,
+    ) -> dict[str, Any]:
+        base_url = str(provider.get("base_url") or DEFAULT_KLING_VIDEO_BASE_URL).rstrip("/")
+        poll_url = (
+            f"{base_url}/{provider_task_id}"
+            if base_url.endswith("/v1/videos/text2video")
+            else f"{base_url}/v1/videos/text2video/{provider_task_id}"
+        )
+        async with AsyncHttpClient(
+            follow_redirects=True,
+            headers={
+                "Authorization": self._build_kling_authorization_value(
+                    str(provider.get("api_key") or "")
+                ),
+                "Content-Type": "application/json",
+            },
+            request_timeout=120,
+        ) as client:
+            response = await client.fetch_get_json(poll_url)
+        result_video_url = self._extract_result_video_url(response)
+        return {
+            "status": self._normalize_video_task_status(
+                self._extract_task_status(response),
+                has_result=bool(result_video_url),
+            ),
+            "provider_task_id": provider_task_id,
+            "result_video_url": result_video_url,
+            "cover_url": self._extract_cover_url(response),
+            "error_detail": self._extract_error_detail(response),
+            "raw_response": response,
+        }
+
+    async def _poll_veo_video_generation_task(
+        self,
+        *,
+        provider: dict[str, Any],
+        provider_task_id: str,
+    ) -> dict[str, Any]:
+        poll_url = self._build_veo_poll_url(
+            base_url=str(provider.get("base_url") or "").strip(),
+        )
+        api_key = str(provider.get("api_key") or "").strip()
+        if not api_key:
+            raise ValueError("未配置 Veo Bearer Token。")
+        async with AsyncHttpClient(
+            follow_redirects=True,
+            headers={
+                "Authorization": self._format_bearer_authorization(api_key),
+                "Content-Type": "application/json",
+            },
+            request_timeout=120,
+        ) as client:
+            response = await client.fetch_post_json(
+                poll_url,
+                json={"operationName": provider_task_id},
+            )
+        result_video_url = self._extract_result_video_url(response)
+        inline_video_bytes = self._extract_inline_video_bytes(response)
+        return {
+            "status": self._normalize_veo_operation_status(
+                payload=response,
+                has_result=bool(result_video_url or inline_video_bytes),
+            ),
+            "provider_task_id": provider_task_id,
+            "result_video_url": result_video_url,
+            "inline_video_bytes": inline_video_bytes,
+            "cover_url": self._extract_cover_url(response),
+            "error_detail": self._extract_error_detail(response),
+            "raw_response": response,
+        }
+
+    async def _poll_wanxiang_video_generation_task(
+        self,
+        *,
+        provider: dict[str, Any],
+        provider_task_id: str,
+    ) -> dict[str, Any]:
+        base_url = str(provider.get("base_url") or DEFAULT_WANXIANG_VIDEO_BASE_URL).rstrip("/")
+        parsed = urlparse(base_url)
+        root_url = (
+            f"{parsed.scheme}://{parsed.netloc}"
+            if parsed.scheme and parsed.netloc
+            else base_url
+        ).rstrip("/")
+        poll_url = f"{root_url}/api/v1/tasks/{provider_task_id}"
+        api_key = str(provider.get("api_key") or "").strip()
+        async with AsyncHttpClient(
+            follow_redirects=True,
+            headers={
+                "Authorization": self._format_bearer_authorization(api_key),
+                "Content-Type": "application/json",
+            },
+            request_timeout=120,
+        ) as client:
+            response = await client.fetch_get_json(poll_url)
+        result_video_url = self._extract_result_video_url(response)
+        return {
+            "status": self._normalize_video_task_status(
+                self._extract_task_status(response),
+                has_result=bool(result_video_url),
+            ),
+            "provider_task_id": provider_task_id,
+            "result_video_url": result_video_url,
+            "cover_url": self._extract_cover_url(response),
+            "error_detail": self._extract_error_detail(response),
+            "raw_response": response,
+        }
+
+    async def _poll_generic_video_generation_task(
+        self,
+        *,
+        provider: dict[str, Any],
+        provider_task_id: str,
+    ) -> dict[str, Any]:
+        base_url = str(provider.get("base_url") or "").rstrip("/")
+        api_key = str(provider.get("api_key") or "").strip()
+        if not base_url:
+            raise ValueError("当前视频模型未配置 Base URL。")
+        if any(token in base_url for token in ("/tasks", "/generations", "/video-synthesis")):
+            poll_url = f"{base_url.rstrip('/')}/{provider_task_id}"
+        else:
+            poll_url = f"{base_url}/tasks/{provider_task_id}"
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = self._format_bearer_authorization(api_key)
+        async with AsyncHttpClient(
+            follow_redirects=True,
+            headers=headers,
+            request_timeout=120,
+        ) as client:
+            response = await client.fetch_get_json(poll_url)
+        result_video_url = self._extract_result_video_url(response)
+        return {
+            "status": self._normalize_video_task_status(
+                self._extract_task_status(response),
+                has_result=bool(result_video_url),
+            ),
+            "provider_task_id": provider_task_id,
+            "result_video_url": result_video_url,
+            "cover_url": self._extract_cover_url(response),
+            "error_detail": self._extract_error_detail(response),
+            "raw_response": response,
+        }
+
+    def _extract_nested_value(
+        self,
+        payload: dict[str, Any],
+        *paths: str,
+    ) -> Any:
+        for path in paths:
+            current: Any = payload
+            for part in path.split("."):
+                if isinstance(current, dict):
+                    current = current.get(part)
+                    continue
+                if isinstance(current, list) and part.isdigit():
+                    index = int(part)
+                    if 0 <= index < len(current):
+                        current = current[index]
+                        continue
+                current = None
+                break
+            if current not in (None, "", []):
+                return current
+        return None
+
+    def _extract_task_status(self, payload: dict[str, Any]) -> str:
+        value = self._extract_nested_value(
+            payload,
+            "status",
+            "state",
+            "task_status",
+            "output.task_status",
+            "output.status",
+            "data.status",
+            "data.state",
+            "data.task_status",
+            "result.status",
+        )
+        return str(value or "").strip()
+
+    def _extract_result_video_url(self, payload: dict[str, Any]) -> str:
+        value = self._extract_nested_value(
+            payload,
+            "result_video_url",
+            "video_url",
+            "output.video_url",
+            "content.video_url",
+            "data.video_url",
+            "data.result_video_url",
+            "data.content.video_url",
+            "output.results.0.video_url",
+            "output.results.0.url",
+            "task_result.videos.0.url",
+            "task_result.videos.0.video_url",
+            "data.task_result.videos.0.url",
+            "data.task_result.videos.0.video_url",
+            "response.videos.0.gcsUri",
+            "response.videos.0.uri",
+            "response.generatedVideos.0.video.uri",
+            "result.video_url",
+            "result.url",
+        )
+        return str(value or "").strip()
+
+    def _extract_inline_video_bytes(self, payload: dict[str, Any]) -> str:
+        value = self._extract_nested_value(
+            payload,
+            "inline_video_bytes",
+            "video_bytes_base64",
+            "response.videos.0.bytesBase64Encoded",
+            "response.generatedVideos.0.video.bytesBase64Encoded",
+            "videos.0.bytesBase64Encoded",
+            "generatedVideos.0.video.bytesBase64Encoded",
+        )
+        return str(value or "").strip()
+
+    def _extract_cover_url(self, payload: dict[str, Any]) -> str:
+        value = self._extract_nested_value(
+            payload,
+            "cover_url",
+            "output.cover_url",
+            "content.poster_url",
+            "content.last_frame_url",
+            "output.results.0.cover_url",
+            "task_result.videos.0.cover_url",
+            "data.task_result.videos.0.cover_url",
+            "result.cover_url",
+        )
+        return str(value or "").strip()
+
+    def _extract_error_detail(self, payload: dict[str, Any]) -> str:
+        value = self._extract_nested_value(
+            payload,
+            "error_detail",
+            "error_message",
+            "message",
+            "msg",
+            "output.message",
+            "output.error_message",
+            "data.error_message",
+            "error.message",
+            "response.error.message",
+            "result.error_message",
+        )
+        return str(value or "").strip()
+
+    def _normalize_video_task_status(
+        self,
+        raw_status: str,
+        *,
+        has_result: bool,
+    ) -> str:
+        normalized = str(raw_status or "").strip().lower()
+        if has_result and not normalized:
+            return "succeeded"
+        if normalized in {"succeeded", "success", "successful", "succeed", "done", "completed", "finished"}:
+            return "succeeded"
+        if normalized in {"failed", "error", "cancelled", "canceled"}:
+            return "failed"
+        if normalized in {"", "queued", "pending", "submitted", "running", "processing", "in_progress"}:
+            return "running"
+        return "running"
+
+    async def _persist_generated_video_asset(
+        self,
+        *,
+        project: dict[str, Any],
+        request_payload: dict[str, Any],
+        provider: dict[str, Any],
+        generation_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        result_video_url = str(generation_result.get("result_video_url") or "").strip()
+        inline_video_bytes = str(generation_result.get("inline_video_bytes") or "").strip()
+        if not result_video_url and not inline_video_bytes:
+            raise ValueError("第三方已完成任务，但未返回可下载的视频地址或内联视频内容。")
+
+        downloaded_path = await self._materialize_generated_video_file(
+            provider=provider,
+            generation_result=generation_result,
+        )
+
+        target_dir = self._generated_upload_dir()
+        target_name = self._build_generated_asset_name(
+            workflow_type=project.get("workflow_type") or "create",
+            download_url=result_video_url,
+        )
+        target_path = target_dir / target_name
+        if target_path.exists():
+            target_path = target_dir / f"{target_path.stem}-{uuid.uuid4().hex[:6]}{target_path.suffix}"
+        if Path(downloaded_path).resolve() != target_path.resolve():
+            shutil.move(downloaded_path, target_path)
+
+        source_asset = None
+        if project.get("source_asset_id"):
+            source_asset = AssetService().get_asset(asset_id=project["source_asset_id"])
+        duration_ms, width, height = self._resolve_generated_video_dimensions(
+            request_payload=request_payload,
+            generation_result=generation_result,
+            source_asset=source_asset,
+        )
+        file_name = target_path.name
+        mime_type = mimetypes.guess_type(str(target_path))[0] or "video/mp4"
+        size_bytes = os.path.getsize(target_path)
+        public_url = self._build_public_upload_url(str(target_path))
+        asset = AssetService().create_asset(
+            owner_user_id=project["user_id"],
+            asset_type="video",
+            source_type="generated",
+            file_name=file_name,
+            file_path=str(target_path),
+            mime_type=mime_type,
+            size_bytes=size_bytes,
+            duration_ms=duration_ms,
+            width=width,
+            height=height,
+            metadata={
+                "public_url": public_url,
+                "provider": provider.get("provider"),
+                "model": provider.get("display_model"),
+                "provider_task_id": generation_result.get("provider_task_id"),
+                "result_video_url": result_video_url,
+                "inline_video_bytes": bool(inline_video_bytes),
+                "cover_url": generation_result.get("cover_url"),
+                "project_id": project["id"],
+                "source_asset_id": project.get("source_asset_id"),
+            },
+        )
+        asset["public_url"] = public_url
+        return asset
+
+    async def _materialize_generated_video_file(
+        self,
+        *,
+        provider: dict[str, Any],
+        generation_result: dict[str, Any],
+    ) -> str:
+        inline_video_bytes = str(generation_result.get("inline_video_bytes") or "").strip()
+        if inline_video_bytes:
+            target_path = self._generated_upload_dir() / f"inline-{uuid.uuid4().hex[:8]}.mp4"
+            try:
+                target_path.write_bytes(base64.b64decode(inline_video_bytes))
+            except (ValueError, TypeError) as exc:
+                raise ValueError("Veo 返回的内联视频内容无法解码。") from exc
+            return str(target_path)
+
+        result_video_url = str(generation_result.get("result_video_url") or "").strip()
+        if result_video_url.startswith("gs://"):
+            return await self._download_gcs_generated_video(
+                provider=provider,
+                gcs_uri=result_video_url,
+            )
+
+        async with FileUtils(
+            temp_dir=str(self._generated_upload_dir()),
+            auto_delete=False,
+            max_file_size=settings.max_file_size,
+        ) as file_utils:
+            return await file_utils.download_file_from_url(result_video_url)
+
+    async def _download_gcs_generated_video(
+        self,
+        *,
+        provider: dict[str, Any],
+        gcs_uri: str,
+    ) -> str:
+        bucket, object_name = self._parse_gcs_uri(gcs_uri)
+        api_key = str(provider.get("api_key") or "").strip()
+        if not api_key:
+            raise ValueError("下载 Veo GCS 结果前需要配置 Bearer Token。")
+        download_url = (
+            f"https://storage.googleapis.com/download/storage/v1/b/{quote(bucket, safe='')}"
+            f"/o/{quote(object_name, safe='')}?alt=media"
+        )
+        target_path = self._generated_upload_dir() / f"gcs-{uuid.uuid4().hex[:8]}.mp4"
+        async with AsyncHttpClient(
+            follow_redirects=True,
+            headers={
+                "Authorization": self._format_bearer_authorization(api_key),
+                "Accept": "*/*",
+            },
+            request_timeout=300,
+        ) as client:
+            await client.download_file(download_url, str(target_path))
+        return str(target_path)
+
+    def _parse_gcs_uri(self, gcs_uri: str) -> tuple[str, str]:
+        normalized = str(gcs_uri or "").strip()
+        if not normalized.startswith("gs://"):
+            raise ValueError("无效的 GCS URI。")
+        bucket_and_object = normalized[5:]
+        if "/" not in bucket_and_object:
+            raise ValueError("GCS URI 缺少对象路径。")
+        bucket, object_name = bucket_and_object.split("/", 1)
+        if not bucket or not object_name:
+            raise ValueError("GCS URI 缺少 bucket 或对象路径。")
+        return bucket, object_name
+
+    def _resolve_generated_video_dimensions(
+        self,
+        *,
+        request_payload: dict[str, Any],
+        generation_result: dict[str, Any],
+        source_asset: dict[str, Any] | None,
+    ) -> tuple[int | None, int | None, int | None]:
+        duration_ms = self._safe_int(
+            self._extract_nested_value(
+                generation_result.get("raw_response") or {},
+                "usage.video_duration",
+                "usage.duration_ms",
+                "output.duration_ms",
+                "result.duration_ms",
+            )
+        )
+        if duration_ms <= 0:
+            duration_ms = int(request_payload.get("duration_seconds") or 5) * 1000
+
+        if source_asset and source_asset.get("width") and source_asset.get("height"):
+            return duration_ms, int(source_asset["width"]), int(source_asset["height"])
+
+        aspect_ratio = str(request_payload.get("aspect_ratio") or "9:16")
+        if aspect_ratio == "16:9":
+            return duration_ms, 1280, 720
+        if aspect_ratio == "1:1":
+            return duration_ms, 720, 720
+        return duration_ms, 720, 1280
+
+    def _generated_upload_dir(self) -> Path:
+        directory = Path("uploads") / "generated"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory.resolve()
+
+    def _build_generated_asset_name(
+        self,
+        *,
+        workflow_type: str,
+        download_url: str,
+    ) -> str:
+        date_part = utcnow_iso()[:10].replace("-", "")
+        extension = Path(urlparse(download_url).path).suffix or ".mp4"
+        prefix = "viral-remake" if workflow_type == "remake" else "viral-create"
+        return f"{prefix}-{date_part}-{uuid.uuid4().hex[:6]}{extension}"

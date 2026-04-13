@@ -76,16 +76,44 @@ class CreateWorkflow(WorkflowDefinition):
         return await self._service._step_create_define_objective(project_id=ctx.project_id)
 
     async def _generate_script(self, ctx: WorkflowContext) -> dict[str, Any]:
-        return await self._service._step_create_generate_script(project_id=ctx.project_id)
+        return await self._service._step_create_generate_script(
+            project_id=ctx.project_id,
+            context=self._build_legacy_context(ctx),
+        )
 
     async def _select_style_reference(self, ctx: WorkflowContext) -> dict[str, Any]:
-        return await self._service._step_create_select_style(project_id=ctx.project_id)
+        return await self._service._step_create_select_style(
+            project_id=ctx.project_id,
+            context=self._build_legacy_context(ctx),
+        )
 
     async def _generate_video(self, ctx: WorkflowContext) -> dict[str, Any]:
-        return await self._service._step_create_generate_video(project_id=ctx.project_id)
+        return await self._service._step_create_generate_video(
+            project_id=ctx.project_id,
+            context=self._build_legacy_context(ctx),
+        )
 
     async def _post_production(self, ctx: WorkflowContext) -> dict[str, Any]:
-        return await self._service._step_create_post_production(project_id=ctx.project_id)
+        return await self._service._step_create_post_production(
+            project_id=ctx.project_id,
+            context=self._build_legacy_context(ctx),
+        )
 
     async def _finish(self, ctx: WorkflowContext) -> dict[str, Any]:
-        return await self._service._step_create_finish(project_id=ctx.project_id)
+        return await self._service._step_create_finish(
+            project_id=ctx.project_id,
+            context=self._build_legacy_context(ctx),
+        )
+
+    def _build_legacy_context(self, ctx: WorkflowContext) -> dict[str, Any]:
+        legacy: dict[str, Any] = {}
+        for step_key in (
+            "define_objective",
+            "generate_script",
+            "select_style_reference",
+            "generate_video",
+            "post_production",
+        ):
+            if step_key in ctx:
+                legacy[step_key] = ctx[step_key]
+        return legacy

@@ -130,7 +130,10 @@ def decode_jwt_token(
         signing_input.encode("ascii"),
         hashlib.sha256,
     ).digest()
-    actual_signature = _b64url_decode(encoded_signature)
+    try:
+        actual_signature = _b64url_decode(encoded_signature)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("JWT 签名解析失败。") from exc
 
     if not hmac.compare_digest(expected_signature, actual_signature):
         raise ValueError("JWT 签名校验失败。")
@@ -155,4 +158,3 @@ def decode_jwt_token(
         raise ValueError("JWT 已过期。")
 
     return payload
-

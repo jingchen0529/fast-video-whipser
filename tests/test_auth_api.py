@@ -63,6 +63,20 @@ def _csrf_headers(client: TestClient) -> dict[str, str]:
     return {"X-CSRF-Token": csrf_token}
 
 
+def _replace_cookie(client: TestClient, *, name: str, value: str) -> None:
+    current_cookie = next(
+        (cookie for cookie in client.cookies.jar if cookie.name == name),
+        None,
+    )
+    assert current_cookie is not None
+    client.cookies.set(
+        name,
+        value,
+        domain=current_cookie.domain,
+        path=current_cookie.path,
+    )
+
+
 def _upload_video_asset(client: TestClient, *, file_name: str = "test.mp4") -> str:
     response = client.post(
         "/api/assets/upload",
@@ -110,6 +124,69 @@ def test_auth_admin_login_cookie_me_and_refresh(tmp_path) -> None:
         assert refreshed_body["data"]["csrf_token"] == client.cookies.get(settings.auth_cookie_csrf_name)
 
 
+def test_me_401_only_clears_access_cookie_and_still_allows_refresh(tmp_path) -> None:
+    with _build_test_client(tmp_path) as client:
+        login_response = _login(
+            client,
+            login="admin",
+            password="Admin12345!",
+            remember=True,
+        )
+        assert login_response.status_code == 200
+
+        original_refresh_token = client.cookies.get(settings.auth_cookie_refresh_name)
+        original_csrf_token = client.cookies.get(settings.auth_cookie_csrf_name)
+        assert original_refresh_token
+        assert original_csrf_token
+
+        _replace_cookie(
+            client,
+            name=settings.auth_cookie_access_name,
+            value="broken.access.token",
+        )
+
+        me_response = client.get("/api/auth/me")
+        assert me_response.status_code == 401
+        assert client.cookies.get(settings.auth_cookie_access_name) is None
+        assert client.cookies.get(settings.auth_cookie_refresh_name) == original_refresh_token
+        assert client.cookies.get(settings.auth_cookie_csrf_name) == original_csrf_token
+
+        refresh_response = client.post(
+            "/api/auth/refresh",
+            headers=_csrf_headers(client),
+        )
+        assert refresh_response.status_code == 200
+        assert client.cookies.get(settings.auth_cookie_access_name)
+        assert client.cookies.get(settings.auth_cookie_refresh_name)
+        assert client.cookies.get(settings.auth_cookie_csrf_name)
+
+
+def test_refresh_401_clears_all_auth_cookies(tmp_path) -> None:
+    with _build_test_client(tmp_path) as client:
+        login_response = _login(
+            client,
+            login="admin",
+            password="Admin12345!",
+            remember=True,
+        )
+        assert login_response.status_code == 200
+
+        _replace_cookie(
+            client,
+            name=settings.auth_cookie_refresh_name,
+            value="broken.refresh.token",
+        )
+
+        refresh_response = client.post(
+            "/api/auth/refresh",
+            headers=_csrf_headers(client),
+        )
+        assert refresh_response.status_code == 401
+        assert client.cookies.get(settings.auth_cookie_access_name) is None
+        assert client.cookies.get(settings.auth_cookie_refresh_name) is None
+        assert client.cookies.get(settings.auth_cookie_csrf_name) is None
+
+
 def test_public_register_disabled_by_default(tmp_path) -> None:
     with _build_test_client(tmp_path) as client:
         register_response = client.post(
@@ -124,105 +201,6 @@ def test_public_register_disabled_by_default(tmp_path) -> None:
 
         assert register_response.status_code == 403
         assert register_response.json()["message"] == "当前环境已关闭公开注册。"
-
-
-def test_auth_role_permission_assignment_and_business_guards(tmp_path) -> None:
-    with _build_test_client(tmp_path) as admin_client:
-        admin_login = _login(
-            admin_client,
-            login="admin@example.com",
-            password="Admin12345!",
-        )
-        assert admin_login.status_code == 200
-        admin_headers = _csrf_headers(admin_client)
-
-        permission_response = admin_client.post(
-            "/api/auth/permissions",
-            json={
-                "code": "reports.view",
-                "name": "查看报表",
-                "group_name": "reports",
-                "description": "允许查看报表页面。",
-            },
-            headers=admin_headers,
-        )
-        assert permission_response.status_code == 200
-        permission_code = permission_response.json()["data"]["code"]
-        assert permission_code == "reports.view"
-
-        role_response = admin_client.post(
-            "/api/auth/roles",
-            json={
-                "code": "report_viewer",
-                "name": "报表查看者",
-                "description": "只允许查看报表。",
-                "permission_codes": ["reports.view", "profile.read"],
-            },
-            headers=admin_headers,
-        )
-        assert role_response.status_code == 200
-        role_permissions = role_response.json()["data"]["permissions"]
-        assert {item["code"] for item in role_permissions} == {"reports.view", "profile.read"}
-
-        user_response = admin_client.post(
-            "/api/auth/users",
-            json={
-                "username": "analyst01",
-                "email": "analyst01@example.com",
-                "password": "Analyst12345!",
-                "display_name": "Analyst 01",
-                "role_codes": ["report_viewer"],
-                "is_active": True,
-                "is_superuser": False,
-            },
-            headers=admin_headers,
-        )
-        assert user_response.status_code == 200
-        user_id = user_response.json()["data"]["id"]
-
-        assign_response = admin_client.post(
-            f"/api/auth/users/{user_id}/roles",
-            json={"role_codes": ["report_viewer"]},
-            headers=admin_headers,
-        )
-        assert assign_response.status_code == 200
-        assert any(
-            role["code"] == "report_viewer"
-            for role in assign_response.json()["data"]["roles"]
-        )
-
-    with _build_test_client(tmp_path) as user_client:
-        user_login = _login(
-            user_client,
-            login="analyst01",
-            password="Analyst12345!",
-        )
-        assert user_login.status_code == 200
-
-        me_response = user_client.get("/api/auth/me")
-        assert me_response.status_code == 200
-        permission_codes = {
-            item["code"]
-            for item in me_response.json()["data"]["permissions"]
-        }
-        assert "reports.view" in permission_codes
-
-        denied_users_response = user_client.get("/api/auth/users")
-        assert denied_users_response.status_code == 403
-
-        denied_tiktok_response = user_client.post(
-            "/api/tiktok/info",
-            json={"value": "7339393672959757570"},
-            headers=_csrf_headers(user_client),
-        )
-        assert denied_tiktok_response.status_code == 403
-
-    with _build_test_client(tmp_path) as anonymous_client:
-        anonymous_response = anonymous_client.post(
-            "/api/tiktok/info",
-            json={"value": "7339393672959757570"},
-        )
-        assert anonymous_response.status_code == 401
 
 
 def test_change_password_logout_and_old_access_token_revoked(tmp_path) -> None:
@@ -385,3 +363,155 @@ def test_login_rate_limit_and_captcha_enforced(tmp_path) -> None:
         )
         assert blocked_response.status_code == 429
         assert blocked_response.json()["message"] == "登录尝试过于频繁，请稍后再试。"
+
+
+def test_menu_tree_and_navigation_are_available_for_admin(tmp_path) -> None:
+    with _build_test_client(tmp_path) as client:
+        login_response = _login(
+            client,
+            login="admin",
+            password="Admin12345!",
+        )
+        assert login_response.status_code == 200
+
+        menu_tree_response = client.get("/api/menus/tree")
+        assert menu_tree_response.status_code == 200
+        menu_tree = menu_tree_response.json()["data"]
+        root_codes = {item["code"] for item in menu_tree}
+        assert {"dashboard.root", "system.root", "creation.root", "space.root"} <= root_codes
+
+        system_root = next(item for item in menu_tree if item["code"] == "system.root")
+        system_child_codes = {item["code"] for item in system_root["children"]}
+        assert {"system.users", "system.roles", "system.menus"} <= system_child_codes
+
+        navigation_response = client.get("/api/auth/me/navigation")
+        assert navigation_response.status_code == 200
+        navigation = navigation_response.json()["data"]
+        navigation_root_codes = {item["code"] for item in navigation}
+        assert {"dashboard.root", "system.root", "creation.root", "space.root"} <= navigation_root_codes
+
+
+def test_menu_crud_and_role_menu_assignment(tmp_path) -> None:
+    with _build_test_client(tmp_path) as client:
+        login_response = _login(
+            client,
+            login="admin",
+            password="Admin12345!",
+        )
+        assert login_response.status_code == 200
+        headers = _csrf_headers(client)
+
+        menu_tree_response = client.get("/api/menus/tree")
+        assert menu_tree_response.status_code == 200
+        system_root = next(
+            item
+            for item in menu_tree_response.json()["data"]
+            if item["code"] == "system.root"
+        )
+
+        create_menu_response = client.post(
+            "/api/menus",
+            json={
+                "code": "system.audit_logs",
+                "title": "审计日志",
+                "menu_type": "menu",
+                "route_path": "/audit-logs",
+                "icon": "FolderTree",
+                "parent_id": system_root["id"],
+                "sort_order": 60,
+                "permission_code": None,
+                "remark": "审计日志入口",
+                "meta_json": {"section": "system"},
+            },
+            headers=headers,
+        )
+        assert create_menu_response.status_code == 200
+        created_menu = create_menu_response.json()["data"]
+        assert created_menu["code"] == "system.audit_logs"
+        assert created_menu["parent_id"] == system_root["id"]
+
+        update_menu_response = client.patch(
+            f"/api/menus/{created_menu['id']}",
+            json={
+                "title": "审计日志中心",
+                "permission_code": None,
+                "parent_id": None,
+                "icon": None,
+            },
+            headers=headers,
+        )
+        assert update_menu_response.status_code == 200
+        updated_menu = update_menu_response.json()["data"]
+        assert updated_menu["title"] == "审计日志中心"
+        assert updated_menu["parent_id"] is None
+        assert updated_menu["icon"] is None
+        assert updated_menu["permission_code"] is None
+
+        roles_response = client.get("/api/auth/roles")
+        assert roles_response.status_code == 200
+        user_role = next(
+            item
+            for item in roles_response.json()["data"]
+            if item["code"] == "user"
+        )
+
+        assign_response = client.put(
+            f"/api/auth/roles/{user_role['id']}/menus",
+            json={"menu_ids": [created_menu["id"]]},
+            headers=headers,
+        )
+        assert assign_response.status_code == 200
+        assigned_menu_codes = {
+            item["code"]
+            for item in assign_response.json()["data"]["menus"]
+        }
+        assert "system.audit_logs" in assigned_menu_codes
+
+        role_menus_response = client.get(f"/api/auth/roles/{user_role['id']}/menus")
+        assert role_menus_response.status_code == 200
+        role_menu_codes = {item["code"] for item in role_menus_response.json()["data"]}
+        assert "system.audit_logs" in role_menu_codes
+
+        delete_response = client.delete(
+            f"/api/menus/{created_menu['id']}",
+            headers=headers,
+        )
+        assert delete_response.status_code == 200
+        assert delete_response.json()["data"]["deleted"] is True
+
+
+def test_regular_user_cannot_access_management_routes(tmp_path) -> None:
+    with _build_test_client(tmp_path) as admin_client:
+        admin_login = _login(
+            admin_client,
+            login="admin",
+            password="Admin12345!",
+        )
+        assert admin_login.status_code == 200
+
+        create_user_response = admin_client.post(
+            "/api/auth/users",
+            json={
+                "username": "member04",
+                "email": "member04@example.com",
+                "password": "Member12345!",
+                "display_name": "Member 04",
+                "role_codes": ["user"],
+                "is_active": True,
+                "is_superuser": False,
+            },
+            headers=_csrf_headers(admin_client),
+        )
+        assert create_user_response.status_code == 200
+
+    with _build_test_client(tmp_path) as member_client:
+        member_login = _login(
+            member_client,
+            login="member04",
+            password="Member12345!",
+        )
+        assert member_login.status_code == 200
+
+        assert member_client.get("/api/auth/users").status_code == 403
+        assert member_client.get("/api/auth/roles").status_code == 403
+        assert member_client.get("/api/menus/tree").status_code == 403

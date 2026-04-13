@@ -164,10 +164,10 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
                 "provider": "kling",
                 "label": "可灵",
                 "enabled": False,
-                "base_url": "",
+                "base_url": "https://api-beijing.klingai.com",
                 "api_key": "",
-                "default_model": "kling-v1",
-                "model_options": ["kling-v1", "kling-master"],
+                "default_model": "kling-v3",
+                "model_options": ["kling-v3", "kling-v3-omni", "kling-video-o1", "kling-v2-6"],
             },
             {
                 "provider": "veo",
@@ -175,8 +175,14 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
                 "enabled": False,
                 "base_url": "",
                 "api_key": "",
-                "default_model": "veo-3",
-                "model_options": ["veo-3", "veo-2"],
+                "default_model": "veo-3.0-generate-001",
+                "model_options": [
+                    "veo-3.0-generate-001",
+                    "veo-3.0-fast-generate-001",
+                    "veo-3.1-generate-001",
+                    "veo-3.1-fast-generate-001",
+                    "veo-2.0-generate-001",
+                ],
             },
             {
                 "provider": "wanxiang",
@@ -217,7 +223,7 @@ class SystemSettingsService:
         payload: dict[str, Any],
         updated_by_user_id: str | None = None,
     ) -> dict[str, Any]:
-        normalized = self._normalize_settings_payload(payload)
+        normalized = self._normalize_settings_payload(payload, validate_base_urls=True)
 
         connection = create_connection()
         try:
@@ -338,7 +344,12 @@ class SystemSettingsService:
         )
         connection.commit()
 
-    def _normalize_settings_payload(self, payload: dict[str, Any] | None) -> dict[str, Any]:
+    def _normalize_settings_payload(
+        self,
+        payload: dict[str, Any] | None,
+        *,
+        validate_base_urls: bool = False,
+    ) -> dict[str, Any]:
         normalized_payload = payload if isinstance(payload, dict) else {}
         return {
             "system": self._normalize_system_settings(normalized_payload.get("system")),
@@ -347,16 +358,19 @@ class SystemSettingsService:
                 "analysis",
                 normalized_payload.get("analysis"),
                 DEFAULT_SYSTEM_SETTINGS["analysis"],
+                validate_base_urls=validate_base_urls,
             ),
             "transcription": self._normalize_provider_group(
                 "transcription",
                 normalized_payload.get("transcription"),
                 DEFAULT_SYSTEM_SETTINGS["transcription"],
+                validate_base_urls=validate_base_urls,
             ),
             "remake": self._normalize_provider_group(
                 "remake",
                 normalized_payload.get("remake"),
                 DEFAULT_SYSTEM_SETTINGS["remake"],
+                validate_base_urls=validate_base_urls,
             ),
         }
 
@@ -384,6 +398,8 @@ class SystemSettingsService:
         group_key: str,
         payload: Any,
         default_group: dict[str, Any],
+        *,
+        validate_base_urls: bool = False,
     ) -> dict[str, Any]:
         raw_group = payload if isinstance(payload, dict) else {}
         raw_providers = raw_group.get("providers")
@@ -409,13 +425,25 @@ class SystemSettingsService:
             merged_payload = deepcopy(default_provider)
             if provider_key in provider_overrides:
                 merged_payload.update(provider_overrides[provider_key])
-            providers.append(self._normalize_provider(merged_payload, group_key=group_key))
+            providers.append(
+                self._normalize_provider(
+                    merged_payload,
+                    group_key=group_key,
+                    validate_base_urls=validate_base_urls,
+                )
+            )
             seen_keys.add(provider_key)
 
         for provider_key, override_payload in provider_overrides.items():
             if provider_key in seen_keys:
                 continue
-            providers.append(self._normalize_provider(override_payload, group_key=group_key))
+            providers.append(
+                self._normalize_provider(
+                    override_payload,
+                    group_key=group_key,
+                    validate_base_urls=validate_base_urls,
+                )
+            )
 
         provider_keys = [item["provider"] for item in providers]
         default_provider = self._normalize_string(raw_group.get("default_provider")).lower()
@@ -430,7 +458,13 @@ class SystemSettingsService:
             "providers": providers,
         }
 
-    def _normalize_provider(self, payload: dict[str, Any], *, group_key: str) -> dict[str, Any]:
+    def _normalize_provider(
+        self,
+        payload: dict[str, Any],
+        *,
+        group_key: str,
+        validate_base_urls: bool = False,
+    ) -> dict[str, Any]:
         provider_key = self._normalize_string(payload.get("provider")).lower()
         label = self._normalize_string(payload.get("label")) or provider_key.replace("_", " ").title()
         default_model = self._normalize_string(payload.get("default_model"))
@@ -445,6 +479,10 @@ class SystemSettingsService:
             model_options.insert(0, default_model)
         if not default_model and model_options:
             default_model = model_options[0]
+        if validate_base_urls and base_url and not self._is_http_base_url(base_url):
+            raise ValueError(
+                f"{label} 的 API Base Endpoint 必须以 http:// 或 https:// 开头。"
+            )
 
         return {
             "provider": provider_key,
@@ -477,8 +515,15 @@ class SystemSettingsService:
         lowered = normalized.lower().rstrip("/")
         suffixes: list[str] = []
 
-        if group_key in {"analysis", "remake"}:
+        if group_key == "analysis":
             suffixes.append("/chat/completions")
+        if group_key == "remake" and provider_key == "doubao":
+            suffixes.extend(
+                [
+                    "/api/v1/contents/generations/tasks",
+                    "/contents/generations/tasks",
+                ]
+            )
         if group_key == "transcription" and provider_key == "openai_whisper_api":
             suffixes.append("/audio/transcriptions")
 
@@ -487,6 +532,11 @@ class SystemSettingsService:
                 return normalized[: -len(suffix)]
 
         return normalized
+
+    @staticmethod
+    def _is_http_base_url(value: str) -> bool:
+        normalized = SystemSettingsService._normalize_string(value)
+        return normalized.lower().startswith(("http://", "https://"))
 
     def _collect_faster_whisper_capabilities(self, provider: dict[str, Any]) -> dict[str, Any]:
         dependency_names = ("faster_whisper", "ctranslate2", "av")
@@ -497,6 +547,7 @@ class SystemSettingsService:
         ffmpeg_available = bool(shutil.which("ffmpeg"))
         ffprobe_available = bool(shutil.which("ffprobe"))
         cuda_info = self._inspect_ctranslate2_cuda()
+        recommended_runtime = self._recommend_faster_whisper_runtime(cuda_info)
         model_dir = self._resolve_directory(provider.get("model_dir"))
         local_models = self._scan_faster_whisper_models(model_dir)
         issues: list[str] = []
@@ -509,10 +560,15 @@ class SystemSettingsService:
             issues.append("未检测到 av 依赖，媒体解码可能失败。")
         if not local_models:
             issues.append("未在本地模型目录中检测到现成模型，首次运行时将尝试按模型名自动下载。")
+        if not cuda_info["cuda_available"]:
+            issues.append("当前环境未检测到 CUDA，推荐使用 cpu + int8 以获得更稳定的本地转写性能。")
 
         available_devices = ["auto", "cpu"]
         if cuda_info["cuda_available"]:
             available_devices.append("cuda")
+        available_compute_types = ["auto", "default", "int8", "float32"]
+        if cuda_info["cuda_available"]:
+            available_compute_types.extend(["float16", "int8_float16"])
 
         return {
             "provider": "faster_whisper",
@@ -528,15 +584,9 @@ class SystemSettingsService:
             "model_dir": str(model_dir) if model_dir else "",
             "local_models": local_models,
             "available_devices": available_devices,
-            "available_compute_types": [
-                "auto",
-                "default",
-                "int8",
-                "float16",
-                "float32",
-                "int8_float16",
-            ],
-            "recommended_device": "cuda" if cuda_info["cuda_available"] else "cpu",
+            "available_compute_types": available_compute_types,
+            "recommended_device": recommended_runtime["device"],
+            "recommended_compute_type": recommended_runtime["compute_type"],
             "cuda_device_count": cuda_info["cuda_device_count"],
         }
 
@@ -607,6 +657,20 @@ class SystemSettingsService:
         return {
             "cuda_available": cuda_device_count > 0,
             "cuda_device_count": max(0, cuda_device_count),
+        }
+
+    @staticmethod
+    def _recommend_faster_whisper_runtime(cuda_info: dict[str, Any]) -> dict[str, str]:
+        cuda_available = bool(cuda_info.get("cuda_available"))
+        if cuda_available:
+            return {
+                "device": "cuda",
+                "compute_type": "float16",
+            }
+
+        return {
+            "device": "cpu",
+            "compute_type": "int8",
         }
 
     def _scan_faster_whisper_models(self, model_dir: Path | None) -> list[dict[str, str]]:

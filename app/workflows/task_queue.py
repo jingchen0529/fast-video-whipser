@@ -40,6 +40,8 @@ class TaskQueue:
     _worker_task: asyncio.Task | None = None
     _running: bool = False
     _poll_interval: float = 2.0
+    _wake_event: asyncio.Event | None = None
+    _worker_loop_ref: asyncio.AbstractEventLoop | None = None
 
     @classmethod
     def instance(cls) -> "TaskQueue":
@@ -89,6 +91,11 @@ class TaskQueue:
             connection.close()
 
         logger.info("Enqueued task %s (type=%s)", task_id, task_type)
+        if self._wake_event is not None and self._worker_loop_ref is not None:
+            try:
+                self._worker_loop_ref.call_soon_threadsafe(self._wake_event.set)
+            except RuntimeError:
+                logger.debug("TaskQueue wake signal skipped because the worker loop is unavailable")
         return task_id
 
     def get_task_status(self, task_id: str) -> dict[str, Any] | None:
@@ -113,6 +120,8 @@ class TaskQueue:
         if self._running:
             return
         self._running = True
+        self._worker_loop_ref = asyncio.get_running_loop()
+        self._wake_event = asyncio.Event()
         self._worker_task = asyncio.create_task(self._worker_loop())
         logger.info("TaskQueue worker started")
 
@@ -125,7 +134,14 @@ class TaskQueue:
                 await self._worker_task
             except asyncio.CancelledError:
                 pass
+            except RuntimeError:
+                logger.warning(
+                    "TaskQueue worker shutdown crossed event loops; forcing cleanup",
+                    exc_info=True,
+                )
             self._worker_task = None
+        self._wake_event = None
+        self._worker_loop_ref = None
         logger.info("TaskQueue worker stopped")
 
     async def _worker_loop(self) -> None:
@@ -136,7 +152,18 @@ class TaskQueue:
                 if task is not None:
                     await self._execute_task(task)
                 else:
-                    await asyncio.sleep(self._poll_interval)
+                    if self._wake_event is None:
+                        await asyncio.sleep(self._poll_interval)
+                        continue
+
+                    self._wake_event.clear()
+                    try:
+                        await asyncio.wait_for(
+                            self._wake_event.wait(),
+                            timeout=self._poll_interval,
+                        )
+                    except TimeoutError:
+                        pass
             except asyncio.CancelledError:
                 break
             except Exception:

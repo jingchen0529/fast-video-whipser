@@ -6,21 +6,30 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile
 from pydantic import BaseModel, Field, StringConstraints
 
-from app.auth.dependencies import get_current_user, require_csrf_protection, require_permissions, validate_csrf_request
+from app.auth.dependencies import (
+    clear_auth_cookies,
+    get_current_user,
+    require_admin_access,
+    require_csrf_protection,
+    validate_csrf_request,
+)
 from app.auth.security import decode_jwt_token
 from app.auth.service import (
+    assign_menus_to_role,
     assert_login_allowed,
-    assign_permissions_to_role,
+
     assign_roles_to_user,
     authenticate_user,
     change_password,
-    create_permission,
+
     create_role,
     create_user,
     delete_role,
     delete_user,
     get_session_by_id,
-    list_permissions,
+    get_role_menus,
+    list_user_navigation,
+
     list_roles,
     list_users,
     refresh_user_token,
@@ -66,18 +75,12 @@ class ChangePasswordRequest(BaseModel):
     new_password: NonEmptyString = Field(..., description="新密码。")
 
 
-class PermissionCreateRequest(BaseModel):
-    code: NonEmptyString = Field(..., description="权限编码。")
-    name: NonEmptyString = Field(..., description="权限名称。")
-    group_name: NonEmptyString = Field(..., description="权限分组。")
-    description: str | None = Field(None, description="权限备注。")
-
 
 class RoleCreateRequest(BaseModel):
     code: NonEmptyString = Field(..., description="角色编码。")
     name: NonEmptyString = Field(..., description="角色名称。")
     description: str | None = Field(None, description="角色备注。")
-    permission_codes: list[str] = Field(default_factory=list, description="角色权限编码列表。")
+
 
 
 class RoleUpdateRequest(BaseModel):
@@ -85,8 +88,9 @@ class RoleUpdateRequest(BaseModel):
     description: str | None = Field(None, description="角色备注。")
 
 
-class RolePermissionAssignmentRequest(BaseModel):
-    permission_codes: list[str] = Field(default_factory=list, description="权限编码列表。")
+
+class RoleMenuAssignmentRequest(BaseModel):
+    menu_ids: list[str] = Field(default_factory=list, description="菜单 ID 列表。")
 
 
 class AdminCreateUserRequest(BaseModel):
@@ -145,22 +149,6 @@ def _set_auth_cookies(response: Response, result: dict) -> None:
         result["csrf_token"],
         **_cookie_kwargs(max_age=refresh_max_age, httponly=False),
     )
-
-
-def _clear_auth_cookies(response: Response) -> None:
-    for cookie_name in (
-        settings.auth_cookie_access_name,
-        settings.auth_cookie_refresh_name,
-        settings.auth_cookie_csrf_name,
-    ):
-        response.delete_cookie(
-            cookie_name,
-            domain=settings.auth_cookie_domain,
-            path=settings.auth_cookie_path,
-            secure=settings.auth_cookie_secure,
-            samesite=settings.auth_cookie_samesite,
-        )
-
 
 def _build_auth_payload(result: dict) -> dict:
     return {
@@ -365,7 +353,7 @@ def logout(
         if exc.status_code not in {400, 401}:
             raise
         result = {"revoked": True}
-    _clear_auth_cookies(response)
+    clear_auth_cookies(response)
     return build_response(request, data=result)
 
 
@@ -376,9 +364,42 @@ def logout(
 )
 def me(
     request: Request,
+    response: Response,
     current_user: Annotated[dict, Depends(get_current_user)],
 ) -> ResponseModel:
+    session = getattr(request.state, "auth_session", None)
+    if session is not None:
+        csrf_max_age = (
+            settings.auth_refresh_token_expire_days * 24 * 60 * 60
+            if session.get("remember")
+            else None
+        )
+        response.set_cookie(
+            settings.auth_cookie_csrf_name,
+            session["csrf_token"],
+            **_cookie_kwargs(max_age=csrf_max_age, httponly=False),
+        )
     return build_response(request, data=current_user)
+
+
+@router.get(
+    "/me/navigation",
+    response_model=ResponseModel,
+    summary="当前用户导航菜单 / Get current user navigation tree",
+)
+def me_navigation(
+    request: Request,
+    current_user: Annotated[dict, Depends(get_current_user)],
+    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+) -> ResponseModel:
+
+    data = list_user_navigation(
+        connection,
+        user_id=current_user["id"],
+        is_superuser=bool(current_user.get("is_superuser")),
+
+    )
+    return build_response(request, data=data)
 
 
 ALLOWED_AVATAR_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
@@ -473,7 +494,7 @@ def update_password(
         current_password=payload.current_password,
         new_password=payload.new_password,
     )
-    _clear_auth_cookies(response)
+    clear_auth_cookies(response)
     return build_response(request, data=result)
 
 
@@ -485,7 +506,7 @@ def update_password(
 def users(
     request: Request,
     connection: Annotated[sqlite3.Connection, Depends(get_db)],
-    _: Annotated[dict, Depends(require_permissions("users.view"))],
+    _: Annotated[dict, Depends(require_admin_access)],
 ) -> ResponseModel:
     return build_response(request, data=list_users(connection))
 
@@ -499,7 +520,7 @@ def admin_create_user(
     request: Request,
     payload: AdminCreateUserRequest,
     connection: Annotated[sqlite3.Connection, Depends(get_db)],
-    _: Annotated[dict, Depends(require_permissions("users.create"))],
+    _: Annotated[dict, Depends(require_admin_access)],
     __: Annotated[None, Depends(require_csrf_protection)],
 ) -> ResponseModel:
     result = create_user(
@@ -525,7 +546,7 @@ def admin_update_user(
     user_id: str,
     payload: UserUpdateRequest,
     connection: Annotated[sqlite3.Connection, Depends(get_db)],
-    _: Annotated[dict, Depends(require_permissions("users.update"))],
+    _: Annotated[dict, Depends(require_admin_access)],
     __: Annotated[None, Depends(require_csrf_protection)],
 ) -> ResponseModel:
     result = update_user(
@@ -547,9 +568,8 @@ def admin_update_user(
 def admin_delete_user(
     request: Request,
     user_id: str,
-    current_user: Annotated[dict, Depends(get_current_user)],
+    current_user: Annotated[dict, Depends(require_admin_access)],
     connection: Annotated[sqlite3.Connection, Depends(get_db)],
-    _: Annotated[dict, Depends(require_permissions("users.delete"))],
     __: Annotated[None, Depends(require_csrf_protection)],
 ) -> ResponseModel:
     result = delete_user(
@@ -570,7 +590,7 @@ def user_roles(
     user_id: str,
     payload: UserRoleAssignmentRequest,
     connection: Annotated[sqlite3.Connection, Depends(get_db)],
-    _: Annotated[dict, Depends(require_permissions("users.assign_roles"))],
+    _: Annotated[dict, Depends(require_admin_access)],
     __: Annotated[None, Depends(require_csrf_protection)],
 ) -> ResponseModel:
     result = assign_roles_to_user(connection, user_id, payload.role_codes)
@@ -585,7 +605,7 @@ def user_roles(
 def roles(
     request: Request,
     connection: Annotated[sqlite3.Connection, Depends(get_db)],
-    _: Annotated[dict, Depends(require_permissions("roles.view"))],
+    _: Annotated[dict, Depends(require_admin_access)],
 ) -> ResponseModel:
     return build_response(request, data=list_roles(connection))
 
@@ -599,7 +619,7 @@ def create_role_endpoint(
     request: Request,
     payload: RoleCreateRequest,
     connection: Annotated[sqlite3.Connection, Depends(get_db)],
-    _: Annotated[dict, Depends(require_permissions("roles.create"))],
+    _: Annotated[dict, Depends(require_admin_access)],
     __: Annotated[None, Depends(require_csrf_protection)],
 ) -> ResponseModel:
     result = create_role(
@@ -607,7 +627,7 @@ def create_role_endpoint(
         code=payload.code,
         name=payload.name,
         description=payload.description,
-        permission_codes=payload.permission_codes,
+
     )
     return build_response(request, data=result)
 
@@ -622,7 +642,7 @@ def update_role_endpoint(
     role_id: str,
     payload: RoleUpdateRequest,
     connection: Annotated[sqlite3.Connection, Depends(get_db)],
-    _: Annotated[dict, Depends(require_permissions("roles.update"))],
+    _: Annotated[dict, Depends(require_admin_access)],
     __: Annotated[None, Depends(require_csrf_protection)],
 ) -> ResponseModel:
     result = update_role(
@@ -643,64 +663,43 @@ def delete_role_endpoint(
     request: Request,
     role_id: str,
     connection: Annotated[sqlite3.Connection, Depends(get_db)],
-    _: Annotated[dict, Depends(require_permissions("roles.delete"))],
+    _: Annotated[dict, Depends(require_admin_access)],
     __: Annotated[None, Depends(require_csrf_protection)],
 ) -> ResponseModel:
     result = delete_role(connection, role_id)
     return build_response(request, data=result)
 
 
-@router.put(
-    "/roles/{role_id}/permissions",
+@router.get(
+    "/roles/{role_id}/menus",
     response_model=ResponseModel,
-    summary="分配角色权限 / Assign permissions to role",
+    summary="角色菜单列表 / Get role menus",
 )
-def role_permissions(
+def role_menus(
     request: Request,
     role_id: str,
-    payload: RolePermissionAssignmentRequest,
     connection: Annotated[sqlite3.Connection, Depends(get_db)],
-    _: Annotated[dict, Depends(require_permissions("roles.assign_permissions"))],
+    _: Annotated[dict, Depends(require_admin_access)],
+) -> ResponseModel:
+    return build_response(request, data=get_role_menus(connection, role_id))
+
+
+@router.put(
+    "/roles/{role_id}/menus",
+    response_model=ResponseModel,
+    summary="分配角色菜单 / Assign menus to role",
+)
+def assign_role_menus(
+    request: Request,
+    role_id: str,
+    payload: RoleMenuAssignmentRequest,
+    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+    _: Annotated[dict, Depends(require_admin_access)],
     __: Annotated[None, Depends(require_csrf_protection)],
 ) -> ResponseModel:
-    result = assign_permissions_to_role(
+    result = assign_menus_to_role(
         connection,
         role_id,
-        payload.permission_codes,
-    )
-    return build_response(request, data=result)
-
-
-@router.get(
-    "/permissions",
-    response_model=ResponseModel,
-    summary="权限列表 / List permissions",
-)
-def permissions(
-    request: Request,
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
-    _: Annotated[dict, Depends(require_permissions("permissions.view"))],
-) -> ResponseModel:
-    return build_response(request, data=list_permissions(connection))
-
-
-@router.post(
-    "/permissions",
-    response_model=ResponseModel,
-    summary="创建权限 / Create custom permission",
-)
-def create_permission_endpoint(
-    request: Request,
-    payload: PermissionCreateRequest,
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
-    _: Annotated[dict, Depends(require_permissions("permissions.create"))],
-    __: Annotated[None, Depends(require_csrf_protection)],
-) -> ResponseModel:
-    result = create_permission(
-        connection,
-        code=payload.code,
-        name=payload.name,
-        group_name=payload.group_name,
-        description=payload.description,
+        payload.menu_ids,
     )
     return build_response(request, data=result)

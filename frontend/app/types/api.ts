@@ -14,14 +14,34 @@ export interface ApiErrorResponse {
   details?: unknown;
 }
 
-export interface AuthPermission {
+
+export interface AuthMenu {
   id: string;
+  parent_id: string | null;
   code: string;
-  name: string;
-  group_name: string;
-  description?: string | null;
+  title: string;
+  menu_type: "directory" | "menu" | "link";
+  route_path: string;
+  route_name?: string | null;
+  redirect_path?: string | null;
+  icon?: string | null;
+  component_key?: string | null;
+
+  sort_order: number;
+  is_visible: boolean;
+  is_enabled: boolean;
+  is_external: boolean;
+  open_mode: "self" | "blank";
+  is_cacheable: boolean;
+  is_affix: boolean;
+  active_menu_path?: string | null;
+  badge_text?: string | null;
+  badge_type?: string | null;
+  remark?: string | null;
+  meta_json: Record<string, unknown>;
   created_at: string;
   updated_at: string;
+  children?: AuthMenu[];
 }
 
 export interface AuthRole {
@@ -32,7 +52,8 @@ export interface AuthRole {
   is_system: boolean;
   created_at: string;
   updated_at: string;
-  permissions?: AuthPermission[];
+
+  menus?: AuthMenu[];
 }
 
 export interface AuthUser {
@@ -47,7 +68,7 @@ export interface AuthUser {
   created_at: string;
   updated_at: string;
   roles: AuthRole[];
-  permissions: AuthPermission[];
+
 }
 
 export interface AuthSessionPayload {
@@ -138,6 +159,50 @@ export interface MediaAsset {
   updated_at: string;
 }
 
+export interface MotionAsset {
+  id: string;
+  source_video_asset_id: string | null;
+  clip_asset_id: string | null;
+  conversation_id: string | null;
+  job_id: string | null;
+  start_ms: number;
+  end_ms: number;
+  action_summary: string;
+  action_label: string | null;
+  entrance_style: string | null;
+  emotion_label: string | null;
+  temperament_label: string | null;
+  scene_label: string | null;
+  camera_motion: string | null;
+  camera_shot: string | null;
+  origin: string;
+  review_status: string;
+  copyright_risk_level: string;
+  metadata_json: Record<string, any> | null;
+  source_video_asset?: {
+    id: string;
+    asset_type: string | null;
+    source_type: string | null;
+    file_name: string | null;
+    thumbnail_path: string | null;
+    metadata_json: Record<string, any> | null;
+  } | null;
+  clip_asset?: {
+    id: string;
+    asset_type: string | null;
+    source_type: string | null;
+    file_name: string | null;
+    thumbnail_path: string | null;
+    metadata_json: Record<string, any> | null;
+  } | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MotionAssetListPayload {
+  items: MotionAsset[];
+}
+
 export interface SystemSettingsProxyConfig {
   enabled: boolean;
   http_url: string;
@@ -203,6 +268,7 @@ export interface FasterWhisperCapabilities {
   available_devices: string[];
   available_compute_types: string[];
   recommended_device: string;
+  recommended_compute_type: string;
   cuda_device_count: number;
 }
 

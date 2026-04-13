@@ -12,6 +12,7 @@ import { marked } from "marked";
 import { toast } from "vue-sonner";
 
 import VideoDrawer from "~/components/custom/VideoDrawer.vue";
+import GenerationDrawer from "~/components/custom/GenerationDrawer.vue";
 import TaskTimeline from "~/components/custom/TaskTimeline.vue";
 import {
   Tooltip,
@@ -36,13 +37,12 @@ const runtimeConfig = useRuntimeConfig();
 const chatStore = useChatStore();
 const route = useRoute();
 
-useHead({ title: "对话详情" });
-
 const inputText = ref("");
 const sending = ref(false);
 const errorMessage = ref("");
 const selectedFile = ref<File | null>(null);
 const showVideoDetail = ref(false);
+const showGenerationDetail = ref(false);
 const filePreviewUrl = ref<string | null>(null);
 const uploadProgress = ref(100);
 let simulateTimer: any = null;
@@ -76,6 +76,19 @@ watch(selectedFile, (newFile) => {
 
 const project = computed(() => chatStore.selectedProject);
 const messages = computed(() => project.value?.conversation_messages || []);
+const videoGeneration = computed(() => project.value?.video_generation || null);
+const normalizedVideoGenerationStatus = computed(() =>
+  String(videoGeneration.value?.status || "")
+    .trim()
+    .toLowerCase(),
+);
+const pageTitle = computed(() => {
+  if (project.value?.workflow_type === "remake") return "视频复刻详情";
+  if (project.value?.workflow_type === "create") return "爆款创作详情";
+  return "视频分析详情";
+});
+
+useHead(() => ({ title: pageTitle.value }));
 
 const isWorkflowReplyType = (type: string) =>
   type === "analysis_reply" || type === "suggestion_reply";
@@ -88,13 +101,44 @@ const renderMarkdown = (content: string) => {
   }
 };
 
+const generatedVideoUrl = computed(() => {
+  const preferred =
+    videoGeneration.value?.asset_url ||
+    videoGeneration.value?.result_video_url ||
+    (project.value?.workflow_type === "analysis" ? project.value?.media_url : null);
+  return resolveAssetUrl(preferred);
+});
+
+const shouldShowVideoGenerationCard = computed(
+  () =>
+    !!project.value &&
+    project.value.workflow_type !== "analysis" &&
+    !!normalizedVideoGenerationStatus.value &&
+    normalizedVideoGenerationStatus.value !== "idle",
+);
+
+const generationStatusLabel = computed(() => {
+  if (normalizedVideoGenerationStatus.value === "succeeded") return "已生成";
+  if (normalizedVideoGenerationStatus.value === "failed") return "生成失败";
+  return "生成中";
+});
+
+const generationPromptPreview = computed(() => {
+  const prompt = String(videoGeneration.value?.prompt || "").trim();
+  if (!prompt) return "";
+  return prompt.length > 220 ? `${prompt.slice(0, 220)}...` : prompt;
+});
+
 const visibleMessages = computed(() => {
   const workflowAssistantTypes = new Set([
     "analysis_reply",
     "suggestion_reply",
+    "remake_reply",
+    "create_reply",
+    "video_generation_result",
   ]);
   const rawMessages = messages.value.filter(
-    (message) => message.message_type !== "workflow_status",
+    (message) => message.message_type !== "workflow_status" && message.message_type !== "workflow_error",
   );
   const mergedMessages: any[] = [];
 
@@ -104,7 +148,7 @@ const visibleMessages = computed(() => {
       message.role === "assistant" &&
       workflowAssistantTypes.has(message.message_type) &&
       lastMessage?.role === "assistant" &&
-      lastMessage?.message_type === "analysis_reply";
+      workflowAssistantTypes.has(lastMessage.message_type);
 
     if (shouldMergeIntoWorkflowReply) {
       lastMessage.content = [lastMessage.content, message.content]
@@ -293,13 +337,18 @@ const resolveAssetUrl = (value?: string | null): string | null => {
   if (!normalized) return null;
   if (/^(https?:|data:|blob:)/i.test(normalized)) return normalized;
   const apiBase = (runtimeConfig.public.apiBase || "").trim();
-  let origin = window.location.origin;
-  if (apiBase) {
+  let origin = "";
+  if (import.meta.client) {
     try {
-      origin = new URL(apiBase, window.location.origin).origin;
+      origin = apiBase
+        ? new URL(apiBase, window.location.origin).origin
+        : window.location.origin;
     } catch {
       origin = window.location.origin;
     }
+  }
+  if (!origin) {
+    return normalized.startsWith("/") ? normalized : `/${normalized}`;
   }
   try {
     return new URL(normalized, `${origin}/`).toString();
@@ -516,6 +565,109 @@ const handleMouseMove = (e: MouseEvent) => {
               </div>
             </div>
           </div>
+
+          <div
+            v-if="index === 0 && shouldShowVideoGenerationCard"
+            class="flex justify-start my-1 w-full"
+          >
+            <div class="flex max-w-[88%] w-full items-end gap-3 pl-[52px]">
+              <div
+                class="w-full rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900/80"
+              >
+                <div class="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <p class="text-sm font-semibold text-zinc-900 dark:text-white">
+                      视频生成结果
+                    </p>
+                    <p class="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                      {{
+                        normalizedVideoGenerationStatus === "succeeded"
+                          ? "后端任务流已完成，结果已经写回动态资产。"
+                          : normalizedVideoGenerationStatus === "failed"
+                            ? "视频模型返回失败状态，请检查错误信息。"
+                            : "后端正在轮询第三方视频模型任务状态。"
+                      }}
+                    </p>
+                  </div>
+                  <span
+                    class="rounded-full px-2.5 py-1 text-[11px] font-semibold"
+                    :class="
+                      normalizedVideoGenerationStatus === 'succeeded'
+                        ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400'
+                        : normalizedVideoGenerationStatus === 'failed'
+                          ? 'bg-red-50 text-red-700 dark:bg-red-950 dark:text-red-400'
+                          : 'bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-400'
+                    "
+                  >
+                    {{ generationStatusLabel }}
+                  </span>
+                </div>
+
+                <div class="mt-3 flex flex-wrap gap-2 text-xs">
+                  <span
+                    v-if="videoGeneration?.provider"
+                    class="rounded-full bg-zinc-100 px-2.5 py-1 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
+                  >
+                    Provider: {{ videoGeneration.provider }}
+                  </span>
+                  <span
+                    v-if="videoGeneration?.model"
+                    class="rounded-full bg-zinc-100 px-2.5 py-1 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
+                  >
+                    Model: {{ videoGeneration.model }}
+                  </span>
+                  <span
+                    v-if="videoGeneration?.provider_task_id"
+                    class="rounded-full bg-zinc-100 px-2.5 py-1 font-mono text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
+                  >
+                    Task: {{ videoGeneration.provider_task_id }}
+                  </span>
+                </div>
+
+                <div
+                  v-if="generatedVideoUrl"
+                  class="mt-4 overflow-hidden rounded-2xl border border-zinc-200 bg-black dark:border-zinc-800"
+                >
+                  <video
+                    :src="generatedVideoUrl"
+                    controls
+                    class="max-h-[360px] w-full bg-black object-contain"
+                  ></video>
+                </div>
+
+                <div
+                  v-if="normalizedVideoGenerationStatus === 'failed' && videoGeneration?.error_detail"
+                  class="mt-4 rounded-xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-600 dark:border-red-900/40 dark:bg-red-950/20 dark:text-red-300"
+                >
+                  {{ videoGeneration.error_detail }}
+                </div>
+
+
+
+                <div class="mt-6 flex flex-wrap gap-2 pt-5 border-t border-zinc-100 dark:border-zinc-800">
+                  <Button
+                    @click="showGenerationDetail = true"
+                    variant="default"
+                    size="sm"
+                    class="rounded-full shadow-sm"
+                  >
+                    查看完整复刻详情
+                  </Button>
+                  <Button
+                    v-if="videoGeneration?.output_asset_id"
+                    as-child
+                    variant="outline"
+                    size="sm"
+                    class="rounded-full shadow-sm bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors"
+                  >
+                    <a href="/assets">
+                      查看资产详情
+                    </a>
+                  </Button>
+                </div>
+              </div>
+            </div>
+          </div>
         </template>
 
         <!-- Task Timeline Fallback (if no messages yet) -->
@@ -660,11 +812,20 @@ const handleMouseMove = (e: MouseEvent) => {
       </div>
     </div>
 
-    <!-- Video Detail Drawer -->
+    <!-- Source Video Detail Drawer -->
     <VideoDrawer
       v-model:open="showVideoDetail"
       :project="project"
       :videoUrl="resolveAssetUrl(project?.media_url)"
+    />
+
+    <!-- Generated Video Detail Drawer -->
+    <GenerationDrawer
+      v-model:open="showGenerationDetail"
+      :videoGeneration="videoGeneration"
+      :targetVideoUrl="resolveAssetUrl(generatedVideoUrl)"
+      :title="project?.title || '生成详情'"
+      :sourceUrl="resolveAssetUrl(project?.media_url)"
     />
   </div>
 </template>

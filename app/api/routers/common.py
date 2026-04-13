@@ -5,7 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, Request, UploadFile
 from pydantic import BaseModel, Field, StringConstraints
 
-from app.auth.dependencies import require_csrf_protection, require_permissions
+from app.auth.dependencies import require_csrf_protection
 from app.core.config import settings
 from app.core.http import ResponseModel, build_response
 from app.services import captcha_service
@@ -70,7 +70,7 @@ async def verify_captcha(
 async def upload_file(
     request: Request,
     file: UploadFile = File(...),
-    _: dict = Depends(require_permissions("files.upload")),
+
     __: None = Depends(require_csrf_protection),
 ) -> ResponseModel:
     # 公共上传接口，后续其他业务可以直接复用这个入口。

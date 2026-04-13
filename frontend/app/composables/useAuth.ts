@@ -2,6 +2,10 @@ import { computed } from "vue";
 
 import type { AuthSessionPayload, AuthUser } from "@/types/api";
 
+let fetchCurrentUserPromise: Promise<AuthUser> | null = null;
+let refreshSessionPromise: Promise<AuthUser | null> | null = null;
+let initializePromise: Promise<boolean> | null = null;
+
 export interface LoginPayload {
   login: string;
   password: string;
@@ -20,7 +24,7 @@ interface ClearSessionOptions {
 
 export function useAuth() {
   const api = useApi();
-  
+
   // 使用 useCookie 仅用于持久化
   const userCookie = useCookie<AuthUser | null>("auth_user", {
     sameSite: "lax",
@@ -48,6 +52,28 @@ export function useAuth() {
   const initialized = useState<boolean>("auth_initialized", () => false);
 
   const isAuthenticated = computed(() => Boolean(user.value));
+
+  const syncCsrfFromCookie = () => {
+    if (csrfTokenCookie.value) {
+      csrfToken.value = csrfTokenCookie.value;
+    }
+  };
+
+  const ensureCsrfToken = async (): Promise<boolean> => {
+    syncCsrfFromCookie();
+    if (csrfToken.value) {
+      return true;
+    }
+
+    try {
+      await fetchCurrentUser();
+    } catch {
+      // 如果 access cookie 已过期，这里忽略，让调用方继续决定是否降级处理。
+    }
+
+    syncCsrfFromCookie();
+    return Boolean(csrfToken.value);
+  };
 
   const clearSession = (options?: ClearSessionOptions) => {
     const clearCookies = options?.clearCookies ?? true;
@@ -80,45 +106,77 @@ export function useAuth() {
   };
 
   const fetchCurrentUser = async (): Promise<AuthUser> => {
-    const profile = await api.get<AuthUser>("/auth/me");
-    user.value = profile;
-    initialized.value = true;
-    return profile;
+    if (fetchCurrentUserPromise) {
+      return fetchCurrentUserPromise;
+    }
+
+    fetchCurrentUserPromise = (async () => {
+      const profile = await api.get<AuthUser>("/auth/me");
+      syncCsrfFromCookie();
+      user.value = profile;
+      initialized.value = true;
+      return profile;
+    })().finally(() => {
+      fetchCurrentUserPromise = null;
+    });
+
+    return fetchCurrentUserPromise;
   };
 
   const refreshSession = async (): Promise<AuthUser | null> => {
-    try {
-      const payload = await api.post<AuthSessionPayload>("/auth/refresh");
-      applySession(payload, rememberMe.value);
-      return payload.user;
-    } catch {
-      clearSession({ clearCookies: import.meta.client });
-      return null;
+    if (refreshSessionPromise) {
+      return refreshSessionPromise;
     }
+
+    refreshSessionPromise = (async () => {
+      try {
+        const payload = await api.post<AuthSessionPayload>("/auth/refresh");
+        applySession(payload, rememberMe.value);
+        return payload.user;
+      } catch {
+        clearSession({ clearCookies: import.meta.client });
+        return null;
+      }
+    })().finally(() => {
+      refreshSessionPromise = null;
+    });
+
+    return refreshSessionPromise;
   };
 
   const initialize = async (): Promise<boolean> => {
-    if (initialized.value && user.value) {
-      return true;
+    if (initializePromise) {
+      return initializePromise;
     }
 
-    try {
-      await fetchCurrentUser();
-      return true;
-    } catch {
-      const refreshedUser = await refreshSession();
-      if (!refreshedUser) {
-        return false;
+    initializePromise = (async () => {
+      syncCsrfFromCookie();
+      if (initialized.value && user.value && csrfToken.value) {
+        return true;
       }
 
       try {
         await fetchCurrentUser();
         return true;
       } catch {
-        clearSession({ clearCookies: import.meta.client });
-        return false;
+        const refreshedUser = await refreshSession();
+        if (!refreshedUser) {
+          return false;
+        }
+
+        try {
+          await fetchCurrentUser();
+          return true;
+        } catch {
+          clearSession({ clearCookies: import.meta.client });
+          return false;
+        }
       }
-    }
+    })().finally(() => {
+      initializePromise = null;
+    });
+
+    return initializePromise;
   };
 
   const login = async (payload: LoginPayload): Promise<AuthUser> => {
@@ -171,10 +229,23 @@ export function useAuth() {
   const logout = async (options?: LogoutOptions) => {
     let succeeded = true;
     try {
+      await ensureCsrfToken();
       await api.post("/auth/logout");
-    } catch {
-      // 即使后端会话已失效，也继续清理前端状态。
-      succeeded = false;
+    } catch (error) {
+      const message = api.normalizeError(error);
+      if (message.includes("CSRF")) {
+        try {
+          await fetchCurrentUser();
+          syncCsrfFromCookie();
+          await api.post("/auth/logout");
+        } catch {
+          // 即使后端会话已失效，也继续清理前端状态。
+          succeeded = false;
+        }
+      } else {
+        // 即使后端会话已失效，也继续清理前端状态。
+        succeeded = false;
+      }
     }
 
     clearSession();

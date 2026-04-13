@@ -1,9 +1,15 @@
+import json
 import sqlite3
 import uuid
 from pathlib import Path
 from typing import Generator
 
-from app.auth.constants import DEFAULT_PERMISSION_DEFINITIONS, DEFAULT_ROLE_DEFINITIONS
+from app.auth.constants import (
+    DEFAULT_MENU_DEFINITIONS,
+    DEFAULT_ROLE_DEFINITIONS,
+    DEFAULT_ROLE_MENU_CODES,
+    REMOVED_DEFAULT_MENU_CODES,
+)
 from app.auth.security import hash_password, utcnow_iso
 from app.core.config import settings
 
@@ -34,15 +40,6 @@ CREATE TABLE IF NOT EXISTS roles (
     updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS permissions (
-    id TEXT PRIMARY KEY,
-    code TEXT NOT NULL UNIQUE,
-    name TEXT NOT NULL,
-    group_name TEXT NOT NULL,
-    description TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
 
 CREATE TABLE IF NOT EXISTS user_roles (
     user_id TEXT NOT NULL,
@@ -53,13 +50,43 @@ CREATE TABLE IF NOT EXISTS user_roles (
     FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS role_permissions (
-    role_id TEXT NOT NULL,
-    permission_id TEXT NOT NULL,
+
+CREATE TABLE IF NOT EXISTS menus (
+    id TEXT PRIMARY KEY,
+    parent_id TEXT,
+    code TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    menu_type TEXT NOT NULL DEFAULT 'menu',
+    route_path TEXT NOT NULL DEFAULT '',
+    route_name TEXT,
+    redirect_path TEXT,
+    icon TEXT,
+    component_key TEXT,
+
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    is_visible INTEGER NOT NULL DEFAULT 1,
+    is_enabled INTEGER NOT NULL DEFAULT 1,
+    is_external INTEGER NOT NULL DEFAULT 0,
+    open_mode TEXT NOT NULL DEFAULT 'self',
+    is_cacheable INTEGER NOT NULL DEFAULT 0,
+    is_affix INTEGER NOT NULL DEFAULT 0,
+    active_menu_path TEXT,
+    badge_text TEXT,
+    badge_type TEXT,
+    remark TEXT,
+    meta_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
-    PRIMARY KEY (role_id, permission_id),
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (parent_id) REFERENCES menus(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS role_menus (
+    role_id TEXT NOT NULL,
+    menu_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (role_id, menu_id),
     FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE,
-    FOREIGN KEY (permission_id) REFERENCES permissions(id) ON DELETE CASCADE
+    FOREIGN KEY (menu_id) REFERENCES menus(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS refresh_tokens (
@@ -368,7 +395,13 @@ CREATE INDEX IF NOT EXISTS idx_task_queue_status_created
 
 CREATE INDEX IF NOT EXISTS idx_user_roles_user_id ON user_roles(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_roles_role_id ON user_roles(role_id);
-CREATE INDEX IF NOT EXISTS idx_role_permissions_role_id ON role_permissions(role_id);
+
+CREATE INDEX IF NOT EXISTS idx_menus_parent_id ON menus(parent_id);
+CREATE INDEX IF NOT EXISTS idx_menus_sort_order ON menus(sort_order);
+
+CREATE INDEX IF NOT EXISTS idx_menus_visible_enabled ON menus(is_visible, is_enabled);
+CREATE INDEX IF NOT EXISTS idx_role_menus_role_id ON role_menus(role_id);
+CREATE INDEX IF NOT EXISTS idx_role_menus_menu_id ON role_menus(menu_id);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_token_jti ON refresh_tokens(token_jti);
 CREATE INDEX IF NOT EXISTS idx_conversations_user_id ON conversations(user_id);
@@ -439,9 +472,10 @@ def initialize_database(database_url: str | None = None) -> None:
     try:
         connection.executescript(SCHEMA_SQL)
         _migrate_schema(connection)
-        _seed_default_permissions(connection)
         _seed_default_roles(connection)
-        _seed_role_permissions(connection)
+        _seed_default_menus(connection)
+        _purge_removed_default_menus(connection)
+        _seed_role_menus(connection)
         _seed_initial_admin(connection)
         connection.commit()
     finally:
@@ -512,6 +546,21 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_project_task_steps_status ON project_task_steps(status)"
     )
     connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_menus_parent_id ON menus(parent_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_menus_sort_order ON menus(sort_order)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_menus_visible_enabled ON menus(is_visible, is_enabled)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_role_menus_role_id ON role_menus(role_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_role_menus_menu_id ON role_menus(menu_id)"
+    )
+    connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_motion_assets_owner_user_id ON motion_assets(owner_user_id)"
     )
     connection.execute(
@@ -571,26 +620,6 @@ def _ensure_column(
         )
 
 
-def _seed_default_permissions(connection: sqlite3.Connection) -> None:
-    now = utcnow_iso()
-    for definition in DEFAULT_PERMISSION_DEFINITIONS:
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO permissions (
-                id, code, name, group_name, description, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                uuid.uuid4().hex,
-                definition["code"],
-                definition["name"],
-                definition["group_name"],
-                definition["description"],
-                now,
-                now,
-            ),
-        )
-
 
 def _seed_default_roles(connection: sqlite3.Connection) -> None:
     now = utcnow_iso()
@@ -613,34 +642,132 @@ def _seed_default_roles(connection: sqlite3.Connection) -> None:
         )
 
 
-def _seed_role_permissions(connection: sqlite3.Connection) -> None:
+
+def _seed_default_menus(connection: sqlite3.Connection) -> None:
     now = utcnow_iso()
-    permission_id_by_code = {
+    menu_id_by_code = {
         row["code"]: row["id"]
-        for row in connection.execute("SELECT id, code FROM permissions").fetchall()
+        for row in connection.execute("SELECT id, code FROM menus").fetchall()
     }
+
+    for definition in DEFAULT_MENU_DEFINITIONS:
+        parent_code = definition["parent_code"]
+        parent_id = menu_id_by_code.get(parent_code) if parent_code else None
+        existing = connection.execute(
+            "SELECT id FROM menus WHERE code = ? LIMIT 1",
+            (definition["code"],),
+        ).fetchone()
+        if existing is None:
+            menu_id = uuid.uuid4().hex
+            connection.execute(
+                """
+                INSERT INTO menus (
+                    id, parent_id, code, title, menu_type, route_path, route_name,
+                    redirect_path, icon, component_key, sort_order,
+                    is_visible, is_enabled, is_external, open_mode, is_cacheable,
+                    is_affix, active_menu_path, badge_text, badge_type, remark,
+                    meta_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    menu_id,
+                    parent_id,
+                    definition["code"],
+                    definition["title"],
+                    definition["menu_type"],
+                    definition["route_path"],
+                    definition["route_name"],
+                    definition["redirect_path"],
+                    definition["icon"],
+                    definition["component_key"],
+                    definition["sort_order"],
+                    definition["is_visible"],
+                    definition["is_enabled"],
+                    definition["is_external"],
+                    definition["open_mode"],
+                    definition["is_cacheable"],
+                    definition["is_affix"],
+                    definition["active_menu_path"],
+                    definition["badge_text"],
+                    definition["badge_type"],
+                    definition["remark"],
+                    json.dumps(definition["meta_json"], ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            menu_id_by_code[definition["code"]] = menu_id
+            continue
+
+        menu_id = existing["id"]
+        connection.execute(
+            """
+            UPDATE menus
+            SET parent_id = COALESCE(parent_id, ?),
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (parent_id, now, menu_id),
+        )
+        menu_id_by_code[definition["code"]] = menu_id
+
+
+def _purge_removed_default_menus(connection: sqlite3.Connection) -> None:
+    if not REMOVED_DEFAULT_MENU_CODES:
+        return
+
+    placeholders = ", ".join("?" for _ in REMOVED_DEFAULT_MENU_CODES)
+    rows = connection.execute(
+        f"SELECT id FROM menus WHERE code IN ({placeholders})",
+        tuple(REMOVED_DEFAULT_MENU_CODES),
+    ).fetchall()
+    if not rows:
+        return
+
+    menu_ids = [row["id"] for row in rows]
+    menu_placeholders = ", ".join("?" for _ in menu_ids)
+    connection.execute(
+        f"DELETE FROM role_menus WHERE menu_id IN ({menu_placeholders})",
+        tuple(menu_ids),
+    )
+    connection.execute(
+        f"DELETE FROM menus WHERE id IN ({menu_placeholders})",
+        tuple(menu_ids),
+    )
+
+
+def _seed_role_menus(connection: sqlite3.Connection) -> None:
+    now = utcnow_iso()
     role_id_by_code = {
         row["code"]: row["id"]
         for row in connection.execute("SELECT id, code FROM roles").fetchall()
     }
+    menu_id_by_code = {
+        row["code"]: row["id"]
+        for row in connection.execute("SELECT id, code FROM menus").fetchall()
+    }
 
-    for definition in DEFAULT_ROLE_DEFINITIONS:
-        role_id = role_id_by_code[definition["code"]]
-        permission_codes = definition["permission_codes"]
-        if permission_codes == "*":
-            codes_to_bind = tuple(permission_id_by_code.keys())
+    for role_code, menu_codes in DEFAULT_ROLE_MENU_CODES.items():
+        role_id = role_id_by_code.get(role_code)
+        if role_id is None:
+            continue
+
+        if menu_codes == "*":
+            target_codes = tuple(menu_id_by_code.keys())
         else:
-            codes_to_bind = permission_codes
+            target_codes = menu_codes
 
-        for permission_code in codes_to_bind:
-            permission_id = permission_id_by_code[permission_code]
+        for menu_code in target_codes:
+            menu_id = menu_id_by_code.get(menu_code)
+            if menu_id is None:
+                continue
             connection.execute(
                 """
-                INSERT OR IGNORE INTO role_permissions (
-                    role_id, permission_id, created_at
+                INSERT OR IGNORE INTO role_menus (
+                    role_id, menu_id, created_at
                 ) VALUES (?, ?, ?)
                 """,
-                (role_id, permission_id, now),
+                (role_id, menu_id, now),
             )
 
 

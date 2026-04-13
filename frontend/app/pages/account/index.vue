@@ -7,6 +7,7 @@ import { toast } from "vue-sonner";
 
 definePageMeta({
   layout: "console",
+  middleware: "auth",
 });
 
 const auth = useAuth();

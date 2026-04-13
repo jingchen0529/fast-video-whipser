@@ -3,7 +3,7 @@ from typing import Any, Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, StringConstraints
 
-from app.auth.dependencies import get_current_user, require_permissions
+from app.auth.dependencies import get_current_user
 from app.core.http import ResponseModel, build_response
 from app.services.conversation_service import ConversationService
 
@@ -38,7 +38,7 @@ async def create_conversation(
     request: Request,
     payload: CreateConversationRequest,
     current_user: dict = Depends(get_current_user),
-    _: dict = Depends(require_permissions("conversations.write")),
+
 ) -> ResponseModel:
     service = ConversationService()
     conversation = service.create_conversation(
@@ -54,7 +54,7 @@ async def create_conversation(
 async def list_conversations(
     request: Request,
     current_user: dict = Depends(get_current_user),
-    _: dict = Depends(require_permissions("conversations.read")),
+
 ) -> ResponseModel:
     service = ConversationService()
     items = service.list_conversations(user_id=current_user["id"])
@@ -70,7 +70,7 @@ async def list_conversation_messages(
     conversation_id: str,
     request: Request,
     current_user: dict = Depends(get_current_user),
-    _: dict = Depends(require_permissions("conversations.read")),
+
 ) -> ResponseModel:
     service = ConversationService()
     try:
@@ -100,7 +100,7 @@ async def create_conversation_message(
     request: Request,
     payload: CreateConversationMessageRequest,
     current_user: dict = Depends(get_current_user),
-    _: dict = Depends(require_permissions("conversations.write")),
+
 ) -> ResponseModel:
     service = ConversationService()
     try:

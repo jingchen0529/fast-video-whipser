@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.auth.dependencies import get_current_user, require_csrf_protection, require_permissions
+from app.auth.dependencies import require_admin_access, require_csrf_protection
 from app.core.http import ResponseModel, build_response
 from app.services.system_settings_service import SystemSettingsService
 
@@ -87,6 +87,7 @@ class FasterWhisperCapabilitiesPayload(BaseModel):
     available_devices: list[str] = Field(default_factory=list)
     available_compute_types: list[str] = Field(default_factory=list)
     recommended_device: str = "cpu"
+    recommended_compute_type: str = "int8"
     cuda_device_count: int = 0
 
     model_config = ConfigDict(extra="ignore")
@@ -114,8 +115,8 @@ class TranscriptionCapabilitiesPayload(BaseModel):
 @router.get("", response_model=ResponseModel, summary="获取系统设置")
 async def get_system_settings(
     request: Request,
-    _: dict = Depends(get_current_user),
-    __: dict = Depends(require_permissions("settings.view")),
+    _: dict = Depends(require_admin_access),
+
 ) -> ResponseModel:
     data = SystemSettingsService().get_settings()
     return build_response(request, data=data)
@@ -123,8 +124,8 @@ async def get_system_settings(
 
 @router.head("", include_in_schema=False, summary="检查系统设置接口")
 async def head_system_settings(
-    _: dict = Depends(get_current_user),
-    __: dict = Depends(require_permissions("settings.view")),
+    _: dict = Depends(require_admin_access),
+
 ) -> Response:
     SystemSettingsService().get_settings()
     return Response(status_code=status.HTTP_200_OK)
@@ -134,8 +135,8 @@ async def head_system_settings(
 async def update_system_settings(
     request: Request,
     payload: SystemSettingsPayload,
-    current_user: dict = Depends(get_current_user),
-    _: dict = Depends(require_permissions("settings.update")),
+    current_user: dict = Depends(require_admin_access),
+
     __: None = Depends(require_csrf_protection),
 ) -> ResponseModel:
     data = SystemSettingsService().update_settings(
@@ -152,8 +153,8 @@ async def update_system_settings(
 )
 async def get_transcription_capabilities(
     request: Request,
-    _: dict = Depends(get_current_user),
-    __: dict = Depends(require_permissions("settings.view")),
+    _: dict = Depends(require_admin_access),
+
 ) -> ResponseModel:
     data = SystemSettingsService().get_transcription_capabilities()
     return build_response(request, data=data)
@@ -167,8 +168,8 @@ async def get_transcription_capabilities(
 async def preview_transcription_capabilities(
     request: Request,
     payload: SystemSettingsPayload,
-    _: dict = Depends(get_current_user),
-    __: dict = Depends(require_permissions("settings.view")),
+    _: dict = Depends(require_admin_access),
+
     ___: None = Depends(require_csrf_protection),
 ) -> ResponseModel:
     data = SystemSettingsService().get_transcription_capabilities(

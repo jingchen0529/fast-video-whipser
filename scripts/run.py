@@ -16,6 +16,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.core.config import settings
 
+FRONTEND_DEFAULT_MAX_OLD_SPACE_SIZE_MB = 4096
+
 
 def _resolve_project_path(path_value: str) -> Path:
     path = Path(path_value)
@@ -62,6 +64,20 @@ def _spawn(
 def _build_frontend_env() -> dict[str, str]:
     env = os.environ.copy()
     env["NUXT_API_BASE"] = _backend_base_url()
+    max_old_space_size = (
+        env.get("FRONTEND_NODE_MAX_OLD_SPACE_SIZE")
+        or env.get("NUXT_NODE_MAX_OLD_SPACE_SIZE")
+        or str(FRONTEND_DEFAULT_MAX_OLD_SPACE_SIZE_MB)
+    ).strip()
+    existing_node_options = env.get("NODE_OPTIONS", "").strip()
+    max_old_space_option = f"--max-old-space-size={max_old_space_size}"
+
+    if max_old_space_option not in existing_node_options.split():
+        env["NODE_OPTIONS"] = (
+            f"{existing_node_options} {max_old_space_option}".strip()
+            if existing_node_options
+            else max_old_space_option
+        )
     return env
 
 

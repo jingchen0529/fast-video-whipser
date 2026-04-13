@@ -10,6 +10,22 @@ from app.db.sqlite import create_connection
 
 class AssetService:
     @staticmethod
+    def _extract_related_asset_from_row(row, prefix: str) -> dict | None:
+        asset_id = row[f"{prefix}_id"] if f"{prefix}_id" in row.keys() else None
+        if not asset_id:
+            return None
+        metadata_raw = row[f"{prefix}_metadata_json"] if f"{prefix}_metadata_json" in row.keys() else None
+        metadata = json.loads(metadata_raw) if metadata_raw else {}
+        return {
+            "id": asset_id,
+            "asset_type": row[f"{prefix}_asset_type"] if f"{prefix}_asset_type" in row.keys() else None,
+            "source_type": row[f"{prefix}_source_type"] if f"{prefix}_source_type" in row.keys() else None,
+            "file_name": row[f"{prefix}_file_name"] if f"{prefix}_file_name" in row.keys() else None,
+            "thumbnail_path": row[f"{prefix}_thumbnail_path"] if f"{prefix}_thumbnail_path" in row.keys() else None,
+            "metadata_json": metadata,
+        }
+
+    @staticmethod
     def _row_to_asset(row) -> dict:
         asset = dict(row)
         if asset.get("metadata_json"):
@@ -21,6 +37,17 @@ class AssetService:
         item = dict(row)
         if item.get("metadata_json"):
             item["metadata_json"] = json.loads(item["metadata_json"])
+        item["source_video_asset"] = AssetService._extract_related_asset_from_row(
+            row,
+            "source_video_related",
+        )
+        item["clip_asset"] = AssetService._extract_related_asset_from_row(
+            row,
+            "clip_related",
+        )
+        for key in list(item.keys()):
+            if key.startswith("source_video_related_") or key.startswith("clip_related_"):
+                item.pop(key, None)
         item.pop("owner_user_id", None)
         return item
 
@@ -92,18 +119,106 @@ class AssetService:
             "updated_at": now,
         }
 
-    def get_asset(self, *, asset_id: str) -> dict | None:
+    def get_asset(self, *, asset_id: str, owner_user_id: str | None = None) -> dict | None:
+        clauses = ["id = ?"]
+        params: list[object] = [asset_id]
+        if owner_user_id is not None:
+            clauses.append("(owner_user_id = ? OR owner_user_id IS NULL)")
+            params.append(owner_user_id)
+        where = " AND ".join(clauses)
+
         connection = create_connection()
         try:
             row = connection.execute(
-                """
+                f"""
                 SELECT *
                 FROM media_assets
-                WHERE id = ?
+                WHERE {where}
                 """,
-                (asset_id,),
+                params,
             ).fetchone()
             return self._row_to_asset(row) if row is not None else None
+        finally:
+            connection.close()
+
+    def list_media_assets(
+        self,
+        *,
+        asset_type: str | None = None,
+        source_type: str | None = None,
+        owner_user_id: str | None = None,
+        keyword: str | None = None,
+        sort: str = "newest",
+        page: int = 1,
+        page_size: int = 40,
+    ) -> dict:
+        clauses = ["1 = 1"]
+        params: list[object] = []
+
+        if asset_type:
+            clauses.append("asset_type = ?")
+            params.append(asset_type.strip())
+        if source_type:
+            clauses.append("source_type = ?")
+            params.append(source_type.strip())
+        if owner_user_id:
+            clauses.append("(owner_user_id = ? OR owner_user_id IS NULL)")
+            params.append(owner_user_id.strip())
+        if keyword:
+            clauses.append("file_name LIKE ?")
+            params.append(f"%{keyword.strip()}%")
+
+        order = "created_at DESC" if sort == "newest" else "created_at ASC"
+        where = " AND ".join(clauses)
+
+        connection = create_connection()
+        try:
+            total = connection.execute(
+                f"SELECT COUNT(*) AS cnt FROM media_assets WHERE {where}",
+                params,
+            ).fetchone()["cnt"]
+
+            safe_page = max(1, page)
+            safe_size = max(1, min(page_size, 100))
+            offset = (safe_page - 1) * safe_size
+
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM media_assets
+                WHERE {where}
+                ORDER BY {order}
+                LIMIT ? OFFSET ?
+                """,
+                [*params, safe_size, offset],
+            ).fetchall()
+            return {
+                "items": [self._row_to_asset(row) for row in rows],
+                "total": total,
+                "page": safe_page,
+                "page_size": safe_size,
+            }
+        finally:
+            connection.close()
+
+    def get_storage_usage(self, *, owner_user_id: str | None = None) -> dict:
+        clauses = ["1 = 1"]
+        params: list[object] = []
+        if owner_user_id:
+            clauses.append("(owner_user_id = ? OR owner_user_id IS NULL)")
+            params.append(owner_user_id.strip())
+        where = " AND ".join(clauses)
+
+        connection = create_connection()
+        try:
+            row = connection.execute(
+                f"SELECT COALESCE(SUM(size_bytes), 0) AS used FROM media_assets WHERE {where}",
+                params,
+            ).fetchone()
+            return {
+                "used_bytes": row["used"] if row is not None else 0,
+                "total_bytes": 1 * 1024 * 1024 * 1024,
+            }
         finally:
             connection.close()
 
@@ -174,6 +289,7 @@ class AssetService:
         conversation_id: str | None,
         job_id: str | None,
         clips: list[dict],
+        owner_user_id: str | None = None,
         origin: str = "ai_generated",
     ) -> list[dict]:
         if not clips:
@@ -190,6 +306,8 @@ class AssetService:
                     "asset_candidate": clip.get("asset_candidate", True),
                     "analysis_source": "video_analysis",
                 }
+                if isinstance(clip.get("metadata_json"), dict):
+                    metadata.update(clip["metadata_json"])
                 connection.execute(
                     """
                     INSERT INTO motion_assets (
@@ -206,7 +324,7 @@ class AssetService:
                         clip.get("clip_asset_id"),
                         conversation_id,
                         job_id,
-                        None,
+                        owner_user_id,
                         clip["start_ms"],
                         clip["end_ms"],
                         clip["action_summary"],
@@ -232,6 +350,7 @@ class AssetService:
                         "clip_asset_id": clip.get("clip_asset_id"),
                         "conversation_id": conversation_id,
                         "job_id": job_id,
+                        "owner_user_id": owner_user_id,
                         "start_ms": clip["start_ms"],
                         "end_ms": clip["end_ms"],
                         "action_summary": clip["action_summary"],
@@ -254,6 +373,94 @@ class AssetService:
             return items
         finally:
             connection.close()
+
+    def review_motion_asset(
+        self,
+        *,
+        motion_asset_id: str,
+        action: str,
+        comment: str | None = None,
+        reviewer_id: str | None = None,
+    ) -> dict | None:
+        normalized_action = (action or "").strip().lower()
+        if normalized_action not in {"approve", "reject"}:
+            raise ValueError("动作资产审核动作仅支持 approve 或 reject。")
+
+        next_status = "approved" if normalized_action == "approve" else "rejected"
+        now = utcnow_iso()
+
+        connection = create_connection()
+        try:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM motion_assets
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (motion_asset_id,),
+            ).fetchone()
+            if row is None:
+                return None
+
+            item = dict(row)
+            metadata = json.loads(item["metadata_json"]) if item.get("metadata_json") else {}
+            review_history = metadata.get("review_history")
+            if not isinstance(review_history, list):
+                review_history = []
+            review_history.append(
+                {
+                    "action": normalized_action,
+                    "status": next_status,
+                    "comment": (comment or "").strip(),
+                    "reviewer_id": reviewer_id,
+                    "reviewed_at": now,
+                }
+            )
+            metadata["review_history"] = review_history
+            if reviewer_id:
+                metadata["last_reviewer_id"] = reviewer_id
+            if comment:
+                metadata["last_review_comment"] = comment.strip()
+
+            connection.execute(
+                """
+                UPDATE motion_assets
+                SET review_status = ?, metadata_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    next_status,
+                    json.dumps(metadata, ensure_ascii=False),
+                    now,
+                    motion_asset_id,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        return self.get_motion_asset(motion_asset_id=motion_asset_id)
+
+    def batch_review_motion_assets(
+        self,
+        *,
+        asset_ids: list[str],
+        action: str,
+        reviewer_id: str | None = None,
+        comment: str | None = None,
+    ) -> int:
+        count = 0
+        for motion_asset_id in asset_ids:
+            result = self.review_motion_asset(
+                motion_asset_id=motion_asset_id,
+                action=action,
+                comment=comment,
+                reviewer_id=reviewer_id,
+            )
+            if result is not None:
+                count += 1
+        return count
 
     def list_motion_assets(
         self,
@@ -295,10 +502,27 @@ class AssetService:
         try:
             rows = connection.execute(
                 f"""
-                SELECT *
+                SELECT
+                    motion_assets.*,
+                    source_video.id AS source_video_related_id,
+                    source_video.asset_type AS source_video_related_asset_type,
+                    source_video.source_type AS source_video_related_source_type,
+                    source_video.file_name AS source_video_related_file_name,
+                    source_video.thumbnail_path AS source_video_related_thumbnail_path,
+                    source_video.metadata_json AS source_video_related_metadata_json,
+                    clip.id AS clip_related_id,
+                    clip.asset_type AS clip_related_asset_type,
+                    clip.source_type AS clip_related_source_type,
+                    clip.file_name AS clip_related_file_name,
+                    clip.thumbnail_path AS clip_related_thumbnail_path,
+                    clip.metadata_json AS clip_related_metadata_json
                 FROM motion_assets
+                LEFT JOIN media_assets AS source_video
+                    ON source_video.id = motion_assets.source_video_asset_id
+                LEFT JOIN media_assets AS clip
+                    ON clip.id = motion_assets.clip_asset_id
                 WHERE {' AND '.join(clauses)}
-                ORDER BY created_at DESC
+                ORDER BY motion_assets.created_at DESC
                 LIMIT ?
                 """,
                 params,
@@ -307,100 +531,39 @@ class AssetService:
         finally:
             connection.close()
 
-    def list_media_assets(
-        self,
-        *,
-        asset_type: str | None = None,
-        source_type: str | None = None,
-        owner_user_id: str | None = None,
-        keyword: str | None = None,
-        sort: str = "newest",
-        page: int = 1,
-        page_size: int = 40,
-    ) -> dict:
-        clauses = ["1 = 1"]
-        params: list[object] = []
-
-        if asset_type:
-            clauses.append("asset_type = ?")
-            params.append(asset_type.strip())
-        if source_type:
-            clauses.append("source_type = ?")
-            params.append(source_type.strip())
+    def delete_asset(self, *, asset_id: str, owner_user_id: str | None = None) -> bool:
+        clauses = ["id = ?"]
+        params: list[object] = [asset_id]
         if owner_user_id:
-            clauses.append("owner_user_id = ?")
+            clauses.append("(owner_user_id = ? OR owner_user_id IS NULL)")
             params.append(owner_user_id.strip())
-        if keyword:
-            clauses.append("file_name LIKE ?")
-            params.append(f"%{keyword.strip()}%")
-
-        order = "created_at DESC" if sort == "newest" else "created_at ASC"
         where = " AND ".join(clauses)
 
         connection = create_connection()
         try:
-            total = connection.execute(
-                f"SELECT COUNT(*) AS cnt FROM media_assets WHERE {where}",
-                params,
-            ).fetchone()["cnt"]
-
-            safe_page = max(1, page)
-            safe_size = max(1, min(page_size, 100))
-            offset = (safe_page - 1) * safe_size
-
-            rows = connection.execute(
-                f"""
-                SELECT *
-                FROM media_assets
-                WHERE {where}
-                ORDER BY {order}
-                LIMIT ? OFFSET ?
-                """,
-                [*params, safe_size, offset],
-            ).fetchall()
-            return {
-                "items": [self._row_to_asset(row) for row in rows],
-                "total": total,
-                "page": safe_page,
-                "page_size": safe_size,
-            }
-        finally:
-            connection.close()
-
-    def get_storage_usage(self) -> dict:
-        connection = create_connection()
-        try:
-            row = connection.execute(
-                "SELECT COALESCE(SUM(size_bytes), 0) AS used FROM media_assets"
-            ).fetchone()
-            return {
-                "used_bytes": row["used"],
-                "total_bytes": 1 * 1024 * 1024 * 1024,
-            }
-        finally:
-            connection.close()
-
-    def delete_asset(self, *, asset_id: str) -> bool:
-        connection = create_connection()
-        try:
             cursor = connection.execute(
-                "DELETE FROM media_assets WHERE id = ?",
-                (asset_id,),
+                f"DELETE FROM media_assets WHERE {where}",
+                params,
             )
             connection.commit()
             return cursor.rowcount > 0
         finally:
             connection.close()
 
-    def delete_assets_batch(self, *, asset_ids: list[str]) -> int:
+    def delete_assets_batch(self, *, asset_ids: list[str], owner_user_id: str | None = None) -> int:
         if not asset_ids:
             return 0
         placeholders = ", ".join("?" for _ in asset_ids)
+        params: list[object] = list(asset_ids)
+        owner_clause = ""
+        if owner_user_id:
+            owner_clause = " AND (owner_user_id = ? OR owner_user_id IS NULL)"
+            params.append(owner_user_id.strip())
         connection = create_connection()
         try:
             cursor = connection.execute(
-                f"DELETE FROM media_assets WHERE id IN ({placeholders})",
-                asset_ids,
+                f"DELETE FROM media_assets WHERE id IN ({placeholders}){owner_clause}",
+                params,
             )
             connection.commit()
             return cursor.rowcount
@@ -412,15 +575,32 @@ class AssetService:
         *,
         motion_asset_id: str,
     ) -> dict | None:
-        clauses = ["id = ?"]
+        clauses = ["motion_assets.id = ?"]
         params: list[object] = [motion_asset_id]
 
         connection = create_connection()
         try:
             row = connection.execute(
                 f"""
-                SELECT *
+                SELECT
+                    motion_assets.*,
+                    source_video.id AS source_video_related_id,
+                    source_video.asset_type AS source_video_related_asset_type,
+                    source_video.source_type AS source_video_related_source_type,
+                    source_video.file_name AS source_video_related_file_name,
+                    source_video.thumbnail_path AS source_video_related_thumbnail_path,
+                    source_video.metadata_json AS source_video_related_metadata_json,
+                    clip.id AS clip_related_id,
+                    clip.asset_type AS clip_related_asset_type,
+                    clip.source_type AS clip_related_source_type,
+                    clip.file_name AS clip_related_file_name,
+                    clip.thumbnail_path AS clip_related_thumbnail_path,
+                    clip.metadata_json AS clip_related_metadata_json
                 FROM motion_assets
+                LEFT JOIN media_assets AS source_video
+                    ON source_video.id = motion_assets.source_video_asset_id
+                LEFT JOIN media_assets AS clip
+                    ON clip.id = motion_assets.clip_asset_id
                 WHERE {' AND '.join(clauses)}
                 LIMIT 1
                 """,

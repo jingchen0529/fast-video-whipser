@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from app.auth.dependencies import get_current_user, require_permissions
+from app.auth.dependencies import get_current_user
 from app.core.http import ResponseModel, build_response
 from app.services.job_service import JobService
 
@@ -12,7 +12,7 @@ async def get_job(
     job_id: str,
     request: Request,
     current_user: dict = Depends(get_current_user),
-    _: dict = Depends(require_permissions("jobs.read")),
+
 ) -> ResponseModel:
     _ = current_user
     service = JobService()

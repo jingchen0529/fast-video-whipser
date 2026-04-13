@@ -110,9 +110,8 @@ const fetchStorageUsage = async () => {
 const fetchAssets = async () => {
   loading.value = true;
   try {
-    // 默认展示上传资产
     const res = await api<{ items: any[]; total: number }>(
-      `/assets?source_type=upload`,
+      "/assets",
     );
     items.value = res.items || [];
   } catch (e) {

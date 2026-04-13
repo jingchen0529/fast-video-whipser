@@ -15,6 +15,7 @@ from app.workflows.engine import (
 from app.workflows.analysis import AnalysisWorkflow, ANALYSIS_TASK_STEPS
 from app.workflows.remake import RemakeWorkflow, REMAKE_TASK_STEPS
 from app.workflows.create import CreateWorkflow, CREATE_TASK_STEPS
+from app.workflows.motion_extraction import MOTION_EXTRACTION_STEPS
 
 __all__ = [
     "TaskStepDefinition",
@@ -29,5 +30,6 @@ __all__ = [
     "REMAKE_TASK_STEPS",
     "CreateWorkflow",
     "CREATE_TASK_STEPS",
+    "MOTION_EXTRACTION_STEPS",
     "UNSUPPORTED_WORKFLOW_STEPS",
 ]

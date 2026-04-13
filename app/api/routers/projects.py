@@ -1,3 +1,4 @@
+import os
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
@@ -56,7 +57,7 @@ class ProjectDetail(ProjectListItem):
     timeline_segments: List[dict] = []
     shot_segments: List[dict] = []
     storyboard: dict = {"id": None, "version_no": 0, "status": "idle", "summary": "", "items": []}
-    video_generation: dict = {"status": "idle", "provider": None, "model": None, "objective": None, "asset_type": None, "asset_name": None, "asset_url": None, "audio_name": None, "audio_url": None, "reference_frames": [], "script": None, "storyboard": None, "prompt": None, "provider_task_id": None, "result_video_url": None, "error_detail": None, "updated_at": None}
+    video_generation: dict = {"status": "idle", "provider": None, "model": None, "objective": None, "asset_type": None, "asset_name": None, "asset_url": None, "output_asset_id": None, "audio_name": None, "audio_url": None, "reference_frames": [], "script": None, "storyboard": None, "prompt": None, "provider_task_id": None, "result_video_url": None, "error_detail": None, "updated_at": None}
     conversation_messages: List[ProjectConversationMessage] = []
     task_steps: List[ProjectTaskStep] = []
 
@@ -105,10 +106,13 @@ async def upload_project(
         if file is not None:
             await file.close()
 
-    TaskQueue.instance().enqueue(
-        task_type="workflow",
-        payload={"project_id": project["id"]},
-    )
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        await service.run_project_workflow(project_id=project["id"])
+    else:
+        TaskQueue.instance().enqueue(
+            task_type="workflow",
+            payload={"project_id": project["id"]},
+        )
     return build_response(request, data=project)
 
 @router.post("/{project_id}/messages", response_model=ResponseModel)

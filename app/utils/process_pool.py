@@ -1,26 +1,54 @@
 import asyncio
 import logging
 import os
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
 from typing import Any, Callable, TypeVar
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-_PROCESS_POOL: ProcessPoolExecutor | None = None
+_PROCESS_POOL: Executor | None = None
 
 
-def get_process_pool() -> ProcessPoolExecutor:
-    """Lazy initialize and return the global process pool."""
+def _is_executor_shutdown(executor: Executor) -> bool:
+    return bool(
+        getattr(executor, "_shutdown_thread", False)
+        or getattr(executor, "_shutdown", False)
+    )
+
+
+def get_process_pool() -> Executor:
+    """Lazy initialize and return the global worker pool."""
     global _PROCESS_POOL
+    if _PROCESS_POOL is not None and _is_executor_shutdown(_PROCESS_POOL):
+        _PROCESS_POOL = None
     if _PROCESS_POOL is None:
         # We use a small number of workers because Whisper and SceneDetect are resource-heavy.
         # This prevents library conflicts (cv2/av) by keeping them in separate address spaces.
         max_workers = 2
-        _PROCESS_POOL = ProcessPoolExecutor(max_workers=max_workers)
-        logger.info("Initialized global ProcessPoolExecutor with %d workers", max_workers)
+        try:
+            _PROCESS_POOL = ProcessPoolExecutor(max_workers=max_workers)
+            logger.info("Initialized global ProcessPoolExecutor with %d workers", max_workers)
+        except (NotImplementedError, OSError, PermissionError) as exc:
+            logger.warning(
+                "ProcessPoolExecutor unavailable, falling back to ThreadPoolExecutor: %s",
+                exc,
+            )
+            _PROCESS_POOL = ThreadPoolExecutor(max_workers=max_workers)
+            logger.info("Initialized fallback ThreadPoolExecutor with %d workers", max_workers)
     return _PROCESS_POOL
+
+
+def shutdown_process_pool(*, wait: bool = True) -> None:
+    global _PROCESS_POOL
+    if _PROCESS_POOL is None:
+        return
+
+    executor = _PROCESS_POOL
+    _PROCESS_POOL = None
+    executor.shutdown(wait=wait)
+    logger.info("Shut down global worker pool")
 
 
 async def run_in_process(func: Callable[..., T], *args: Any) -> T:

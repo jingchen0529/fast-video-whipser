@@ -16,7 +16,6 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Switch } from "@/components/ui/switch";
 import { Pagination } from "@/components/ui/pagination";
 import {
   Tooltip,
@@ -32,7 +31,7 @@ import {
   DialogTitle,
   DialogFooter,
 } from "@/components/ui/dialog";
-import type { AuthPermission, AuthRole } from "@/types/api";
+import type { AuthMenu, AuthRole } from "@/types/api";
 import PopupForm from "./popupForm.vue";
 
 definePageMeta({
@@ -44,7 +43,7 @@ const api = useApi();
 
 // --- 响应式状态 ---
 const roles = ref<AuthRole[]>([]); // 角色列表
-const permissions = ref<AuthPermission[]>([]); // 权限资源列表 (用于分配)
+const menus = ref<AuthMenu[]>([]); // 菜单树 (用于分配)
 const loading = ref(false); // 全局加载状态
 const showPopup = ref(false); // 控制新增/编辑弹窗
 const editingRole = ref<AuthRole | null>(null); // 当前编辑的角色对象
@@ -78,18 +77,18 @@ const paginatedRoles = computed(() => {
 });
 
 /**
- * 加载数据（角色列表 + 权限定义）
+ * 加载数据（角色列表 + 菜单树）
  * @param manual 是否手动刷新
  */
 const loadData = async (manual = false) => {
   loading.value = true;
   try {
-    const [roleList, permissionList] = await Promise.all([
+    const [roleList, menuTree] = await Promise.all([
       api.get<AuthRole[]>("/auth/roles"),
-      api.get<AuthPermission[]>("/auth/permissions"),
+      api.get<AuthMenu[]>("/menus/tree"),
     ]);
     roles.value = roleList;
-    permissions.value = permissionList;
+    menus.value = menuTree;
     if (manual) {
       toast.success("角色列表已刷新。");
     }
@@ -120,8 +119,8 @@ const openEditRole = (role: AuthRole) => {
 /**
  * 全选当前页
  */
-const toggleSelectAll = (checked: boolean) => {
-  if (checked) {
+const toggleSelectAll = (checked: boolean | "indeterminate") => {
+  if (checked === true) {
     selectedIds.value = paginatedRoles.value.map((r) => r.id);
   } else {
     selectedIds.value = [];
@@ -210,11 +209,11 @@ onMounted(async () => {
               <TableRow class="h-10 hover:bg-transparent">
                 <TableHead class="w-12 text-center">
                   <Checkbox
-                    :checked="
+                    :model-value="
                       selectedIds.length === paginatedRoles.length &&
                       paginatedRoles.length > 0
                     "
-                    @update:checked="toggleSelectAll"
+                    @update:model-value="toggleSelectAll"
                   />
                 </TableHead>
                 <TableHead class="text-[13px] font-bold text-zinc-700"
@@ -227,10 +226,10 @@ onMounted(async () => {
                   >唯一编码</TableHead
                 >
                 <TableHead class="text-[13px] font-bold text-zinc-700"
-                  >权限概览</TableHead
+                  >菜单概览</TableHead
                 >
                 <TableHead class="text-[13px] font-bold text-zinc-700"
-                  >系统标识</TableHead
+                  >角色类型</TableHead
                 >
                 <TableHead
                   class="text-[13px] font-bold text-zinc-700 text-center"
@@ -246,10 +245,10 @@ onMounted(async () => {
               >
                 <TableCell class="text-center">
                   <Checkbox
-                    :checked="selectedIds.includes(item.id)"
-                    @update:checked="
-                      (val: boolean) =>
-                        val
+                    :model-value="selectedIds.includes(item.id)"
+                    @update:model-value="
+                      (val: boolean | 'indeterminate') =>
+                        val === true
                           ? selectedIds.push(item.id)
                           : (selectedIds = selectedIds.filter(
                               (id) => id !== item.id,
@@ -274,17 +273,21 @@ onMounted(async () => {
                     variant="outline"
                     class="rounded-full bg-admin-cyan/5 text-admin-cyan border-admin-cyan/20 text-[10px] px-2 h-5"
                   >
-                    {{ item.permissions?.length || 0 }} 项权限
+                    {{ item.menus?.length || 0 }} 个菜单
                   </Badge>
                 </TableCell>
                 <TableCell>
-                  <div class="flex items-center">
-                    <Switch
-                      :checked="!item.is_system"
-                      disabled
-                      class="data-[state=checked]:bg-admin-cyan cursor-not-allowed opacity-80"
-                    />
-                  </div>
+                  <Badge
+                    variant="outline"
+                    class="h-6 rounded-full px-2.5 text-[10px] font-medium"
+                    :class="
+                      item.is_system
+                        ? 'border-amber-200 bg-amber-50 text-amber-700'
+                        : 'border-zinc-200 bg-zinc-50 text-zinc-600'
+                    "
+                  >
+                    {{ item.is_system ? "系统内置" : "自定义" }}
+                  </Badge>
                 </TableCell>
                 <TableCell>
                   <div class="flex items-center justify-center gap-1">
@@ -338,7 +341,7 @@ onMounted(async () => {
     <PopupForm
       v-model="showPopup"
       :role="editingRole"
-      :permissions="permissions"
+      :menu-tree="menus"
       @saved="loadData"
     />
 

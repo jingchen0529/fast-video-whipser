@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field, StringConstraints
 
-from app.auth.dependencies import require_permissions
+
 from app.core.http import ResponseModel, build_response
 from app.crawlers.tiktok import TikTokAPPCrawler
 
@@ -30,7 +30,7 @@ class TikTokValueRequest(BaseModel):
 async def get_tiktok_video_info(
     request: Request,
     payload: TikTokValueRequest,
-    _: dict = Depends(require_permissions("tiktok.fetch")),
+
 ) -> ResponseModel:
     # 统一返回视频信息、下载链接，以及作品在 TikTok 上的基础信息。
     crawler = TikTokAPPCrawler()
