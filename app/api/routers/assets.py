@@ -2,7 +2,6 @@ import os
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
 
 from app.auth.dependencies import (
     get_current_user,
@@ -11,7 +10,8 @@ from app.auth.dependencies import (
 )
 from app.core.config import settings
 from app.core.http import ResponseModel, build_response
-from app.services.asset_service import AssetService
+from app.schemas.assets import BatchDeleteBody, MotionBatchReviewRequest, MotionExtractRequest, MotionReviewRequest
+from app.services.asset_service import AssetService, MAX_MOTION_ASSET_LIST_LIMIT
 from app.services.job_service import JobService
 from app.services.motion_service import MotionService
 from app.utils.file_utils import FileUtils
@@ -79,10 +79,6 @@ async def delete_asset(
     if not deleted:
         raise HTTPException(status_code=404, detail="资产不存在。")
     return build_response(request, data={"deleted": True})
-
-
-class BatchDeleteBody(BaseModel):
-    ids: list[str]
 
 
 @router.post("/batch-delete", response_model=ResponseModel, summary="批量删除媒体资产")
@@ -164,7 +160,7 @@ async def list_motion_assets(
     origin: str | None = Query(None, description="来源类型: upload 或 ai_generated"),
     source_video_asset_id: str | None = None,
     keyword: str | None = Query(None, alias="q"),
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(20, ge=1, le=MAX_MOTION_ASSET_LIST_LIMIT),
     current_user: dict = Depends(get_current_user),
 
 ) -> ResponseModel:
@@ -203,21 +199,6 @@ async def get_motion_asset(
     return build_response(request, data=item)
 
 
-class MotionExtractRequest(BaseModel):
-    project_id: int
-
-
-class MotionReviewRequest(BaseModel):
-    action: str
-    comment: str | None = None
-
-
-class MotionBatchReviewRequest(BaseModel):
-    ids: list[str]
-    action: str
-    comment: str | None = None
-
-
 @router.post("/motions/extract", response_model=ResponseModel, summary="触发动作资产提取")
 async def extract_motion_assets(
     body: MotionExtractRequest,
@@ -225,6 +206,7 @@ async def extract_motion_assets(
     current_user: dict = Depends(get_current_user),
     __: None = Depends(require_csrf_protection),
 ) -> ResponseModel:
+    extraction_hint = (body.extraction_hint or "").strip()
     project = MotionService()._project_service._get_project_for_execution(
         project_id=body.project_id,
     )
@@ -233,7 +215,7 @@ async def extract_motion_assets(
 
     job = JobService().create_job(
         job_type="motion_extraction",
-        conversation_id=project.get("conversation_id"),
+        project_id=body.project_id,
         input_asset_id=project.get("source_asset_id"),
         result={
             "project_id": body.project_id,
@@ -243,6 +225,7 @@ async def extract_motion_assets(
             "saved_count": 0,
             "asset_ids": [],
             "items": [],
+            "extraction_hint": extraction_hint,
         },
     )
 
@@ -251,6 +234,7 @@ async def extract_motion_assets(
             job_id=job["id"],
             project_id=body.project_id,
             owner_user_id=current_user["id"],
+            extraction_hint=extraction_hint,
         )
     else:
         TaskQueue.instance().enqueue(
@@ -259,6 +243,7 @@ async def extract_motion_assets(
                 "job_id": job["id"],
                 "project_id": body.project_id,
                 "owner_user_id": current_user["id"],
+                "extraction_hint": extraction_hint,
             },
         )
 

@@ -1,3 +1,4 @@
+from app.services.job_service import JobService
 from tests.test_auth_api import _build_test_client, _csrf_headers, _login, _upload_video_asset
 
 
@@ -23,35 +24,19 @@ def test_get_job_success(tmp_path) -> None:
         )
         assert login_response.status_code == 200
 
-        conversation_response = client.post(
-            "/api/conversations",
-            headers=_csrf_headers(client),
-            json={
-                "title": "任务详情测试",
-                "conversation_type": "mixed",
-            },
-        )
-        assert conversation_response.status_code == 200
-        conversation_id = conversation_response.json()["data"]["id"]
         asset_id = _upload_video_asset(client)
-
-        message_response = client.post(
-            f"/api/conversations/{conversation_id}/messages",
-            headers=_csrf_headers(client),
-            json={
-                "message_type": "video_analysis_request",
-                "content": "分析这个视频",
-                "asset_ids": [asset_id],
-                "options": {},
-            },
+        job = JobService().create_job(
+            job_type="video_analysis",
+            input_asset_id=asset_id,
+            status="succeeded",
+            progress=100,
+            result={"motion_asset_count": 3},
         )
-        assert message_response.status_code == 200
-        job_id = message_response.json()["data"]["job"]["id"]
 
-        response = client.get(f"/api/jobs/{job_id}")
+        response = client.get(f"/api/jobs/{job['id']}")
         assert response.status_code == 200
         body = response.json()
 
-        assert body["data"]["id"] == job_id
+        assert body["data"]["id"] == job["id"]
         assert body["data"]["job_type"] == "video_analysis"
         assert body["data"]["status"] in {"queued", "running", "succeeded"}

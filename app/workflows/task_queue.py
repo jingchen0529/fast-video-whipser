@@ -1,5 +1,5 @@
 """
-Persistent async task queue backed by SQLite.
+Persistent async task queue backed by the database.
 
 Replaces FastAPI's BackgroundTasks with a durable queue that:
 - Persists tasks to the DB (survives restarts)
@@ -10,22 +10,29 @@ Replaces FastAPI's BackgroundTasks with a durable queue that:
 import asyncio
 import json
 import logging
-import traceback
 import uuid
 from typing import Any, Awaitable, Callable
 
-from app.auth.security import utcnow_iso
-from app.db.sqlite import create_connection
+from sqlalchemy import select
+
+from app.auth.security import utcnow_ms
+from app.db.session import get_db_session
+from app.models.job import TaskQueueItem
 
 logger = logging.getLogger(__name__)
 
 TaskExecutor = Callable[..., Awaitable[Any]]
 
 
+def _get_session():
+    gen = get_db_session()
+    return next(gen)
+
+
 class TaskQueue:
     """
     Persistent async task queue.
-    
+
     Usage:
         queue = TaskQueue.instance()
         task_id = queue.enqueue(
@@ -63,32 +70,27 @@ class TaskQueue:
     ) -> str:
         """Add a task to the persistent queue. Returns the task ID."""
         task_id = uuid.uuid4().hex
-        now = utcnow_iso()
-        connection = create_connection()
+        now = utcnow_ms()
+        session = _get_session()
         try:
-            connection.execute(
-                """
-                INSERT INTO task_queue (
-                    id, task_type, status, payload_json,
-                    max_retries, retry_count,
-                    error_message, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    task_id,
-                    task_type,
-                    "queued",
-                    json.dumps(payload, ensure_ascii=False),
-                    max_retries,
-                    0,
-                    None,
-                    now,
-                    now,
-                ),
+            item = TaskQueueItem(
+                id=task_id,
+                task_type=task_type,
+                status="queued",
+                payload_json=json.dumps(payload, ensure_ascii=False),
+                max_retries=max_retries,
+                retry_count=0,
+                error_message=None,
+                created_at=now,
+                updated_at=now,
             )
-            connection.commit()
+            session.add(item)
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
         finally:
-            connection.close()
+            session.close()
 
         logger.info("Enqueued task %s (type=%s)", task_id, task_type)
         if self._wake_event is not None and self._worker_loop_ref is not None:
@@ -100,20 +102,29 @@ class TaskQueue:
 
     def get_task_status(self, task_id: str) -> dict[str, Any] | None:
         """Get the current status of a queued task."""
-        connection = create_connection()
+        session = _get_session()
         try:
-            row = connection.execute(
-                "SELECT * FROM task_queue WHERE id = ?",
-                (task_id,),
-            ).fetchone()
-            if row is None:
+            item = session.get(TaskQueueItem, task_id)
+            if item is None:
                 return None
-            item = dict(row)
-            if item.get("payload_json"):
-                item["payload"] = json.loads(item["payload_json"])
-            return item
+            result = {
+                "id": item.id,
+                "task_type": item.task_type,
+                "status": item.status,
+                "payload_json": item.payload_json,
+                "max_retries": item.max_retries,
+                "retry_count": item.retry_count,
+                "error_message": item.error_message,
+                "started_at": item.started_at,
+                "finished_at": item.finished_at,
+                "created_at": item.created_at,
+                "updated_at": item.updated_at,
+            }
+            if item.payload_json:
+                result["payload"] = json.loads(item.payload_json)
+            return result
         finally:
-            connection.close()
+            session.close()
 
     async def start_worker(self) -> None:
         """Start the background worker loop."""
@@ -171,36 +182,56 @@ class TaskQueue:
                 await asyncio.sleep(self._poll_interval)
 
     def _claim_next_task(self) -> dict[str, Any] | None:
-        """Atomically claim the next queued task."""
-        now = utcnow_iso()
-        connection = create_connection()
+        """Atomically claim the next queued task.
+
+        Uses SELECT ... FOR UPDATE SKIP LOCKED so that concurrent workers
+        (multiple processes or threads) never pick up the same task.  The row
+        is locked for the duration of the transaction; other workers will skip
+        it and move on to the next available row instead of blocking.
+
+        Note: SKIP LOCKED requires MySQL 8.0+ or PostgreSQL 9.5+.  SQLite does
+        not support it, but SQLite is single-writer by nature so the race
+        condition cannot occur there.
+        """
+        now = utcnow_ms()
+        session = _get_session()
         try:
-            row = connection.execute(
-                """
-                SELECT * FROM task_queue
-                WHERE status = 'queued'
-                ORDER BY created_at ASC
-                LIMIT 1
-                """,
-            ).fetchone()
-            if row is None:
+            item = session.scalar(
+                select(TaskQueueItem)
+                .where(TaskQueueItem.status == "queued")
+                .order_by(TaskQueueItem.created_at.asc())
+                .limit(1)
+                .with_for_update(skip_locked=True)
+            )
+            if item is None:
+                session.rollback()
                 return None
 
-            task = dict(row)
-            connection.execute(
-                """
-                UPDATE task_queue
-                SET status = 'running', started_at = ?, updated_at = ?
-                WHERE id = ? AND status = 'queued'
-                """,
-                (now, now, task["id"]),
-            )
-            connection.commit()
+            task = {
+                "id": item.id,
+                "task_type": item.task_type,
+                "status": item.status,
+                "payload_json": item.payload_json,
+                "max_retries": item.max_retries,
+                "retry_count": item.retry_count,
+                "error_message": item.error_message,
+                "started_at": item.started_at,
+                "finished_at": item.finished_at,
+                "created_at": item.created_at,
+                "updated_at": item.updated_at,
+            }
+            item.status = "running"
+            item.started_at = now
+            item.updated_at = now
+            session.commit()
             if task.get("payload_json"):
                 task["payload"] = json.loads(task["payload_json"])
             return task
+        except Exception:
+            session.rollback()
+            raise
         finally:
-            connection.close()
+            session.close()
 
     async def _execute_task(self, task: dict[str, Any]) -> None:
         """Execute a single task."""
@@ -234,50 +265,52 @@ class TaskQueue:
                 logger.error("Task %s permanently failed: %s", task_id, error_msg)
 
     def _mark_succeeded(self, task_id: str) -> None:
-        now = utcnow_iso()
-        connection = create_connection()
+        now = utcnow_ms()
+        session = _get_session()
         try:
-            connection.execute(
-                """
-                UPDATE task_queue
-                SET status = 'succeeded', finished_at = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (now, now, task_id),
-            )
-            connection.commit()
+            item = session.get(TaskQueueItem, task_id)
+            if item is not None:
+                item.status = "succeeded"
+                item.finished_at = now
+                item.updated_at = now
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
         finally:
-            connection.close()
+            session.close()
 
     def _mark_failed(self, task_id: str, error_message: str) -> None:
-        now = utcnow_iso()
-        connection = create_connection()
+        now = utcnow_ms()
+        session = _get_session()
         try:
-            connection.execute(
-                """
-                UPDATE task_queue
-                SET status = 'failed', error_message = ?, finished_at = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (error_message, now, now, task_id),
-            )
-            connection.commit()
+            item = session.get(TaskQueueItem, task_id)
+            if item is not None:
+                item.status = "failed"
+                item.error_message = error_message
+                item.finished_at = now
+                item.updated_at = now
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
         finally:
-            connection.close()
+            session.close()
 
     def _mark_retry(self, task_id: str, retry_count: int, error_message: str) -> None:
-        now = utcnow_iso()
-        connection = create_connection()
+        now = utcnow_ms()
+        session = _get_session()
         try:
-            connection.execute(
-                """
-                UPDATE task_queue
-                SET status = 'queued', retry_count = ?, error_message = ?,
-                    started_at = NULL, updated_at = ?
-                WHERE id = ?
-                """,
-                (retry_count, error_message, now, task_id),
-            )
-            connection.commit()
+            item = session.get(TaskQueueItem, task_id)
+            if item is not None:
+                item.status = "queued"
+                item.retry_count = retry_count
+                item.error_message = error_message
+                item.started_at = None
+                item.updated_at = now
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
         finally:
-            connection.close()
+            session.close()

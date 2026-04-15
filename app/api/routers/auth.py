@@ -1,10 +1,9 @@
-import sqlite3
 import uuid
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile
-from pydantic import BaseModel, Field, StringConstraints
+from sqlalchemy.orm import Session
 
 from app.auth.dependencies import (
     clear_auth_cookies,
@@ -17,11 +16,9 @@ from app.auth.security import decode_jwt_token
 from app.auth.service import (
     assign_menus_to_role,
     assert_login_allowed,
-
     assign_roles_to_user,
     authenticate_user,
     change_password,
-
     create_role,
     create_user,
     delete_role,
@@ -29,7 +26,6 @@ from app.auth.service import (
     get_session_by_id,
     get_role_menus,
     list_user_navigation,
-
     list_roles,
     list_users,
     refresh_user_token,
@@ -41,82 +37,23 @@ from app.auth.service import (
 )
 from app.core.config import settings
 from app.core.http import ResponseModel, build_response
-from app.db import get_db
+from app.db import get_db_session
+from app.schemas.auth import (
+    AdminCreateUserRequest,
+    ChangePasswordRequest,
+    LoginRequest,
+    ProfileUpdateRequest,
+    RefreshTokenRequest,
+    RegisterRequest,
+    RoleCreateRequest,
+    RoleMenuAssignmentRequest,
+    RoleUpdateRequest,
+    UserRoleAssignmentRequest,
+    UserUpdateRequest,
+)
 from app.services import captcha_service
 
 router = APIRouter()
-
-NonEmptyString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
-OptionalString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
-
-
-class RegisterRequest(BaseModel):
-    username: NonEmptyString = Field(..., description="登录用户名。")
-    email: NonEmptyString = Field(..., description="用户邮箱。")
-    password: NonEmptyString = Field(..., description="登录密码。")
-    display_name: str | None = Field(None, description="显示名称。")
-    remember: bool = Field(False, description="是否持久化登录。")
-
-
-class LoginRequest(BaseModel):
-    login: NonEmptyString = Field(..., description="用户名或邮箱。")
-    password: NonEmptyString = Field(..., description="登录密码。")
-    captcha_id: NonEmptyString = Field(..., description="验证码 ID。")
-    captcha_code: NonEmptyString = Field(..., description="验证码内容。")
-    remember: bool = Field(False, description="是否持久化登录。")
-
-
-class RefreshTokenRequest(BaseModel):
-    refresh_token: NonEmptyString = Field(..., description="刷新令牌。")
-
-
-class ChangePasswordRequest(BaseModel):
-    current_password: NonEmptyString = Field(..., description="当前密码。")
-    new_password: NonEmptyString = Field(..., description="新密码。")
-
-
-
-class RoleCreateRequest(BaseModel):
-    code: NonEmptyString = Field(..., description="角色编码。")
-    name: NonEmptyString = Field(..., description="角色名称。")
-    description: str | None = Field(None, description="角色备注。")
-
-
-
-class RoleUpdateRequest(BaseModel):
-    name: OptionalString | None = Field(None, description="角色名称。")
-    description: str | None = Field(None, description="角色备注。")
-
-
-
-class RoleMenuAssignmentRequest(BaseModel):
-    menu_ids: list[str] = Field(default_factory=list, description="菜单 ID 列表。")
-
-
-class AdminCreateUserRequest(BaseModel):
-    username: NonEmptyString = Field(..., description="用户名。")
-    email: NonEmptyString = Field(..., description="邮箱。")
-    password: NonEmptyString = Field(..., description="密码。")
-    display_name: str | None = Field(None, description="显示名称。")
-    role_codes: list[str] = Field(default_factory=lambda: ["user"], description="角色编码列表。")
-    is_active: bool = Field(True, description="是否启用。")
-    is_superuser: bool = Field(False, description="是否超级管理员。")
-
-
-class UserUpdateRequest(BaseModel):
-    email: OptionalString | None = Field(None, description="新邮箱。")
-    display_name: OptionalString | None = Field(None, description="新显示名称。")
-    is_active: bool | None = Field(None, description="是否启用。")
-    is_superuser: bool | None = Field(None, description="是否超级管理员。")
-
-
-class UserRoleAssignmentRequest(BaseModel):
-    role_codes: list[str] = Field(default_factory=list, description="角色编码列表。")
-
-
-class ProfileUpdateRequest(BaseModel):
-    display_name: OptionalString | None = Field(None, description="新显示名称。")
-    email: OptionalString | None = Field(None, description="新邮箱。")
 
 
 def _cookie_kwargs(*, max_age: int | None, httponly: bool) -> dict[str, object]:
@@ -197,7 +134,7 @@ def _validate_cookie_token_csrf(
     *,
     token: str,
     expected_type: str,
-    connection: sqlite3.Connection,
+    session: Session,
 ) -> None:
     try:
         claims = decode_jwt_token(
@@ -213,13 +150,13 @@ def _validate_cookie_token_csrf(
     if not session_id:
         raise HTTPException(status_code=401, detail="令牌缺少会话标识。")
 
-    session = get_session_by_id(connection, session_id)
-    if session is None or session["revoked_at"] is not None:
+    auth_session = get_session_by_id(session, session_id)
+    if auth_session is None or auth_session["revoked_at"] is not None:
         raise HTTPException(status_code=401, detail="当前会话已失效。")
 
     validate_csrf_request(
         request,
-        expected_token=session["csrf_token"],
+        expected_token=auth_session["csrf_token"],
         enforce_cookie_presence=True,
     )
 
@@ -233,13 +170,13 @@ def register(
     request: Request,
     response: Response,
     payload: RegisterRequest,
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+    session: Annotated[Session, Depends(get_db_session)],
 ) -> ResponseModel:
     if not settings.auth_allow_public_register:
         raise HTTPException(status_code=403, detail="当前环境已关闭公开注册。")
 
     result = register_user(
-        connection,
+        session,
         username=payload.username,
         email=payload.email,
         password=payload.password,
@@ -261,19 +198,19 @@ def login(
     request: Request,
     response: Response,
     payload: LoginRequest,
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+    session: Annotated[Session, Depends(get_db_session)],
 ) -> ResponseModel:
     client_ip = _client_ip(request)
-    assert_login_allowed(connection, login=payload.login, client_ip=client_ip)
+    assert_login_allowed(session, login=payload.login, client_ip=client_ip)
 
     if settings.auth_require_captcha_for_login:
         verified = captcha_service.verify_captcha(payload.captcha_id, payload.captcha_code)
         if not verified:
-            register_login_failure(connection, login=payload.login, client_ip=client_ip)
+            register_login_failure(session, login=payload.login, client_ip=client_ip)
             raise HTTPException(status_code=400, detail="验证码错误或已过期。")
 
     result = authenticate_user(
-        connection,
+        session,
         login=payload.login,
         password=payload.password,
         remember=payload.remember,
@@ -292,7 +229,7 @@ def login(
 def refresh_token(
     request: Request,
     response: Response,
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+    session: Annotated[Session, Depends(get_db_session)],
     payload: RefreshTokenRequest | None = None,
 ) -> ResponseModel:
     refresh_token_value, source = _resolve_refresh_token(request, payload)
@@ -303,11 +240,11 @@ def refresh_token(
             request,
             token=refresh_token_value,
             expected_type="refresh",
-            connection=connection,
+            session=session,
         )
 
     result = refresh_user_token(
-        connection,
+        session,
         refresh_token=refresh_token_value,
     )
     _set_auth_cookies(response, result)
@@ -322,7 +259,7 @@ def refresh_token(
 def logout(
     request: Request,
     response: Response,
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+    session: Annotated[Session, Depends(get_db_session)],
     payload: RefreshTokenRequest | None = None,
 ) -> ResponseModel:
     refresh_token_value, source = _resolve_refresh_token(request, payload)
@@ -333,19 +270,19 @@ def logout(
             request,
             token=refresh_token_value,
             expected_type="refresh",
-            connection=connection,
+            session=session,
         )
     elif access_cookie_token:
         _validate_cookie_token_csrf(
             request,
             token=access_cookie_token,
             expected_type="access",
-            connection=connection,
+            session=session,
         )
 
     try:
         result = revoke_refresh_token(
-            connection,
+            session,
             refresh_token=refresh_token_value,
             access_token=access_cookie_token if refresh_token_value is None else None,
         )
@@ -367,16 +304,16 @@ def me(
     response: Response,
     current_user: Annotated[dict, Depends(get_current_user)],
 ) -> ResponseModel:
-    session = getattr(request.state, "auth_session", None)
-    if session is not None:
+    auth_session = getattr(request.state, "auth_session", None)
+    if auth_session is not None:
         csrf_max_age = (
             settings.auth_refresh_token_expire_days * 24 * 60 * 60
-            if session.get("remember")
+            if auth_session.get("remember")
             else None
         )
         response.set_cookie(
             settings.auth_cookie_csrf_name,
-            session["csrf_token"],
+            auth_session["csrf_token"],
             **_cookie_kwargs(max_age=csrf_max_age, httponly=False),
         )
     return build_response(request, data=current_user)
@@ -390,14 +327,12 @@ def me(
 def me_navigation(
     request: Request,
     current_user: Annotated[dict, Depends(get_current_user)],
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+    session: Annotated[Session, Depends(get_db_session)],
 ) -> ResponseModel:
-
     data = list_user_navigation(
-        connection,
+        session,
         user_id=current_user["id"],
         is_superuser=bool(current_user.get("is_superuser")),
-
     )
     return build_response(request, data=data)
 
@@ -417,7 +352,7 @@ async def upload_avatar(
     file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user),
     _: Annotated[None, Depends(require_csrf_protection)] = None,
-    connection: sqlite3.Connection = Depends(get_db),
+    session: Session = Depends(get_db_session),
 ) -> ResponseModel:
     content_type = file.content_type or "application/octet-stream"
     if content_type not in ALLOWED_AVATAR_TYPES:
@@ -439,12 +374,10 @@ async def upload_avatar(
     file_path = UPLOADS_DIR / filename
     file_path.write_bytes(data)
 
-    # Store relative URL path — works across dev/prod
     avatar_url = f"/uploads/avatars/{filename}"
 
-    from app.auth.service import update_user
     update_user(
-        connection,
+        session,
         current_user["id"],
         avatar_url=avatar_url,
     )
@@ -462,16 +395,16 @@ def update_profile(
     payload: ProfileUpdateRequest,
     current_user: Annotated[dict, Depends(get_current_user)],
     _: Annotated[None, Depends(require_csrf_protection)],
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+    session: Annotated[Session, Depends(get_db_session)],
 ) -> ResponseModel:
-    from app.auth.service import update_user, build_user_profile
     update_user(
-        connection,
+        session,
         current_user["id"],
         email=payload.email,
         display_name=payload.display_name,
     )
-    profile = build_user_profile(connection, current_user["id"])
+    from app.auth.service import build_user_profile
+    profile = build_user_profile(session, current_user["id"])
     return build_response(request, data=profile)
 
 
@@ -486,10 +419,10 @@ def update_password(
     payload: ChangePasswordRequest,
     current_user: Annotated[dict, Depends(get_current_user)],
     _: Annotated[None, Depends(require_csrf_protection)],
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+    session: Annotated[Session, Depends(get_db_session)],
 ) -> ResponseModel:
     result = change_password(
-        connection,
+        session,
         user_id=current_user["id"],
         current_password=payload.current_password,
         new_password=payload.new_password,
@@ -505,10 +438,10 @@ def update_password(
 )
 def users(
     request: Request,
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+    session: Annotated[Session, Depends(get_db_session)],
     _: Annotated[dict, Depends(require_admin_access)],
 ) -> ResponseModel:
-    return build_response(request, data=list_users(connection))
+    return build_response(request, data=list_users(session))
 
 
 @router.post(
@@ -519,12 +452,12 @@ def users(
 def admin_create_user(
     request: Request,
     payload: AdminCreateUserRequest,
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+    session: Annotated[Session, Depends(get_db_session)],
     _: Annotated[dict, Depends(require_admin_access)],
     __: Annotated[None, Depends(require_csrf_protection)],
 ) -> ResponseModel:
     result = create_user(
-        connection,
+        session,
         username=payload.username,
         email=payload.email,
         password=payload.password,
@@ -545,12 +478,12 @@ def admin_update_user(
     request: Request,
     user_id: str,
     payload: UserUpdateRequest,
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+    session: Annotated[Session, Depends(get_db_session)],
     _: Annotated[dict, Depends(require_admin_access)],
     __: Annotated[None, Depends(require_csrf_protection)],
 ) -> ResponseModel:
     result = update_user(
-        connection,
+        session,
         user_id,
         email=payload.email,
         display_name=payload.display_name,
@@ -569,11 +502,11 @@ def admin_delete_user(
     request: Request,
     user_id: str,
     current_user: Annotated[dict, Depends(require_admin_access)],
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+    session: Annotated[Session, Depends(get_db_session)],
     __: Annotated[None, Depends(require_csrf_protection)],
 ) -> ResponseModel:
     result = delete_user(
-        connection,
+        session,
         user_id,
         actor_user_id=current_user["id"],
     )
@@ -589,11 +522,11 @@ def user_roles(
     request: Request,
     user_id: str,
     payload: UserRoleAssignmentRequest,
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+    session: Annotated[Session, Depends(get_db_session)],
     _: Annotated[dict, Depends(require_admin_access)],
     __: Annotated[None, Depends(require_csrf_protection)],
 ) -> ResponseModel:
-    result = assign_roles_to_user(connection, user_id, payload.role_codes)
+    result = assign_roles_to_user(session, user_id, payload.role_codes)
     return build_response(request, data=result)
 
 
@@ -604,10 +537,10 @@ def user_roles(
 )
 def roles(
     request: Request,
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+    session: Annotated[Session, Depends(get_db_session)],
     _: Annotated[dict, Depends(require_admin_access)],
 ) -> ResponseModel:
-    return build_response(request, data=list_roles(connection))
+    return build_response(request, data=list_roles(session))
 
 
 @router.post(
@@ -618,16 +551,15 @@ def roles(
 def create_role_endpoint(
     request: Request,
     payload: RoleCreateRequest,
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+    session: Annotated[Session, Depends(get_db_session)],
     _: Annotated[dict, Depends(require_admin_access)],
     __: Annotated[None, Depends(require_csrf_protection)],
 ) -> ResponseModel:
     result = create_role(
-        connection,
+        session,
         code=payload.code,
         name=payload.name,
         description=payload.description,
-
     )
     return build_response(request, data=result)
 
@@ -641,12 +573,12 @@ def update_role_endpoint(
     request: Request,
     role_id: str,
     payload: RoleUpdateRequest,
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+    session: Annotated[Session, Depends(get_db_session)],
     _: Annotated[dict, Depends(require_admin_access)],
     __: Annotated[None, Depends(require_csrf_protection)],
 ) -> ResponseModel:
     result = update_role(
-        connection,
+        session,
         role_id,
         name=payload.name,
         description=payload.description,
@@ -662,11 +594,11 @@ def update_role_endpoint(
 def delete_role_endpoint(
     request: Request,
     role_id: str,
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+    session: Annotated[Session, Depends(get_db_session)],
     _: Annotated[dict, Depends(require_admin_access)],
     __: Annotated[None, Depends(require_csrf_protection)],
 ) -> ResponseModel:
-    result = delete_role(connection, role_id)
+    result = delete_role(session, role_id)
     return build_response(request, data=result)
 
 
@@ -678,10 +610,10 @@ def delete_role_endpoint(
 def role_menus(
     request: Request,
     role_id: str,
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+    session: Annotated[Session, Depends(get_db_session)],
     _: Annotated[dict, Depends(require_admin_access)],
 ) -> ResponseModel:
-    return build_response(request, data=get_role_menus(connection, role_id))
+    return build_response(request, data=get_role_menus(session, role_id))
 
 
 @router.put(
@@ -693,12 +625,12 @@ def assign_role_menus(
     request: Request,
     role_id: str,
     payload: RoleMenuAssignmentRequest,
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+    session: Annotated[Session, Depends(get_db_session)],
     _: Annotated[dict, Depends(require_admin_access)],
     __: Annotated[None, Depends(require_csrf_protection)],
 ) -> ResponseModel:
     result = assign_menus_to_role(
-        connection,
+        session,
         role_id,
         payload.menu_ids,
     )

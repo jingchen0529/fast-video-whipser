@@ -7,46 +7,14 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.router import api_router
-from app.auth.dependencies import clear_auth_cookies
 from app.core.config import settings, validate_runtime_settings
 from app.core.http import register_exception_handlers
 from app.core.logging import configure_logging
 from app.db import initialize_database
+from app.middleware import AuthCookieCleanupMiddleware
 
 logger = configure_logging("fast_video_whisper")
 RESERVED_FRONTEND_PATHS = ("api", "docs", "redoc", "openapi.json", "uploads")
-AUTH_FAILURE_COOKIE_CLEANUP = {
-    "/api/auth/me": {
-        "clear_access": True,
-        "clear_refresh": False,
-        "clear_csrf": False,
-    },
-    "/auth/me": {
-        "clear_access": True,
-        "clear_refresh": False,
-        "clear_csrf": False,
-    },
-    "/api/auth/refresh": {
-        "clear_access": True,
-        "clear_refresh": True,
-        "clear_csrf": True,
-    },
-    "/auth/refresh": {
-        "clear_access": True,
-        "clear_refresh": True,
-        "clear_csrf": True,
-    },
-    "/api/auth/logout": {
-        "clear_access": True,
-        "clear_refresh": True,
-        "clear_csrf": True,
-    },
-    "/auth/logout": {
-        "clear_access": True,
-        "clear_refresh": True,
-        "clear_csrf": True,
-    },
-}
 
 
 async def _workflow_executor(*, project_id: int) -> None:
@@ -61,6 +29,7 @@ async def _motion_extraction_executor(
     job_id: str,
     project_id: int,
     owner_user_id: str | None = None,
+    extraction_hint: str | None = None,
 ) -> None:
     from app.services.motion_service import MotionService
 
@@ -69,6 +38,7 @@ async def _motion_extraction_executor(
         job_id=job_id,
         project_id=project_id,
         owner_user_id=owner_user_id,
+        extraction_hint=extraction_hint,
     )
 
 
@@ -198,26 +168,7 @@ def create_app(
         lifespan=lifespan,
     )
 
-    @app.middleware("http")
-    async def cleanup_failed_auth_cookies(request, call_next):
-        response = await call_next(request)
-        cleanup_rule = AUTH_FAILURE_COOKIE_CLEANUP.get(request.url.path)
-        if cleanup_rule is None or response.status_code != 401:
-            return response
-
-        if not any(
-            cookie_name in request.cookies
-            for cookie_name in (
-                settings.auth_cookie_access_name,
-                settings.auth_cookie_refresh_name,
-                settings.auth_cookie_csrf_name,
-            )
-        ):
-            return response
-
-        clear_auth_cookies(response, **cleanup_rule)
-        return response
-
+    app.add_middleware(AuthCookieCleanupMiddleware)
     register_exception_handlers(app)
     app.include_router(api_router, prefix="/api")
     app.include_router(api_router, include_in_schema=False)

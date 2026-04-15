@@ -3,53 +3,119 @@ import uuid
 from collections.abc import Iterable
 
 from fastapi import HTTPException
+from sqlalchemy import func, select, delete as sa_delete
+from sqlalchemy.orm import Session
 
-from app.auth.security import utcnow_iso
-from app.db.sqlite import create_connection
+from app.auth.security import utcnow_ms
+from app.db.session import get_db_session
+from app.models.asset import MediaAsset, MotionAsset
+
+
+MAX_MOTION_ASSET_LIST_LIMIT = 1000
+
+
+def _get_session() -> Session:
+    """获取一个独立的数据库 Session（用于非 FastAPI 依赖注入场景）。"""
+    gen = get_db_session()
+    return next(gen)
 
 
 class AssetService:
+
     @staticmethod
-    def _extract_related_asset_from_row(row, prefix: str) -> dict | None:
-        asset_id = row[f"{prefix}_id"] if f"{prefix}_id" in row.keys() else None
-        if not asset_id:
-            return None
-        metadata_raw = row[f"{prefix}_metadata_json"] if f"{prefix}_metadata_json" in row.keys() else None
-        metadata = json.loads(metadata_raw) if metadata_raw else {}
+    def _asset_to_dict(asset: MediaAsset) -> dict:
+        metadata_json = asset.metadata_json
+        if isinstance(metadata_json, str):
+            try:
+                metadata_json = json.loads(metadata_json)
+            except (json.JSONDecodeError, TypeError):
+                metadata_json = {}
         return {
-            "id": asset_id,
-            "asset_type": row[f"{prefix}_asset_type"] if f"{prefix}_asset_type" in row.keys() else None,
-            "source_type": row[f"{prefix}_source_type"] if f"{prefix}_source_type" in row.keys() else None,
-            "file_name": row[f"{prefix}_file_name"] if f"{prefix}_file_name" in row.keys() else None,
-            "thumbnail_path": row[f"{prefix}_thumbnail_path"] if f"{prefix}_thumbnail_path" in row.keys() else None,
-            "metadata_json": metadata,
+            "id": asset.id,
+            "owner_user_id": asset.owner_user_id,
+            "asset_type": asset.asset_type,
+            "source_type": asset.source_type,
+            "file_name": asset.file_name,
+            "file_path": asset.file_path,
+            "mime_type": asset.mime_type,
+            "duration_ms": asset.duration_ms,
+            "width": asset.width,
+            "height": asset.height,
+            "size_bytes": asset.size_bytes,
+            "sha256": asset.sha256,
+            "thumbnail_path": asset.thumbnail_path,
+            "metadata_json": metadata_json or {},
+            "created_at": asset.created_at,
+            "updated_at": asset.updated_at,
         }
 
     @staticmethod
-    def _row_to_asset(row) -> dict:
-        asset = dict(row)
-        if asset.get("metadata_json"):
-            asset["metadata_json"] = json.loads(asset["metadata_json"])
-        return asset
+    def _motion_to_dict(motion: MotionAsset) -> dict:
+        metadata_json = motion.metadata_json
+        if isinstance(metadata_json, str):
+            try:
+                metadata_json = json.loads(metadata_json)
+            except (json.JSONDecodeError, TypeError):
+                metadata_json = {}
+        thumbnail_asset_id = None
+        thumbnail_path = None
+        if isinstance(metadata_json, dict):
+            thumbnail_asset_id = metadata_json.get("thumbnail_asset_id")
+            thumbnail_path = metadata_json.get("thumbnail_path")
 
-    @staticmethod
-    def _row_to_motion_asset(row) -> dict:
-        item = dict(row)
-        if item.get("metadata_json"):
-            item["metadata_json"] = json.loads(item["metadata_json"])
-        item["source_video_asset"] = AssetService._extract_related_asset_from_row(
-            row,
-            "source_video_related",
-        )
-        item["clip_asset"] = AssetService._extract_related_asset_from_row(
-            row,
-            "clip_related",
-        )
-        for key in list(item.keys()):
-            if key.startswith("source_video_related_") or key.startswith("clip_related_"):
-                item.pop(key, None)
-        item.pop("owner_user_id", None)
-        return item
+        source_video_asset = None
+        if motion.source_video_asset:
+            sv = motion.source_video_asset
+            source_video_asset = {
+                "id": sv.id,
+                "asset_type": sv.asset_type,
+                "source_type": sv.source_type,
+                "file_name": sv.file_name,
+                "thumbnail_path": sv.thumbnail_path,
+                "metadata_json": json.loads(sv.metadata_json) if sv.metadata_json else {},
+            }
+
+        clip_asset = None
+        if motion.clip_asset:
+            ca = motion.clip_asset
+            clip_asset = {
+                "id": ca.id,
+                "asset_type": ca.asset_type,
+                "source_type": ca.source_type,
+                "file_name": ca.file_name,
+                "thumbnail_path": ca.thumbnail_path,
+                "metadata_json": json.loads(ca.metadata_json) if ca.metadata_json else {},
+            }
+
+        return {
+            "id": motion.id,
+            "project_id": motion.project_id,
+            "source_video_asset_id": motion.source_video_asset_id,
+            "clip_asset_id": motion.clip_asset_id,
+            "job_id": motion.job_id,
+            "start_ms": motion.start_ms,
+            "end_ms": motion.end_ms,
+            "thumbnail_asset_id": thumbnail_asset_id,
+            "thumbnail_path": thumbnail_path,
+            "action_summary": motion.action_summary,
+            "action_label": motion.action_label,
+            "entrance_style": motion.entrance_style,
+            "emotion_label": motion.emotion_label,
+            "temperament_label": motion.temperament_label,
+            "scene_label": motion.scene_label,
+            "camera_motion": motion.camera_motion,
+            "camera_shot": motion.camera_shot,
+            "confidence": motion.confidence,
+            "asset_candidate": motion.asset_candidate,
+            "review_status": motion.review_status,
+            "copyright_risk_level": motion.copyright_risk_level,
+            "origin": motion.origin,
+            "metadata_json": metadata_json or {},
+            "source_video_asset": source_video_asset,
+            "clip_asset": clip_asset,
+            "created_at": motion.created_at,
+            "updated_at": motion.updated_at,
+        }
 
     def create_asset(
         self,
@@ -67,79 +133,49 @@ class AssetService:
         thumbnail_path: str | None = None,
         metadata: dict | None = None,
     ) -> dict:
-        now = utcnow_iso()
+        now = utcnow_ms()
         asset_id = uuid.uuid4().hex
 
-        connection = create_connection()
+        session = _get_session()
         try:
-            connection.execute(
-                """
-                INSERT INTO media_assets (
-                    id, owner_user_id, asset_type, source_type,
-                    file_name, file_path, mime_type, duration_ms,
-                    width, height, size_bytes, thumbnail_path,
-                    metadata_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    asset_id,
-                    owner_user_id,
-                    asset_type,
-                    source_type,
-                    file_name,
-                    file_path,
-                    mime_type,
-                    duration_ms,
-                    width,
-                    height,
-                    size_bytes,
-                    thumbnail_path,
-                    json.dumps(metadata or {}, ensure_ascii=False),
-                    now,
-                    now,
-                ),
+            asset = MediaAsset(
+                id=asset_id,
+                owner_user_id=owner_user_id,
+                asset_type=asset_type,
+                source_type=source_type,
+                file_name=file_name,
+                file_path=file_path,
+                mime_type=mime_type,
+                duration_ms=duration_ms,
+                width=width,
+                height=height,
+                size_bytes=size_bytes,
+                thumbnail_path=thumbnail_path,
+                metadata_json=json.dumps(metadata or {}, ensure_ascii=False),
+                created_at=now,
+                updated_at=now,
             )
-            connection.commit()
+            session.add(asset)
+            session.commit()
+            return self._asset_to_dict(asset)
+        except Exception:
+            session.rollback()
+            raise
         finally:
-            connection.close()
-
-        return {
-            "id": asset_id,
-            "asset_type": asset_type,
-            "source_type": source_type,
-            "file_name": file_name,
-            "file_path": file_path,
-            "mime_type": mime_type,
-            "size_bytes": size_bytes,
-            "duration_ms": duration_ms,
-            "width": width,
-            "height": height,
-            "thumbnail_path": thumbnail_path,
-            "created_at": now,
-            "updated_at": now,
-        }
+            session.close()
 
     def get_asset(self, *, asset_id: str, owner_user_id: str | None = None) -> dict | None:
-        clauses = ["id = ?"]
-        params: list[object] = [asset_id]
-        if owner_user_id is not None:
-            clauses.append("(owner_user_id = ? OR owner_user_id IS NULL)")
-            params.append(owner_user_id)
-        where = " AND ".join(clauses)
-
-        connection = create_connection()
+        session = _get_session()
         try:
-            row = connection.execute(
-                f"""
-                SELECT *
-                FROM media_assets
-                WHERE {where}
-                """,
-                params,
-            ).fetchone()
-            return self._row_to_asset(row) if row is not None else None
+            q = select(MediaAsset).where(MediaAsset.id == asset_id)
+            if owner_user_id is not None:
+                q = q.where(
+                    (MediaAsset.owner_user_id == owner_user_id) | (MediaAsset.owner_user_id.is_(None))
+                )
+            asset = session.scalar(q)
+            return self._asset_to_dict(asset) if asset else None
         finally:
-            connection.close()
+            session.close()
 
     def list_media_assets(
         self,
@@ -152,75 +188,61 @@ class AssetService:
         page: int = 1,
         page_size: int = 40,
     ) -> dict:
-        clauses = ["1 = 1"]
-        params: list[object] = []
-
-        if asset_type:
-            clauses.append("asset_type = ?")
-            params.append(asset_type.strip())
-        if source_type:
-            clauses.append("source_type = ?")
-            params.append(source_type.strip())
-        if owner_user_id:
-            clauses.append("(owner_user_id = ? OR owner_user_id IS NULL)")
-            params.append(owner_user_id.strip())
-        if keyword:
-            clauses.append("file_name LIKE ?")
-            params.append(f"%{keyword.strip()}%")
-
-        order = "created_at DESC" if sort == "newest" else "created_at ASC"
-        where = " AND ".join(clauses)
-
-        connection = create_connection()
+        session = _get_session()
         try:
-            total = connection.execute(
-                f"SELECT COUNT(*) AS cnt FROM media_assets WHERE {where}",
-                params,
-            ).fetchone()["cnt"]
+            q = select(MediaAsset)
+            if asset_type:
+                q = q.where(MediaAsset.asset_type == asset_type.strip())
+            if source_type:
+                q = q.where(MediaAsset.source_type == source_type.strip())
+            if owner_user_id:
+                q = q.where(
+                    (MediaAsset.owner_user_id == owner_user_id.strip())
+                    | (MediaAsset.owner_user_id.is_(None))
+                )
+            if keyword:
+                q = q.where(MediaAsset.file_name.like(f"%{keyword.strip()}%"))
+
+            total = session.scalar(
+                select(func.count()).select_from(q.subquery())
+            ) or 0
+
+            if sort == "newest":
+                q = q.order_by(MediaAsset.created_at.desc())
+            else:
+                q = q.order_by(MediaAsset.created_at.asc())
 
             safe_page = max(1, page)
             safe_size = max(1, min(page_size, 100))
             offset = (safe_page - 1) * safe_size
+            q = q.limit(safe_size).offset(offset)
 
-            rows = connection.execute(
-                f"""
-                SELECT *
-                FROM media_assets
-                WHERE {where}
-                ORDER BY {order}
-                LIMIT ? OFFSET ?
-                """,
-                [*params, safe_size, offset],
-            ).fetchall()
+            rows = session.scalars(q).all()
             return {
-                "items": [self._row_to_asset(row) for row in rows],
+                "items": [self._asset_to_dict(r) for r in rows],
                 "total": total,
                 "page": safe_page,
                 "page_size": safe_size,
             }
         finally:
-            connection.close()
+            session.close()
 
     def get_storage_usage(self, *, owner_user_id: str | None = None) -> dict:
-        clauses = ["1 = 1"]
-        params: list[object] = []
-        if owner_user_id:
-            clauses.append("(owner_user_id = ? OR owner_user_id IS NULL)")
-            params.append(owner_user_id.strip())
-        where = " AND ".join(clauses)
-
-        connection = create_connection()
+        session = _get_session()
         try:
-            row = connection.execute(
-                f"SELECT COALESCE(SUM(size_bytes), 0) AS used FROM media_assets WHERE {where}",
-                params,
-            ).fetchone()
+            q = select(func.coalesce(func.sum(MediaAsset.size_bytes), 0))
+            if owner_user_id:
+                q = q.where(
+                    (MediaAsset.owner_user_id == owner_user_id.strip())
+                    | (MediaAsset.owner_user_id.is_(None))
+                )
+            used = session.scalar(q) or 0
             return {
-                "used_bytes": row["used"] if row is not None else 0,
+                "used_bytes": used,
                 "total_bytes": 1 * 1024 * 1024 * 1024,
             }
         finally:
-            connection.close()
+            session.close()
 
     def list_accessible_assets(
         self,
@@ -228,35 +250,23 @@ class AssetService:
         asset_ids: Iterable[str],
         owner_user_id: str | None = None,
     ) -> list[dict]:
-        normalized_ids = [asset_id.strip() for asset_id in asset_ids if asset_id and asset_id.strip()]
+        normalized_ids = [aid.strip() for aid in asset_ids if aid and aid.strip()]
         if not normalized_ids:
             return []
 
-        placeholders = ", ".join("?" for _ in normalized_ids)
-        query = f"""
-            SELECT *
-            FROM media_assets
-            WHERE id IN ({placeholders})
-        """
-        params: list[str] = list(normalized_ids)
-        if owner_user_id is not None:
-            query += " AND (owner_user_id = ? OR owner_user_id IS NULL)"
-            params.append(owner_user_id)
-
-        connection = create_connection()
+        session = _get_session()
         try:
-            rows = connection.execute(query, params).fetchall()
-            asset_map = {
-                row["id"]: self._row_to_asset(row)
-                for row in rows
-            }
-            return [
-                asset_map[asset_id]
-                for asset_id in normalized_ids
-                if asset_id in asset_map
-            ]
+            q = select(MediaAsset).where(MediaAsset.id.in_(normalized_ids))
+            if owner_user_id is not None:
+                q = q.where(
+                    (MediaAsset.owner_user_id == owner_user_id)
+                    | (MediaAsset.owner_user_id.is_(None))
+                )
+            rows = session.scalars(q).all()
+            asset_map = {r.id: self._asset_to_dict(r) for r in rows}
+            return [asset_map[aid] for aid in normalized_ids if aid in asset_map]
         finally:
-            connection.close()
+            session.close()
 
     def ensure_accessible_assets(
         self,
@@ -264,29 +274,25 @@ class AssetService:
         asset_ids: Iterable[str],
         owner_user_id: str | None = None,
     ) -> list[dict]:
-        normalized_ids = [asset_id.strip() for asset_id in asset_ids if asset_id and asset_id.strip()]
+        normalized_ids = [aid.strip() for aid in asset_ids if aid and aid.strip()]
         assets = self.list_accessible_assets(
             asset_ids=normalized_ids,
             owner_user_id=owner_user_id,
         )
-        asset_map = {asset["id"]: asset for asset in assets}
-        missing_asset_ids = [
-            asset_id
-            for asset_id in normalized_ids
-            if asset_id not in asset_map
-        ]
-        if missing_asset_ids:
+        asset_map = {a["id"]: a for a in assets}
+        missing = [aid for aid in normalized_ids if aid not in asset_map]
+        if missing:
             raise HTTPException(
                 status_code=404,
-                detail=f"以下资产不存在或无权访问: {', '.join(missing_asset_ids)}",
+                detail=f"以下资产不存在或无权访问: {', '.join(missing)}",
             )
-        return [asset_map[asset_id] for asset_id in normalized_ids]
+        return [asset_map[aid] for aid in normalized_ids]
 
     def create_motion_assets_from_analysis(
         self,
         *,
         source_video_asset_id: str | None,
-        conversation_id: str | None,
+        project_id: int | None = None,
         job_id: str | None,
         clips: list[dict],
         owner_user_id: str | None = None,
@@ -295,8 +301,8 @@ class AssetService:
         if not clips:
             return []
 
-        now = utcnow_iso()
-        connection = create_connection()
+        now = utcnow_ms()
+        session = _get_session()
         try:
             items: list[dict] = []
             for clip in clips:
@@ -308,71 +314,71 @@ class AssetService:
                 }
                 if isinstance(clip.get("metadata_json"), dict):
                     metadata.update(clip["metadata_json"])
-                connection.execute(
-                    """
-                    INSERT INTO motion_assets (
-                        id, source_video_asset_id, clip_asset_id, conversation_id, job_id,
-                        owner_user_id, start_ms, end_ms, action_summary, action_label,
-                        entrance_style, emotion_label, temperament_label, scene_label,
-                        camera_motion, camera_shot, origin, review_status, copyright_risk_level,
-                        metadata_json, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        motion_asset_id,
-                        source_video_asset_id,
-                        clip.get("clip_asset_id"),
-                        conversation_id,
-                        job_id,
-                        owner_user_id,
-                        clip["start_ms"],
-                        clip["end_ms"],
-                        clip["action_summary"],
-                        clip.get("action_label"),
-                        clip.get("entrance_style"),
-                        clip.get("emotion_label"),
-                        clip.get("temperament_label"),
-                        clip.get("scene_label"),
-                        clip.get("camera_motion"),
-                        clip.get("camera_shot"),
-                        origin,
-                        clip.get("review_status", "auto_tagged"),
-                        clip.get("copyright_risk_level", "unknown"),
-                        json.dumps(metadata, ensure_ascii=False),
-                        now,
-                        now,
-                    ),
+                thumbnail_asset_id = metadata.get("thumbnail_asset_id") if isinstance(metadata, dict) else None
+                thumbnail_path = metadata.get("thumbnail_path") if isinstance(metadata, dict) else None
+
+                motion = MotionAsset(
+                    id=motion_asset_id,
+                    source_video_asset_id=source_video_asset_id,
+                    clip_asset_id=clip.get("clip_asset_id"),
+                    project_id=project_id,
+                    job_id=job_id,
+                    owner_user_id=owner_user_id,
+                    start_ms=clip["start_ms"],
+                    end_ms=clip["end_ms"],
+                    action_summary=clip["action_summary"],
+                    action_label=clip.get("action_label"),
+                    entrance_style=clip.get("entrance_style"),
+                    emotion_label=clip.get("emotion_label"),
+                    temperament_label=clip.get("temperament_label"),
+                    scene_label=clip.get("scene_label"),
+                    camera_motion=clip.get("camera_motion"),
+                    camera_shot=clip.get("camera_shot"),
+                    confidence=float(clip.get("confidence") or 0.0),
+                    asset_candidate=bool(clip.get("asset_candidate", True)),
+                    origin=origin,
+                    review_status=clip.get("review_status", "auto_tagged"),
+                    copyright_risk_level=clip.get("copyright_risk_level", "unknown"),
+                    metadata_json=json.dumps(metadata, ensure_ascii=False),
+                    created_at=now,
+                    updated_at=now,
                 )
-                items.append(
-                    {
-                        "id": motion_asset_id,
-                        "source_video_asset_id": source_video_asset_id,
-                        "clip_asset_id": clip.get("clip_asset_id"),
-                        "conversation_id": conversation_id,
-                        "job_id": job_id,
-                        "owner_user_id": owner_user_id,
-                        "start_ms": clip["start_ms"],
-                        "end_ms": clip["end_ms"],
-                        "action_summary": clip["action_summary"],
-                        "action_label": clip.get("action_label"),
-                        "entrance_style": clip.get("entrance_style"),
-                        "emotion_label": clip.get("emotion_label"),
-                        "temperament_label": clip.get("temperament_label"),
-                        "scene_label": clip.get("scene_label"),
-                        "camera_motion": clip.get("camera_motion"),
-                        "camera_shot": clip.get("camera_shot"),
-                        "origin": origin,
-                        "review_status": clip.get("review_status", "auto_tagged"),
-                        "copyright_risk_level": clip.get("copyright_risk_level", "unknown"),
-                        "metadata_json": metadata,
-                        "created_at": now,
-                        "updated_at": now,
-                    }
-                )
-            connection.commit()
+                session.add(motion)
+                items.append({
+                    "id": motion_asset_id,
+                    "source_video_asset_id": source_video_asset_id,
+                    "clip_asset_id": clip.get("clip_asset_id"),
+                    "project_id": project_id,
+                    "job_id": job_id,
+                    "owner_user_id": owner_user_id,
+                    "start_ms": clip["start_ms"],
+                    "end_ms": clip["end_ms"],
+                    "thumbnail_asset_id": thumbnail_asset_id,
+                    "thumbnail_path": thumbnail_path,
+                    "action_summary": clip["action_summary"],
+                    "action_label": clip.get("action_label"),
+                    "entrance_style": clip.get("entrance_style"),
+                    "emotion_label": clip.get("emotion_label"),
+                    "temperament_label": clip.get("temperament_label"),
+                    "scene_label": clip.get("scene_label"),
+                    "camera_motion": clip.get("camera_motion"),
+                    "camera_shot": clip.get("camera_shot"),
+                    "confidence": float(clip.get("confidence") or 0.0),
+                    "asset_candidate": bool(clip.get("asset_candidate", True)),
+                    "origin": origin,
+                    "review_status": clip.get("review_status", "auto_tagged"),
+                    "copyright_risk_level": clip.get("copyright_risk_level", "unknown"),
+                    "metadata_json": metadata,
+                    "created_at": now,
+                    "updated_at": now,
+                })
+            session.commit()
             return items
+        except Exception:
+            session.rollback()
+            raise
         finally:
-            connection.close()
+            session.close()
 
     def review_motion_asset(
         self,
@@ -387,60 +393,48 @@ class AssetService:
             raise ValueError("动作资产审核动作仅支持 approve 或 reject。")
 
         next_status = "approved" if normalized_action == "approve" else "rejected"
-        now = utcnow_iso()
+        now = utcnow_ms()
 
-        connection = create_connection()
+        session = _get_session()
         try:
-            row = connection.execute(
-                """
-                SELECT *
-                FROM motion_assets
-                WHERE id = ?
-                LIMIT 1
-                """,
-                (motion_asset_id,),
-            ).fetchone()
-            if row is None:
+            motion = session.get(MotionAsset, motion_asset_id)
+            if motion is None:
                 return None
 
-            item = dict(row)
-            metadata = json.loads(item["metadata_json"]) if item.get("metadata_json") else {}
+            metadata = {}
+            if motion.metadata_json:
+                try:
+                    metadata = json.loads(motion.metadata_json)
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+
             review_history = metadata.get("review_history")
             if not isinstance(review_history, list):
                 review_history = []
-            review_history.append(
-                {
-                    "action": normalized_action,
-                    "status": next_status,
-                    "comment": (comment or "").strip(),
-                    "reviewer_id": reviewer_id,
-                    "reviewed_at": now,
-                }
-            )
+            review_history.append({
+                "action": normalized_action,
+                "status": next_status,
+                "comment": (comment or "").strip(),
+                "reviewer_id": reviewer_id,
+                "reviewed_at": now,
+            })
             metadata["review_history"] = review_history
             if reviewer_id:
                 metadata["last_reviewer_id"] = reviewer_id
             if comment:
                 metadata["last_review_comment"] = comment.strip()
 
-            connection.execute(
-                """
-                UPDATE motion_assets
-                SET review_status = ?, metadata_json = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    next_status,
-                    json.dumps(metadata, ensure_ascii=False),
-                    now,
-                    motion_asset_id,
-                ),
-            )
-            connection.commit()
+            motion.review_status = next_status
+            motion.metadata_json = json.dumps(metadata, ensure_ascii=False)
+            motion.updated_at = now
+            session.commit()
+            session.refresh(motion)
+            return self._motion_to_dict(motion)
+        except Exception:
+            session.rollback()
+            raise
         finally:
-            connection.close()
-
-        return self.get_motion_asset(motion_asset_id=motion_asset_id)
+            session.close()
 
     def batch_review_motion_assets(
         self,
@@ -473,139 +467,84 @@ class AssetService:
         keyword: str | None = None,
         limit: int = 20,
     ) -> list[dict]:
-        clauses = ["1 = 1"]
-        params: list[object] = []
-
-        if source_video_asset_id:
-            clauses.append("source_video_asset_id = ?")
-            params.append(source_video_asset_id.strip())
-        if action_label:
-            clauses.append("action_label = ?")
-            params.append(action_label.strip())
-        if scene_label:
-            clauses.append("scene_label = ?")
-            params.append(scene_label.strip())
-        if review_status:
-            clauses.append("review_status = ?")
-            params.append(review_status.strip())
-        if origin:
-            clauses.append("origin = ?")
-            params.append(origin.strip())
-        if keyword:
-            clauses.append("action_summary LIKE ?")
-            params.append(f"%{keyword.strip()}%")
-
-        safe_limit = max(1, min(limit, 100))
-        params.append(safe_limit)
-
-        connection = create_connection()
+        session = _get_session()
         try:
-            rows = connection.execute(
-                f"""
-                SELECT
-                    motion_assets.*,
-                    source_video.id AS source_video_related_id,
-                    source_video.asset_type AS source_video_related_asset_type,
-                    source_video.source_type AS source_video_related_source_type,
-                    source_video.file_name AS source_video_related_file_name,
-                    source_video.thumbnail_path AS source_video_related_thumbnail_path,
-                    source_video.metadata_json AS source_video_related_metadata_json,
-                    clip.id AS clip_related_id,
-                    clip.asset_type AS clip_related_asset_type,
-                    clip.source_type AS clip_related_source_type,
-                    clip.file_name AS clip_related_file_name,
-                    clip.thumbnail_path AS clip_related_thumbnail_path,
-                    clip.metadata_json AS clip_related_metadata_json
-                FROM motion_assets
-                LEFT JOIN media_assets AS source_video
-                    ON source_video.id = motion_assets.source_video_asset_id
-                LEFT JOIN media_assets AS clip
-                    ON clip.id = motion_assets.clip_asset_id
-                WHERE {' AND '.join(clauses)}
-                ORDER BY motion_assets.created_at DESC
-                LIMIT ?
-                """,
-                params,
-            ).fetchall()
-            return [self._row_to_motion_asset(row) for row in rows]
+            from sqlalchemy.orm import selectinload
+            q = select(MotionAsset).options(
+                selectinload(MotionAsset.source_video_asset),
+                selectinload(MotionAsset.clip_asset),
+            )
+            if source_video_asset_id:
+                q = q.where(MotionAsset.source_video_asset_id == source_video_asset_id.strip())
+            if action_label:
+                q = q.where(MotionAsset.action_label == action_label.strip())
+            if scene_label:
+                q = q.where(MotionAsset.scene_label == scene_label.strip())
+            if review_status:
+                q = q.where(MotionAsset.review_status == review_status.strip())
+            if origin:
+                q = q.where(MotionAsset.origin == origin.strip())
+            if keyword:
+                q = q.where(MotionAsset.action_summary.like(f"%{keyword.strip()}%"))
+
+            safe_limit = max(1, min(limit, MAX_MOTION_ASSET_LIST_LIMIT))
+            q = q.order_by(MotionAsset.created_at.desc()).limit(safe_limit)
+            rows = session.scalars(q).all()
+            return [self._motion_to_dict(r) for r in rows]
         finally:
-            connection.close()
+            session.close()
 
     def delete_asset(self, *, asset_id: str, owner_user_id: str | None = None) -> bool:
-        clauses = ["id = ?"]
-        params: list[object] = [asset_id]
-        if owner_user_id:
-            clauses.append("(owner_user_id = ? OR owner_user_id IS NULL)")
-            params.append(owner_user_id.strip())
-        where = " AND ".join(clauses)
-
-        connection = create_connection()
+        session = _get_session()
         try:
-            cursor = connection.execute(
-                f"DELETE FROM media_assets WHERE {where}",
-                params,
-            )
-            connection.commit()
-            return cursor.rowcount > 0
+            q = sa_delete(MediaAsset).where(MediaAsset.id == asset_id)
+            if owner_user_id:
+                q = q.where(
+                    (MediaAsset.owner_user_id == owner_user_id.strip())
+                    | (MediaAsset.owner_user_id.is_(None))
+                )
+            result = session.execute(q)
+            session.commit()
+            return result.rowcount > 0
+        except Exception:
+            session.rollback()
+            raise
         finally:
-            connection.close()
+            session.close()
 
     def delete_assets_batch(self, *, asset_ids: list[str], owner_user_id: str | None = None) -> int:
         if not asset_ids:
             return 0
-        placeholders = ", ".join("?" for _ in asset_ids)
-        params: list[object] = list(asset_ids)
-        owner_clause = ""
-        if owner_user_id:
-            owner_clause = " AND (owner_user_id = ? OR owner_user_id IS NULL)"
-            params.append(owner_user_id.strip())
-        connection = create_connection()
+        session = _get_session()
         try:
-            cursor = connection.execute(
-                f"DELETE FROM media_assets WHERE id IN ({placeholders}){owner_clause}",
-                params,
+            q = sa_delete(MediaAsset).where(MediaAsset.id.in_(asset_ids))
+            if owner_user_id:
+                q = q.where(
+                    (MediaAsset.owner_user_id == owner_user_id.strip())
+                    | (MediaAsset.owner_user_id.is_(None))
+                )
+            result = session.execute(q)
+            session.commit()
+            return result.rowcount
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def get_motion_asset(self, *, motion_asset_id: str) -> dict | None:
+        session = _get_session()
+        try:
+            from sqlalchemy.orm import selectinload
+            q = (
+                select(MotionAsset)
+                .options(
+                    selectinload(MotionAsset.source_video_asset),
+                    selectinload(MotionAsset.clip_asset),
+                )
+                .where(MotionAsset.id == motion_asset_id)
             )
-            connection.commit()
-            return cursor.rowcount
+            motion = session.scalar(q)
+            return self._motion_to_dict(motion) if motion else None
         finally:
-            connection.close()
-
-    def get_motion_asset(
-        self,
-        *,
-        motion_asset_id: str,
-    ) -> dict | None:
-        clauses = ["motion_assets.id = ?"]
-        params: list[object] = [motion_asset_id]
-
-        connection = create_connection()
-        try:
-            row = connection.execute(
-                f"""
-                SELECT
-                    motion_assets.*,
-                    source_video.id AS source_video_related_id,
-                    source_video.asset_type AS source_video_related_asset_type,
-                    source_video.source_type AS source_video_related_source_type,
-                    source_video.file_name AS source_video_related_file_name,
-                    source_video.thumbnail_path AS source_video_related_thumbnail_path,
-                    source_video.metadata_json AS source_video_related_metadata_json,
-                    clip.id AS clip_related_id,
-                    clip.asset_type AS clip_related_asset_type,
-                    clip.source_type AS clip_related_source_type,
-                    clip.file_name AS clip_related_file_name,
-                    clip.thumbnail_path AS clip_related_thumbnail_path,
-                    clip.metadata_json AS clip_related_metadata_json
-                FROM motion_assets
-                LEFT JOIN media_assets AS source_video
-                    ON source_video.id = motion_assets.source_video_asset_id
-                LEFT JOIN media_assets AS clip
-                    ON clip.id = motion_assets.clip_asset_id
-                WHERE {' AND '.join(clauses)}
-                LIMIT 1
-                """,
-                params,
-            ).fetchone()
-            return self._row_to_motion_asset(row) if row is not None else None
-        finally:
-            connection.close()
+            session.close()

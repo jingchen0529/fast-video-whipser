@@ -75,7 +75,7 @@ watch(selectedFile, (newFile) => {
 });
 
 const project = computed(() => chatStore.selectedProject);
-const messages = computed(() => project.value?.conversation_messages || []);
+const messages = computed(() => project.value?.messages || []);
 const videoGeneration = computed(() => project.value?.video_generation || null);
 const normalizedVideoGenerationStatus = computed(() =>
   String(videoGeneration.value?.status || "")
@@ -105,6 +105,7 @@ const generatedVideoUrl = computed(() => {
   const preferred =
     videoGeneration.value?.asset_url ||
     videoGeneration.value?.result_video_url ||
+    project.value?.generated_media_url ||
     (project.value?.workflow_type === "analysis" ? project.value?.media_url : null);
   return resolveAssetUrl(preferred);
 });
@@ -251,10 +252,7 @@ const handleSend = async () => {
   inputText.value = "";
 
   // Optimistic user message
-  if (!project.value.conversation_messages) {
-    project.value.conversation_messages = [];
-  }
-  project.value.conversation_messages.push({
+  project.value.messages.push({
     id: "temp-" + Date.now(),
     role: "user",
     message_type: "chat_question",
@@ -266,7 +264,7 @@ const handleSend = async () => {
 
   // Immediately show AI "thinking" placeholder
   const aiPlaceholderId = "ai-thinking-" + Date.now();
-  project.value.conversation_messages.push({
+  project.value.messages.push({
     id: aiPlaceholderId,
     role: "assistant",
     message_type: "chat_reply",
@@ -284,7 +282,7 @@ const handleSend = async () => {
       body: { content },
     });
     // Replace the thinking placeholder with real response
-    const msgs = project.value.conversation_messages;
+    const msgs = project.value.messages;
     const placeholderIndex = msgs.findIndex((m: any) => m.id === aiPlaceholderId);
     if (placeholderIndex !== -1) {
       msgs[placeholderIndex] = {
@@ -310,7 +308,7 @@ const handleSend = async () => {
     scrollToBottom();
   } catch (error) {
     // Replace thinking placeholder with error message
-    const msgs = project.value.conversation_messages;
+    const msgs = project.value.messages;
     const placeholderIndex = msgs.findIndex((m: any) => m.id === aiPlaceholderId);
     if (placeholderIndex !== -1) {
       msgs.splice(placeholderIndex, 1);
@@ -453,7 +451,14 @@ const handleMouseMove = (e: MouseEvent) => {
           @click="showVideoDetail = true"
           class="shrink-0 rounded-full bg-zinc-100 px-3 py-1.5 text-xs font-medium hover:bg-zinc-200 transition-colors dark:bg-zinc-800 dark:hover:bg-zinc-700 mr-2"
         >
-          查看视频
+          查看源视频
+        </button>
+        <button
+          v-if="generatedVideoUrl && project.workflow_type !== 'analysis'"
+          @click="showGenerationDetail = true"
+          class="shrink-0 rounded-full bg-zinc-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-zinc-800 transition-colors dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200"
+        >
+          查看生成视频
         </button>
       </Teleport>
     </ClientOnly>
@@ -582,7 +587,7 @@ const handleMouseMove = (e: MouseEvent) => {
                     <p class="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
                       {{
                         normalizedVideoGenerationStatus === "succeeded"
-                          ? "后端任务流已完成，结果已经写回动态资产。"
+                          ? "后端任务流已完成，结果已经写回资产库。"
                           : normalizedVideoGenerationStatus === "failed"
                             ? "视频模型返回失败状态，请检查错误信息。"
                             : "后端正在轮询第三方视频模型任务状态。"

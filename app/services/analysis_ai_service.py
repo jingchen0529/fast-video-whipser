@@ -22,14 +22,31 @@ class AnalysisAIService:
         source_name: str,
         candidate: dict[str, Any],
         fallback_payload: dict[str, Any],
+        extraction_hint: str | None = None,
+        provider_group: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         system_prompt = (
             "你是一名短视频动作资产标注专家，擅长把镜头片段整理成结构化动作标签。"
             "请根据镜头描述、转写文本、运镜和景别，输出严格 JSON。"
             "如果信息不足，请保守判断，不要编造具体人物身份。"
+            "如果给了提取偏好，也只能在片段证据支持时作为优先参考，不能仅凭偏好臆断。"
+            "除了常见人物动作，也要识别工业展示与产品展示场景。"
+            "对于工厂/产品类视频，优先考虑以下动作标签："
+            "team_greeting、operate_machine、carry_goods、display_product、inspect_product、"
+            "material_flow、pour_material、package_product。"
+            "对于工厂/产品类视频，优先考虑以下场景标签："
+            "factory_entrance、factory_workshop、production_line、warehouse、machine_station、"
+            "product_closeup、factory_exterior、loading_area。"
+            "禁止输出任意自由组合标签，例如“smile, wave”或“factory entrance”；"
+            "必须输出单个规范化标签，如 team_greeting 或 factory_entrance。"
         )
         user_prompt = "\n".join(
             [
+                *(
+                    [f"本次提取偏好（仅作辅助参考，不能覆盖片段事实）：{extraction_hint.strip()}"]
+                    if extraction_hint and extraction_hint.strip()
+                    else []
+                ),
                 f"素材名称：{source_name}",
                 f"片段信息：{candidate}",
                 (
@@ -38,12 +55,15 @@ class AnalysisAIService:
                     '"scene_label":"","camera_motion":"","camera_shot":"","action_summary":"",'
                     '"confidence":0.0,"is_high_value":true}'
                 ),
+                "其中：camera_motion 使用 static/pan/tilt/tracking/push_in/pull_out/zoom_in/zoom_out/handheld/mixed，"
+                "camera_shot 使用 wide/full/medium/medium_close/close_up/extreme_close_up/mixed。",
             ]
         )
         return await self._complete_payload_json(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             fallback_payload=fallback_payload,
+            provider_group=provider_group,
         )
 
     async def generate_analysis_reply(
@@ -375,8 +395,9 @@ class AnalysisAIService:
         system_prompt: str,
         user_prompt: str,
         fallback_payload: dict[str, Any],
+        provider_group: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        provider = self._resolve_provider()
+        provider = self._resolve_provider_from_group(provider_group) if provider_group else self._resolve_provider()
         api_key = provider.get("api_key") or ""
         base_url = provider.get("base_url") or ""
         request_model = provider.get("request_model") or ""
@@ -460,6 +481,23 @@ class AnalysisAIService:
             "request_model": os.getenv("DOUBAO_ENDPOINT_ID", DEFAULT_DOUBAO_ENDPOINT_ID),
             "display_model": DEFAULT_DOUBAO_MODEL_NAME,
         }
+
+    def _resolve_provider_from_group(self, group: dict[str, Any]) -> dict[str, str]:
+        """Resolve provider from a specific settings group (e.g. motion_extraction)."""
+        providers = group.get("providers", [])
+        provider_map = {
+            item.get("provider"): item
+            for item in providers
+            if isinstance(item, dict) and item.get("provider")
+        }
+        default_provider = provider_map.get(group.get("default_provider", ""))
+        if default_provider and default_provider.get("api_key"):
+            return self._build_provider_payload(default_provider)
+        for item in providers:
+            if isinstance(item, dict) and item.get("api_key"):
+                return self._build_provider_payload(item)
+        # Fallback to global analysis provider
+        return self._resolve_provider()
 
     def _build_provider_payload(self, provider: dict[str, Any]) -> dict[str, str]:
         provider_key = str(provider.get("provider") or "analysis")

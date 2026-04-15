@@ -125,11 +125,7 @@ const handleSend = async () => {
       );
 
       if (chatStore.selectedProject) {
-        if (!chatStore.selectedProject.conversation_messages) {
-          chatStore.selectedProject.conversation_messages = [];
-        }
-
-        chatStore.selectedProject.conversation_messages.push({
+        chatStore.selectedProject.messages.push({
           id: "temp-" + Date.now(),
           role: "user",
           message_type: "chat_question",
@@ -139,7 +135,7 @@ const handleSend = async () => {
           reply_to_message_id: null,
         });
 
-        chatStore.selectedProject.conversation_messages.push({
+        chatStore.selectedProject.messages.push({
           id: res.id,
           role: res.role || "assistant",
           message_type: "chat_reply",

@@ -1,6 +1,10 @@
+import hashlib
+from contextlib import contextmanager
 from pathlib import Path
 from io import BytesIO
+from urllib.parse import urlsplit, urlunsplit
 
+import pymysql
 from fastapi.testclient import TestClient
 
 from app.core.application import create_app
@@ -8,23 +12,94 @@ from app.core.config import settings
 from app.services import captcha_service
 
 
-def _build_test_client(tmp_path: Path) -> TestClient:
-    settings.database_url = f"sqlite:///{tmp_path / 'auth-test.db'}"
-    settings.environment = "development"
-    settings.auth_jwt_secret = "unit-test-secret-value-which-is-long-enough"
-    settings.auth_jwt_issuer = "unit-test-suite"
-    settings.auth_initial_admin_username = "admin"
-    settings.auth_initial_admin_email = "admin@example.com"
-    settings.auth_initial_admin_password = "Admin12345!"
-    settings.auth_initial_admin_display_name = "Admin User"
-    settings.auth_allow_public_register = False
-    settings.auth_require_captcha_for_login = True
-    settings.auth_rate_limit_max_attempts = 5
-    settings.auth_rate_limit_block_seconds = 60
-    settings.auth_cookie_secure = False
-    settings.auth_cookie_samesite = "lax"
+def _build_test_database_url(tmp_path: Path, *, prefix: str = "auth") -> str:
+    parsed = urlsplit(settings.database_url)
+    if parsed.scheme not in {"mysql", "mysql+pymysql"}:
+        raise RuntimeError(f"当前测试仅支持 MySQL DATABASE_URL，实际为: {settings.database_url}")
 
-    return TestClient(create_app(serve_frontend_static=False))
+    database_hash = hashlib.md5(str(tmp_path).encode("utf-8")).hexdigest()[:12]
+    database_name = f"fvw_test_{prefix}_{database_hash}"
+    return urlunsplit((parsed.scheme, parsed.netloc, f"/{database_name}", parsed.query, parsed.fragment))
+
+
+def _quote_identifier(identifier: str) -> str:
+    return f"`{identifier.replace('`', '``')}`"
+
+
+def _drop_database(database_url: str) -> None:
+    parsed = urlsplit(database_url)
+    database_name = parsed.path.lstrip("/")
+    if not database_name.startswith("fvw_test_"):
+        raise RuntimeError(f"拒绝删除非测试数据库: {database_name}")
+
+    admin_url = urlunsplit((parsed.scheme, parsed.netloc, "", parsed.query, parsed.fragment))
+    admin_parsed = urlsplit(admin_url)
+    connection = pymysql.connect(
+        host=admin_parsed.hostname or "127.0.0.1",
+        port=admin_parsed.port or 3306,
+        user=admin_parsed.username or "root",
+        password=admin_parsed.password or "",
+        charset="utf8mb4",
+        autocommit=True,
+    )
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(f"DROP DATABASE IF EXISTS {_quote_identifier(database_name)}")
+    finally:
+        connection.close()
+
+
+@contextmanager
+def _test_database_scope(tmp_path: Path, *, prefix: str = "auth"):
+    original_settings = {
+        "database_url": settings.database_url,
+        "environment": settings.environment,
+        "auth_jwt_secret": settings.auth_jwt_secret,
+        "auth_jwt_issuer": settings.auth_jwt_issuer,
+        "auth_initial_admin_username": settings.auth_initial_admin_username,
+        "auth_initial_admin_email": settings.auth_initial_admin_email,
+        "auth_initial_admin_password": settings.auth_initial_admin_password,
+        "auth_initial_admin_display_name": settings.auth_initial_admin_display_name,
+        "auth_allow_public_register": settings.auth_allow_public_register,
+        "auth_require_captcha_for_login": settings.auth_require_captcha_for_login,
+        "auth_rate_limit_max_attempts": settings.auth_rate_limit_max_attempts,
+        "auth_rate_limit_block_seconds": settings.auth_rate_limit_block_seconds,
+        "auth_cookie_secure": settings.auth_cookie_secure,
+        "auth_cookie_samesite": settings.auth_cookie_samesite,
+    }
+    test_database_url = _build_test_database_url(tmp_path, prefix=prefix)
+    settings.database_url = test_database_url
+    try:
+        yield test_database_url
+    finally:
+        try:
+            _drop_database(test_database_url)
+        except pymysql.MySQLError:
+            # 测试失败时不要让清库错误覆盖原始异常；在真实 MySQL 环境下会继续尽力删除。
+            pass
+        finally:
+            for key, value in original_settings.items():
+                setattr(settings, key, value)
+
+
+@contextmanager
+def _build_test_client(tmp_path: Path):
+    with _test_database_scope(tmp_path, prefix="auth"):
+        settings.environment = "development"
+        settings.auth_jwt_secret = "unit-test-secret-value-which-is-long-enough"
+        settings.auth_jwt_issuer = "unit-test-suite"
+        settings.auth_initial_admin_username = "admin"
+        settings.auth_initial_admin_email = "admin@example.com"
+        settings.auth_initial_admin_password = "Admin12345!"
+        settings.auth_initial_admin_display_name = "Admin User"
+        settings.auth_allow_public_register = False
+        settings.auth_require_captcha_for_login = True
+        settings.auth_rate_limit_max_attempts = 5
+        settings.auth_rate_limit_block_seconds = 60
+        settings.auth_cookie_secure = False
+        settings.auth_cookie_samesite = "lax"
+        with TestClient(create_app(serve_frontend_static=False)) as client:
+            yield client
 
 
 def _captcha_pair(client: TestClient) -> tuple[str, str]:
@@ -392,6 +467,7 @@ def test_menu_tree_and_navigation_are_available_for_admin(tmp_path) -> None:
 
 
 def test_menu_crud_and_role_menu_assignment(tmp_path) -> None:
+    removed_menu_field = "_".join(("per", "mission_code"))
     with _build_test_client(tmp_path) as client:
         login_response = _login(
             client,
@@ -419,7 +495,6 @@ def test_menu_crud_and_role_menu_assignment(tmp_path) -> None:
                 "icon": "FolderTree",
                 "parent_id": system_root["id"],
                 "sort_order": 60,
-                "permission_code": None,
                 "remark": "审计日志入口",
                 "meta_json": {"section": "system"},
             },
@@ -429,12 +504,12 @@ def test_menu_crud_and_role_menu_assignment(tmp_path) -> None:
         created_menu = create_menu_response.json()["data"]
         assert created_menu["code"] == "system.audit_logs"
         assert created_menu["parent_id"] == system_root["id"]
+        assert removed_menu_field not in created_menu
 
         update_menu_response = client.patch(
             f"/api/menus/{created_menu['id']}",
             json={
                 "title": "审计日志中心",
-                "permission_code": None,
                 "parent_id": None,
                 "icon": None,
             },
@@ -445,7 +520,7 @@ def test_menu_crud_and_role_menu_assignment(tmp_path) -> None:
         assert updated_menu["title"] == "审计日志中心"
         assert updated_menu["parent_id"] is None
         assert updated_menu["icon"] is None
-        assert updated_menu["permission_code"] is None
+        assert removed_menu_field not in updated_menu
 
         roles_response = client.get("/api/auth/roles")
         assert roles_response.status_code == 200

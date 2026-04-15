@@ -6,8 +6,16 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from app.auth.security import utcnow_iso
-from app.db.sqlite import create_connection
+from sqlalchemy import select
+
+from app.auth.security import utcnow_ms
+from app.db.session import get_db_session
+from app.models.asset import SystemSetting
+
+
+def _get_session():
+    gen = get_db_session()
+    return next(gen)
 
 
 DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
@@ -204,6 +212,69 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
             },
         ],
     },
+    "motion_extraction": {
+        "coarse_filter_mode": "keyword",
+        "min_duration_ms": 800,
+        "max_duration_ms": 15000,
+        "signal_score_threshold": 3,
+        "confidence_threshold": 0.6,
+        "default_provider": "openai",
+        "providers": [
+            {
+                "provider": "openai",
+                "label": "OpenAI",
+                "enabled": True,
+                "base_url": "https://api.openai.com/v1",
+                "api_key": "",
+                "default_model": "gpt-4.1-mini",
+                "model_options": ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini"],
+            },
+            {
+                "provider": "gemini",
+                "label": "Gemini",
+                "enabled": False,
+                "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+                "api_key": "",
+                "default_model": "gemini-2.5-flash",
+                "model_options": [
+                    "gemini-2.5-pro",
+                    "gemini-2.5-flash",
+                    "gemini-2.5-flash-lite",
+                ],
+            },
+            {
+                "provider": "doubao",
+                "label": "豆包",
+                "enabled": True,
+                "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+                "api_key": "",
+                "default_model": "doubao-seed-1-6-250615",
+                "model_options": [
+                    "doubao-seed-1-6-250615",
+                    "doubao-pro",
+                    "doubao-lite",
+                ],
+            },
+            {
+                "provider": "deepseek",
+                "label": "DeepSeek",
+                "enabled": False,
+                "base_url": "https://api.deepseek.com/v1",
+                "api_key": "",
+                "default_model": "deepseek-chat",
+                "model_options": ["deepseek-chat", "deepseek-reasoner"],
+            },
+            {
+                "provider": "custom",
+                "label": "自定义兼容服务",
+                "enabled": False,
+                "base_url": "",
+                "api_key": "",
+                "default_model": "custom-model",
+                "model_options": ["custom-model"],
+            },
+        ],
+    },
 }
 
 
@@ -211,11 +282,11 @@ class SystemSettingsService:
     SETTINGS_KEY = "runtime_ai_settings"
 
     def get_settings(self) -> dict[str, Any]:
-        connection = create_connection()
+        session = _get_session()
         try:
-            return self._read_settings(connection)
+            return self._read_settings(session)
         finally:
-            connection.close()
+            session.close()
 
     def update_settings(
         self,
@@ -225,16 +296,16 @@ class SystemSettingsService:
     ) -> dict[str, Any]:
         normalized = self._normalize_settings_payload(payload, validate_base_urls=True)
 
-        connection = create_connection()
+        session = _get_session()
         try:
             self._persist_settings(
-                connection,
+                session,
                 payload=normalized,
                 updated_by_user_id=updated_by_user_id,
             )
             return normalized
         finally:
-            connection.close()
+            session.close()
 
     def get_transcription_capabilities(
         self,
@@ -291,58 +362,47 @@ class SystemSettingsService:
 
         return mounts or None
 
-    def _read_settings(self, connection) -> dict[str, Any]:
-        row = connection.execute(
-            """
-            SELECT value_json
-            FROM system_settings
-            WHERE key = ?
-            LIMIT 1
-            """,
-            (self.SETTINGS_KEY,),
-        ).fetchone()
+    def _read_settings(self, session) -> dict[str, Any]:
+        setting_obj = session.scalar(
+            select(SystemSetting).where(SystemSetting.setting_key == self.SETTINGS_KEY)
+        )
 
-        if row is None:
+        if setting_obj is None:
             normalized = deepcopy(DEFAULT_SYSTEM_SETTINGS)
-            self._persist_settings(connection, payload=normalized)
+            self._persist_settings(session, payload=normalized)
             return normalized
 
         try:
-            payload = json.loads(row["value_json"] or "{}")
+            payload = json.loads(setting_obj.value_json or "{}")
         except json.JSONDecodeError:
             payload = {}
 
         normalized = self._normalize_settings_payload(payload)
         if normalized != payload:
-            self._persist_settings(connection, payload=normalized)
+            self._persist_settings(session, payload=normalized)
         return normalized
 
     def _persist_settings(
         self,
-        connection,
+        session,
         *,
         payload: dict[str, Any],
         updated_by_user_id: str | None = None,
     ) -> None:
-        now = utcnow_iso()
-        connection.execute(
-            """
-            INSERT INTO system_settings (
-                key, value_json, updated_at, updated_by_user_id
-            ) VALUES (?, ?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET
-                value_json = excluded.value_json,
-                updated_at = excluded.updated_at,
-                updated_by_user_id = excluded.updated_by_user_id
-            """,
-            (
-                self.SETTINGS_KEY,
-                json.dumps(payload, ensure_ascii=False),
-                now,
-                updated_by_user_id,
-            ),
-        )
-        connection.commit()
+        now = utcnow_ms()
+        existing = session.get(SystemSetting, self.SETTINGS_KEY)
+        if existing is None:
+            session.add(SystemSetting(
+                setting_key=self.SETTINGS_KEY,
+                value_json=json.dumps(payload, ensure_ascii=False),
+                updated_at=now,
+                updated_by_user_id=updated_by_user_id,
+            ))
+        else:
+            existing.value_json = json.dumps(payload, ensure_ascii=False)
+            existing.updated_at = now
+            existing.updated_by_user_id = updated_by_user_id
+        session.commit()
 
     def _normalize_settings_payload(
         self,
@@ -351,6 +411,7 @@ class SystemSettingsService:
         validate_base_urls: bool = False,
     ) -> dict[str, Any]:
         normalized_payload = payload if isinstance(payload, dict) else {}
+        motion_extraction_raw = normalized_payload.get("motion_extraction")
         return {
             "system": self._normalize_system_settings(normalized_payload.get("system")),
             "proxy": self._normalize_proxy_settings(normalized_payload.get("proxy")),
@@ -372,6 +433,10 @@ class SystemSettingsService:
                 DEFAULT_SYSTEM_SETTINGS["remake"],
                 validate_base_urls=validate_base_urls,
             ),
+            "motion_extraction": self._normalize_motion_extraction_settings(
+                motion_extraction_raw,
+                validate_base_urls=validate_base_urls,
+            ),
         }
 
     def _normalize_system_settings(self, payload: Any) -> dict[str, Any]:
@@ -391,6 +456,32 @@ class SystemSettingsService:
             "https_url": self._normalize_string(raw.get("https_url")),
             "all_url": self._normalize_string(raw.get("all_url")),
             "no_proxy": self._normalize_string(raw.get("no_proxy")),
+        }
+
+    def _normalize_motion_extraction_settings(
+        self,
+        payload: Any,
+        *,
+        validate_base_urls: bool = False,
+    ) -> dict[str, Any]:
+        raw = payload if isinstance(payload, dict) else {}
+        defaults = DEFAULT_SYSTEM_SETTINGS["motion_extraction"]
+        coarse_filter_mode = self._normalize_string(raw.get("coarse_filter_mode")).lower() or defaults["coarse_filter_mode"]
+        if coarse_filter_mode not in ("keyword", "permissive"):
+            coarse_filter_mode = defaults["coarse_filter_mode"]
+        provider_group = self._normalize_provider_group(
+            "motion_extraction",
+            raw,
+            defaults,
+            validate_base_urls=validate_base_urls,
+        )
+        return {
+            "coarse_filter_mode": coarse_filter_mode,
+            "min_duration_ms": self._normalize_int(raw.get("min_duration_ms"), default=defaults["min_duration_ms"], minimum=100),
+            "max_duration_ms": self._normalize_int(raw.get("max_duration_ms"), default=defaults["max_duration_ms"], minimum=1000),
+            "signal_score_threshold": self._normalize_int(raw.get("signal_score_threshold"), default=defaults["signal_score_threshold"], minimum=1),
+            "confidence_threshold": self._normalize_float(raw.get("confidence_threshold"), default=defaults["confidence_threshold"]),
+            **provider_group,
         }
 
     def _normalize_provider_group(
@@ -741,6 +832,14 @@ class SystemSettingsService:
         if minimum is not None:
             normalized = max(minimum, normalized)
         return normalized
+
+    @staticmethod
+    def _normalize_float(value: Any, *, default: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError):
+            normalized = default
+        return max(minimum, min(maximum, normalized))
 
     def _normalize_string_list(self, value: Any) -> list[str]:
         if isinstance(value, str):

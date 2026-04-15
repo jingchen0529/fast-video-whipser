@@ -1,22 +1,35 @@
 import json
 import re
 import secrets
-import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import HTTPException
+from sqlalchemy import select, func, delete as sa_delete
+from sqlalchemy.orm import Session, selectinload
 
 from app.auth.security import (
     create_jwt_token,
+    datetime_to_timestamp_ms,
     decode_jwt_token,
     hash_password,
-    utcnow_iso,
+    parse_datetime_value,
+    utcnow_ms,
     verify_password,
 )
 from app.core.config import settings
 from app.core.logging import configure_logging
+from app.models.auth import (
+    AuthRateLimit,
+    AuthSession,
+    Menu,
+    RefreshToken,
+    Role,
+    RoleMenu,
+    User,
+    UserRole,
+)
 
 USERNAME_PATTERN = re.compile(r"^[a-z0-9_.-]{3,50}$")
 
@@ -41,7 +54,6 @@ def normalize_email(email: str) -> str:
     return normalized
 
 
-
 def normalize_role_code(code: str) -> str:
     normalized = code.strip().lower()
     if not ROLE_CODE_PATTERN.fullmatch(normalized):
@@ -61,49 +73,122 @@ def ensure_password_strength(password: str) -> None:
         raise ValueError("密码长度至少需要 8 位。")
 
 
-def _parse_datetime(value: str) -> datetime:
-    return datetime.fromisoformat(value)
+def _parse_datetime(value: Any) -> datetime:
+    parsed = parse_datetime_value(value)
+    if parsed is None:
+        raise ValueError("时间值不能为空。")
+    return parsed
 
 
-def _row_to_session(row: sqlite3.Row) -> dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Serialization helpers: ORM model -> dict
+# ---------------------------------------------------------------------------
+
+def _user_to_dict(user: User) -> dict[str, Any]:
     return {
-        "id": row["id"],
-        "user_id": row["user_id"],
-        "token_version": int(row["token_version"]),
-        "csrf_token": row["csrf_token"],
-        "remember": bool(row["remember"]),
-        "client_ip": row["client_ip"],
-        "user_agent": row["user_agent"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
-        "last_seen_at": row["last_seen_at"],
-        "revoked_at": row["revoked_at"],
-        "revoked_reason": row["revoked_reason"],
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "display_name": user.display_name,
+        "avatar_url": user.avatar_url,
+        "is_active": user.is_active,
+        "is_superuser": user.is_superuser,
+        "last_login_at": user.last_login_at,
+        "created_at": user.created_at,
+        "updated_at": user.updated_at,
     }
 
 
+def _role_to_dict(role: Role) -> dict[str, Any]:
+    return {
+        "id": role.id,
+        "code": role.code,
+        "name": role.name,
+        "description": role.description,
+        "is_system": role.is_system,
+        "created_at": role.created_at,
+        "updated_at": role.updated_at,
+    }
+
+
+def _menu_to_dict(menu: Menu) -> dict[str, Any]:
+    try:
+        meta_json = json.loads(menu.meta_json or "{}")
+    except json.JSONDecodeError:
+        meta_json = {}
+
+    return {
+        "id": menu.id,
+        "parent_id": menu.parent_id,
+        "code": menu.code,
+        "title": menu.title,
+        "menu_type": menu.menu_type,
+        "route_path": menu.route_path or "",
+        "route_name": menu.route_name,
+        "redirect_path": menu.redirect_path,
+        "icon": menu.icon,
+        "component_key": menu.component_key,
+        "sort_order": menu.sort_order or 0,
+        "is_visible": menu.is_visible,
+        "is_enabled": menu.is_enabled,
+        "is_external": menu.is_external,
+        "open_mode": menu.open_mode or "self",
+        "is_cacheable": menu.is_cacheable,
+        "is_affix": menu.is_affix,
+        "active_menu_path": menu.active_menu_path,
+        "badge_text": menu.badge_text,
+        "badge_type": menu.badge_type,
+        "remark": menu.remark,
+        "meta_json": meta_json,
+        "created_at": menu.created_at,
+        "updated_at": menu.updated_at,
+    }
+
+
+def _session_to_dict(session: AuthSession) -> dict[str, Any]:
+    return {
+        "id": session.id,
+        "user_id": session.user_id,
+        "token_version": session.token_version,
+        "csrf_token": session.csrf_token,
+        "remember": session.remember,
+        "client_ip": session.client_ip,
+        "user_agent": session.user_agent,
+        "created_at": session.created_at,
+        "updated_at": session.updated_at,
+        "last_seen_at": session.last_seen_at,
+        "revoked_at": session.revoked_at,
+        "revoked_reason": session.revoked_reason,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Session (auth_sessions) helpers
+# ---------------------------------------------------------------------------
+
 def get_session_by_id(
-    connection: sqlite3.Connection,
+    session: Session,
     session_id: str,
 ) -> dict[str, Any] | None:
-    row = connection.execute(
-        "SELECT * FROM auth_sessions WHERE id = ? LIMIT 1",
-        (session_id,),
-    ).fetchone()
-    if row is None:
+    obj = session.get(AuthSession, session_id)
+    if obj is None:
         return None
-    return _row_to_session(row)
+    return _session_to_dict(obj)
 
 
 def _get_active_session(
-    connection: sqlite3.Connection,
+    session: Session,
     session_id: str,
 ) -> dict[str, Any]:
-    session = get_session_by_id(connection, session_id)
-    if session is None or session["revoked_at"] is not None:
+    s = get_session_by_id(session, session_id)
+    if s is None or s["revoked_at"] is not None:
         raise HTTPException(status_code=401, detail="当前会话已失效。")
-    return session
+    return s
 
+
+# ---------------------------------------------------------------------------
+# Audit log (no change — pure logging)
+# ---------------------------------------------------------------------------
 
 def _issue_audit_log(
     action: str,
@@ -125,6 +210,10 @@ def _issue_audit_log(
     )
 
 
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
 def _rate_limit_scopes(login: str, client_ip: str | None) -> list[tuple[str, str]]:
     normalized_ip = (client_ip or "unknown").strip() or "unknown"
     normalized_login = login.strip().lower() or "unknown"
@@ -136,224 +225,146 @@ def _rate_limit_scopes(login: str, client_ip: str | None) -> list[tuple[str, str
 
 
 def assert_login_allowed(
-    connection: sqlite3.Connection,
+    session: Session,
     *,
     login: str,
     client_ip: str | None = None,
 ) -> None:
     now = datetime.now(UTC)
     for scope_type, scope_key in _rate_limit_scopes(login, client_ip):
-        row = connection.execute(
-            """
-            SELECT blocked_until
-            FROM auth_rate_limits
-            WHERE scope_type = ? AND scope_key = ?
-            LIMIT 1
-            """,
-            (scope_type, scope_key),
-        ).fetchone()
-        if row is None or not row["blocked_until"]:
+        obj = session.get(AuthRateLimit, (scope_type, scope_key))
+        if obj is None or not obj.blocked_until:
             continue
-        if _parse_datetime(row["blocked_until"]) > now:
+        if _parse_datetime(obj.blocked_until) > now:
             raise HTTPException(status_code=429, detail=LOGIN_BLOCK_MESSAGE)
 
 
 def register_login_failure(
-    connection: sqlite3.Connection,
+    session: Session,
     *,
     login: str,
     client_ip: str | None = None,
 ) -> None:
     now = datetime.now(UTC)
-    now_iso = utcnow_iso()
-    blocked_until_iso = (now + timedelta(seconds=settings.auth_rate_limit_block_seconds)).isoformat()
+    now_ts = utcnow_ms()
+    blocked_until_ts = datetime_to_timestamp_ms(
+        now + timedelta(seconds=settings.auth_rate_limit_block_seconds)
+    )
     max_attempts = max(1, settings.auth_rate_limit_max_attempts)
     for scope_type, scope_key in _rate_limit_scopes(login, client_ip):
-        row = connection.execute(
-            """
-            SELECT failure_count, blocked_until
-            FROM auth_rate_limits
-            WHERE scope_type = ? AND scope_key = ?
-            LIMIT 1
-            """,
-            (scope_type, scope_key),
-        ).fetchone()
-        if row is None:
+        obj = session.get(AuthRateLimit, (scope_type, scope_key))
+        if obj is None:
             failure_count = 1
-            connection.execute(
-                """
-                INSERT INTO auth_rate_limits (
-                    scope_type, scope_key, failure_count, blocked_until,
-                    last_attempt_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    scope_type,
-                    scope_key,
-                    failure_count,
-                    blocked_until_iso if failure_count >= max_attempts else None,
-                    now_iso,
-                    now_iso,
-                    now_iso,
-                ),
+            obj = AuthRateLimit(
+                scope_type=scope_type,
+                scope_key=scope_key,
+                failure_count=failure_count,
+                blocked_until=blocked_until_ts if failure_count >= max_attempts else None,
+                last_attempt_at=now_ts,
+                created_at=now_ts,
+                updated_at=now_ts,
             )
+            session.add(obj)
             continue
 
-        blocked_until = row["blocked_until"]
-        failure_count = int(row["failure_count"])
-        if blocked_until and _parse_datetime(blocked_until) <= now:
+        failure_count = obj.failure_count
+        if obj.blocked_until and _parse_datetime(obj.blocked_until) <= now:
             failure_count = 0
 
         failure_count += 1
-        connection.execute(
-            """
-            UPDATE auth_rate_limits
-            SET failure_count = ?,
-                blocked_until = ?,
-                last_attempt_at = ?,
-                updated_at = ?
-            WHERE scope_type = ? AND scope_key = ?
-            """,
-            (
-                failure_count,
-                blocked_until_iso if failure_count >= max_attempts else None,
-                now_iso,
-                now_iso,
-                scope_type,
-                scope_key,
-            ),
-        )
-    connection.commit()
+        obj.failure_count = failure_count
+        obj.blocked_until = blocked_until_ts if failure_count >= max_attempts else None
+        obj.last_attempt_at = now_ts
+        obj.updated_at = now_ts
+    # Rate limit changes must persist even if the request later raises HTTPException
+    session.commit()
 
 
 def clear_login_failures(
-    connection: sqlite3.Connection,
+    session: Session,
     *,
     login: str,
     client_ip: str | None = None,
 ) -> None:
     for scope_type, scope_key in _rate_limit_scopes(login, client_ip):
-        connection.execute(
-            "DELETE FROM auth_rate_limits WHERE scope_type = ? AND scope_key = ?",
-            (scope_type, scope_key),
+        session.execute(
+            sa_delete(AuthRateLimit).where(
+                AuthRateLimit.scope_type == scope_type,
+                AuthRateLimit.scope_key == scope_key,
+            )
         )
-    connection.commit()
+    session.commit()
 
 
+# ---------------------------------------------------------------------------
+# Role helpers
+# ---------------------------------------------------------------------------
 
-def _row_to_role(row: sqlite3.Row) -> dict[str, Any]:
-    return {
-        "id": row["id"],
-        "code": row["code"],
-        "name": row["name"],
-        "description": row["description"],
-        "is_system": bool(row["is_system"]),
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
-    }
+def _get_role_by_id(session: Session, role_id: str) -> Role | None:
+    return session.get(Role, role_id)
 
 
-def _row_to_menu(row: sqlite3.Row) -> dict[str, Any]:
-    try:
-        meta_json = json.loads(row["meta_json"] or "{}")
-    except json.JSONDecodeError:
-        meta_json = {}
-
-    row_keys = set(row.keys())
-
-    return {
-        "id": row["id"],
-        "parent_id": row["parent_id"],
-        "code": row["code"],
-        "title": row["title"],
-        "menu_type": row["menu_type"],
-        "route_path": row["route_path"] or "",
-        "route_name": row["route_name"],
-        "redirect_path": row["redirect_path"],
-        "icon": row["icon"],
-        "component_key": row["component_key"],
-        "permission_code": row["permission_code"] if "permission_code" in row_keys else None,
-
-        "sort_order": int(row["sort_order"] or 0),
-        "is_visible": bool(row["is_visible"]),
-        "is_enabled": bool(row["is_enabled"]),
-        "is_external": bool(row["is_external"]),
-        "open_mode": row["open_mode"] or "self",
-        "is_cacheable": bool(row["is_cacheable"]),
-        "is_affix": bool(row["is_affix"]),
-        "active_menu_path": row["active_menu_path"],
-        "badge_text": row["badge_text"],
-        "badge_type": row["badge_type"],
-        "remark": row["remark"],
-        "meta_json": meta_json,
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
-    }
+def _get_role_by_code(session: Session, role_code: str) -> Role | None:
+    return session.scalar(
+        select(Role).where(Role.code == normalize_role_code(role_code))
+    )
 
 
-def _row_to_user(row: sqlite3.Row) -> dict[str, Any]:
-    return {
-        "id": row["id"],
-        "username": row["username"],
-        "email": row["email"],
-        "display_name": row["display_name"],
-        "avatar_url": row["avatar_url"],
-        "is_active": bool(row["is_active"]),
-        "is_superuser": bool(row["is_superuser"]),
-        "last_login_at": row["last_login_at"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
-    }
+# ---------------------------------------------------------------------------
+# Menu helpers
+# ---------------------------------------------------------------------------
+
+def _get_menu_by_id(session: Session, menu_id: str) -> Menu | None:
+    return session.get(Menu, menu_id)
 
 
-def get_user_by_id(connection: sqlite3.Connection, user_id: str) -> dict[str, Any] | None:
-    row = connection.execute(
-        "SELECT * FROM users WHERE id = ? LIMIT 1",
-        (user_id,),
-    ).fetchone()
-    if row is None:
+def _get_menu_by_code(session: Session, code: str) -> Menu | None:
+    return session.scalar(
+        select(Menu).where(Menu.code == normalize_menu_code(code))
+    )
+
+
+# ---------------------------------------------------------------------------
+# User queries
+# ---------------------------------------------------------------------------
+
+def get_user_by_id(session: Session, user_id: str) -> dict[str, Any] | None:
+    user = session.get(User, user_id)
+    if user is None:
         return None
-    return _row_to_user(row)
+    return _user_to_dict(user)
 
 
-def get_user_roles(connection: sqlite3.Connection, user_id: str) -> list[dict[str, Any]]:
-    rows = connection.execute(
-        """
-        SELECT r.*
-        FROM roles r
-        INNER JOIN user_roles ur ON ur.role_id = r.id
-        WHERE ur.user_id = ?
-        ORDER BY r.name ASC
-        """,
-        (user_id,),
-    ).fetchall()
-    return [_row_to_role(row) for row in rows]
-
+def get_user_roles(session: Session, user_id: str) -> list[dict[str, Any]]:
+    roles = session.scalars(
+        select(Role)
+        .join(UserRole, UserRole.role_id == Role.id)
+        .where(UserRole.user_id == user_id)
+        .order_by(Role.name.asc())
+    ).all()
+    return [_role_to_dict(r) for r in roles]
 
 
 def build_user_profile(
-    connection: sqlite3.Connection,
+    session: Session,
     user_id: str,
 ) -> dict[str, Any] | None:
-    user = get_user_by_id(connection, user_id)
+    user = get_user_by_id(session, user_id)
     if user is None:
         return None
-
-    roles = get_user_roles(connection, user_id)
-    user["roles"] = roles
+    user["roles"] = get_user_roles(session, user_id)
     return user
 
 
+# ---------------------------------------------------------------------------
+# Menu CRUD
+# ---------------------------------------------------------------------------
 
-def list_menus(connection: sqlite3.Connection) -> list[dict[str, Any]]:
-    rows = connection.execute(
-        """
-        SELECT *
-        FROM menus
-        ORDER BY sort_order ASC, created_at ASC, id ASC
-        """
-    ).fetchall()
-    return [_row_to_menu(row) for row in rows]
+def list_menus(session: Session) -> list[dict[str, Any]]:
+    menus = session.scalars(
+        select(Menu).order_by(Menu.sort_order.asc(), Menu.created_at.asc(), Menu.id.asc())
+    ).all()
+    return [_menu_to_dict(m) for m in menus]
 
 
 def build_menu_tree(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -383,43 +394,28 @@ def build_menu_tree(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sort_nodes(nodes)
 
 
-def list_menu_tree(connection: sqlite3.Connection) -> list[dict[str, Any]]:
-    return build_menu_tree(list_menus(connection))
-
-
-def _get_menu_by_id(connection: sqlite3.Connection, menu_id: str) -> sqlite3.Row | None:
-    return connection.execute(
-        "SELECT * FROM menus WHERE id = ? LIMIT 1",
-        (menu_id,),
-    ).fetchone()
-
-
-def _get_menu_by_code(connection: sqlite3.Connection, code: str) -> sqlite3.Row | None:
-    return connection.execute(
-        "SELECT * FROM menus WHERE code = ? LIMIT 1",
-        (normalize_menu_code(code),),
-    ).fetchone()
-
+def list_menu_tree(session: Session) -> list[dict[str, Any]]:
+    return build_menu_tree(list_menus(session))
 
 
 def _assert_menu_parent_available(
-    connection: sqlite3.Connection,
+    session: Session,
     *,
     parent_id: str | None,
     menu_id: str | None = None,
-) -> sqlite3.Row | None:
+) -> Menu | None:
     if not parent_id:
         return None
-    parent_row = _get_menu_by_id(connection, parent_id)
-    if parent_row is None:
+    parent = _get_menu_by_id(session, parent_id)
+    if parent is None:
         raise HTTPException(status_code=404, detail="父级菜单不存在。")
     if menu_id and parent_id == menu_id:
         raise HTTPException(status_code=400, detail="菜单不能将自己设置为父级。")
-    return parent_row
+    return parent
 
 
 def _assert_menu_parent_chain(
-    connection: sqlite3.Connection,
+    session: Session,
     *,
     menu_id: str,
     parent_id: str | None,
@@ -428,14 +424,14 @@ def _assert_menu_parent_chain(
     while current_parent_id:
         if current_parent_id == menu_id:
             raise HTTPException(status_code=400, detail="菜单父级关系不能形成循环。")
-        parent_row = _get_menu_by_id(connection, current_parent_id)
-        if parent_row is None:
+        parent = _get_menu_by_id(session, current_parent_id)
+        if parent is None:
             break
-        current_parent_id = parent_row["parent_id"]
+        current_parent_id = parent.parent_id
 
 
 def create_menu(
-    connection: sqlite3.Connection,
+    session: Session,
     *,
     code: str,
     title: str,
@@ -445,7 +441,6 @@ def create_menu(
     redirect_path: str | None = None,
     icon: str | None = None,
     component_key: str | None = None,
-
     parent_id: str | None = None,
     sort_order: int = 0,
     is_visible: bool = True,
@@ -471,57 +466,45 @@ def create_menu(
     if normalized_open_mode not in {"self", "blank"}:
         raise ValueError("打开方式仅支持 self 或 blank。")
 
-    if _get_menu_by_code(connection, normalized_code) is not None:
+    if _get_menu_by_code(session, normalized_code) is not None:
         raise HTTPException(status_code=409, detail="菜单编码已存在。")
 
-    _assert_menu_parent_available(connection, parent_id=parent_id)
-    now = utcnow_iso()
-    menu_id = uuid.uuid4().hex
-    connection.execute(
-        """
-        INSERT INTO menus (
-            id, parent_id, code, title, menu_type, route_path, route_name,
-            redirect_path, icon, component_key, sort_order,
-            is_visible, is_enabled, is_external, open_mode, is_cacheable,
-            is_affix, active_menu_path, badge_text, badge_type, remark,
-            meta_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            menu_id,
-            parent_id,
-            normalized_code,
-            normalized_title,
-            normalized_menu_type,
-            route_path.strip(),
-            route_name.strip() if route_name else None,
-            redirect_path.strip() if redirect_path else None,
-            icon.strip() if icon else None,
-            component_key.strip() if component_key else None,
-            int(sort_order),
-            int(is_visible),
-            int(is_enabled),
-            int(is_external),
-            normalized_open_mode,
-            int(is_cacheable),
-            int(is_affix),
-            active_menu_path.strip() if active_menu_path else None,
-            badge_text.strip() if badge_text else None,
-            badge_type.strip() if badge_type else None,
-            remark.strip() if remark else None,
-            json.dumps(meta_json or {}, ensure_ascii=False),
-            now,
-            now,
-        ),
+    _assert_menu_parent_available(session, parent_id=parent_id)
+    now = utcnow_ms()
+    menu = Menu(
+        id=uuid.uuid4().hex,
+        parent_id=parent_id,
+        code=normalized_code,
+        title=normalized_title,
+        menu_type=normalized_menu_type,
+        route_path=route_path.strip(),
+        route_name=route_name.strip() if route_name else None,
+        redirect_path=redirect_path.strip() if redirect_path else None,
+        icon=icon.strip() if icon else None,
+        component_key=component_key.strip() if component_key else None,
+        sort_order=int(sort_order),
+        is_visible=is_visible,
+        is_enabled=is_enabled,
+        is_external=is_external,
+        open_mode=normalized_open_mode,
+        is_cacheable=is_cacheable,
+        is_affix=is_affix,
+        active_menu_path=active_menu_path.strip() if active_menu_path else None,
+        badge_text=badge_text.strip() if badge_text else None,
+        badge_type=badge_type.strip() if badge_type else None,
+        remark=remark.strip() if remark else None,
+        meta_json=json.dumps(meta_json or {}, ensure_ascii=False),
+        created_at=now,
+        updated_at=now,
     )
-    connection.commit()
-    row = _get_menu_by_id(connection, menu_id)
+    session.add(menu)
+    session.flush()
     _issue_audit_log("menu_create", outcome="success", detail=normalized_code)
-    return _row_to_menu(row)
+    return _menu_to_dict(menu)
 
 
 def update_menu(
-    connection: sqlite3.Connection,
+    session: Session,
     menu_id: str,
     *,
     title: Any = _UNSET,
@@ -531,7 +514,6 @@ def update_menu(
     redirect_path: Any = _UNSET,
     icon: Any = _UNSET,
     component_key: Any = _UNSET,
-
     parent_id: Any = _UNSET,
     sort_order: Any = _UNSET,
     is_visible: Any = _UNSET,
@@ -546,236 +528,208 @@ def update_menu(
     remark: Any = _UNSET,
     meta_json: Any = _UNSET,
 ) -> dict[str, Any]:
-    menu_row = _get_menu_by_id(connection, menu_id)
-    if menu_row is None:
+    menu = _get_menu_by_id(session, menu_id)
+    if menu is None:
         raise HTTPException(status_code=404, detail="菜单不存在。")
 
-    updates: list[str] = []
-    values: list[Any] = []
+    changed = False
     if title is not _UNSET:
         normalized_title = title.strip()
         if not normalized_title:
             raise ValueError("菜单名称不能为空。")
-        updates.append("title = ?")
-        values.append(normalized_title)
+        menu.title = normalized_title
+        changed = True
     if menu_type is not _UNSET:
         normalized_menu_type = menu_type.strip().lower()
         if normalized_menu_type not in {"directory", "menu", "link"}:
             raise ValueError("菜单类型仅支持 directory、menu、link。")
-        updates.append("menu_type = ?")
-        values.append(normalized_menu_type)
+        menu.menu_type = normalized_menu_type
+        changed = True
     if route_path is not _UNSET:
-        updates.append("route_path = ?")
-        values.append((route_path or "").strip())
+        menu.route_path = (route_path or "").strip()
+        changed = True
     if route_name is not _UNSET:
-        updates.append("route_name = ?")
-        values.append((route_name or "").strip() or None)
+        menu.route_name = (route_name or "").strip() or None
+        changed = True
     if redirect_path is not _UNSET:
-        updates.append("redirect_path = ?")
-        values.append((redirect_path or "").strip() or None)
+        menu.redirect_path = (redirect_path or "").strip() or None
+        changed = True
     if icon is not _UNSET:
-        updates.append("icon = ?")
-        values.append((icon or "").strip() or None)
+        menu.icon = (icon or "").strip() or None
+        changed = True
     if component_key is not _UNSET:
-        updates.append("component_key = ?")
-        values.append((component_key or "").strip() or None)
-
+        menu.component_key = (component_key or "").strip() or None
+        changed = True
     if parent_id is not _UNSET:
-        _assert_menu_parent_available(connection, parent_id=parent_id, menu_id=menu_id)
-        _assert_menu_parent_chain(connection, menu_id=menu_id, parent_id=parent_id)
-        updates.append("parent_id = ?")
-        values.append(parent_id or None)
+        _assert_menu_parent_available(session, parent_id=parent_id, menu_id=menu_id)
+        _assert_menu_parent_chain(session, menu_id=menu_id, parent_id=parent_id)
+        menu.parent_id = parent_id or None
+        changed = True
     if sort_order is not _UNSET:
-        updates.append("sort_order = ?")
-        values.append(int(sort_order))
+        menu.sort_order = int(sort_order)
+        changed = True
     if is_visible is not _UNSET:
-        updates.append("is_visible = ?")
-        values.append(int(is_visible))
+        menu.is_visible = bool(is_visible)
+        changed = True
     if is_enabled is not _UNSET:
-        updates.append("is_enabled = ?")
-        values.append(int(is_enabled))
+        menu.is_enabled = bool(is_enabled)
+        changed = True
     if is_external is not _UNSET:
-        updates.append("is_external = ?")
-        values.append(int(is_external))
+        menu.is_external = bool(is_external)
+        changed = True
     if open_mode is not _UNSET:
         normalized_open_mode = open_mode.strip().lower()
         if normalized_open_mode not in {"self", "blank"}:
             raise ValueError("打开方式仅支持 self 或 blank。")
-        updates.append("open_mode = ?")
-        values.append(normalized_open_mode)
+        menu.open_mode = normalized_open_mode
+        changed = True
     if is_cacheable is not _UNSET:
-        updates.append("is_cacheable = ?")
-        values.append(int(is_cacheable))
+        menu.is_cacheable = bool(is_cacheable)
+        changed = True
     if is_affix is not _UNSET:
-        updates.append("is_affix = ?")
-        values.append(int(is_affix))
+        menu.is_affix = bool(is_affix)
+        changed = True
     if active_menu_path is not _UNSET:
-        updates.append("active_menu_path = ?")
-        values.append((active_menu_path or "").strip() or None)
+        menu.active_menu_path = (active_menu_path or "").strip() or None
+        changed = True
     if badge_text is not _UNSET:
-        updates.append("badge_text = ?")
-        values.append((badge_text or "").strip() or None)
+        menu.badge_text = (badge_text or "").strip() or None
+        changed = True
     if badge_type is not _UNSET:
-        updates.append("badge_type = ?")
-        values.append((badge_type or "").strip() or None)
+        menu.badge_type = (badge_type or "").strip() or None
+        changed = True
     if remark is not _UNSET:
-        updates.append("remark = ?")
-        values.append((remark or "").strip() or None)
+        menu.remark = (remark or "").strip() or None
+        changed = True
     if meta_json is not _UNSET:
-        updates.append("meta_json = ?")
-        values.append(json.dumps(meta_json or {}, ensure_ascii=False))
+        menu.meta_json = json.dumps(meta_json or {}, ensure_ascii=False)
+        changed = True
 
-    if updates:
-        updates.append("updated_at = ?")
-        values.append(utcnow_iso())
-        values.append(menu_id)
-        connection.execute(
-            f"UPDATE menus SET {', '.join(updates)} WHERE id = ?",
-            tuple(values),
-        )
-        connection.commit()
+    if changed:
+        menu.updated_at = utcnow_ms()
+        session.flush()
 
-    row = _get_menu_by_id(connection, menu_id)
     _issue_audit_log("menu_update", outcome="success", detail=menu_id)
-    return _row_to_menu(row)
+    return _menu_to_dict(menu)
 
 
-def delete_menu(connection: sqlite3.Connection, menu_id: str) -> dict[str, Any]:
-    menu_row = _get_menu_by_id(connection, menu_id)
-    if menu_row is None:
+def delete_menu(session: Session, menu_id: str) -> dict[str, Any]:
+    menu = _get_menu_by_id(session, menu_id)
+    if menu is None:
         raise HTTPException(status_code=404, detail="菜单不存在。")
 
-    child_count = int(
-        connection.execute(
-            "SELECT COUNT(1) AS count FROM menus WHERE parent_id = ?",
-            (menu_id,),
-        ).fetchone()["count"]
+    child_count = session.scalar(
+        select(func.count()).select_from(Menu).where(Menu.parent_id == menu_id)
     )
     if child_count > 0:
         raise HTTPException(status_code=400, detail="当前菜单仍存在子节点，无法删除。")
 
-    menu = _row_to_menu(menu_row)
-    connection.execute("DELETE FROM menus WHERE id = ?", (menu_id,))
-    connection.commit()
-    _issue_audit_log("menu_delete", outcome="success", detail=menu_id)
-    return {
-        "id": menu["id"],
-        "code": menu["code"],
-        "title": menu["title"],
+    result = {
+        "id": menu.id,
+        "code": menu.code,
+        "title": menu.title,
         "deleted": True,
     }
+    session.delete(menu)
+    session.flush()
+    _issue_audit_log("menu_delete", outcome="success", detail=menu_id)
+    return result
 
 
-def get_role_menus(connection: sqlite3.Connection, role_id: str) -> list[dict[str, Any]]:
-    rows = connection.execute(
-        """
-        SELECT m.*
-        FROM menus m
-        INNER JOIN role_menus rm ON rm.menu_id = m.id
-        WHERE rm.role_id = ?
-        ORDER BY m.sort_order ASC, m.created_at ASC, m.id ASC
-        """,
-        (role_id,),
-    ).fetchall()
-    return [_row_to_menu(row) for row in rows]
+def get_role_menus(session: Session, role_id: str) -> list[dict[str, Any]]:
+    menus = session.scalars(
+        select(Menu)
+        .join(RoleMenu, RoleMenu.menu_id == Menu.id)
+        .where(RoleMenu.role_id == role_id)
+        .order_by(Menu.sort_order.asc(), Menu.created_at.asc(), Menu.id.asc())
+    ).all()
+    return [_menu_to_dict(m) for m in menus]
 
 
 def assign_menus_to_role(
-    connection: sqlite3.Connection,
+    session: Session,
     role_id: str,
     menu_ids: list[str],
 ) -> dict[str, Any]:
-    role_row = _get_role_by_id(connection, role_id)
-    if role_row is None:
+    role = _get_role_by_id(session, role_id)
+    if role is None:
         raise HTTPException(status_code=404, detail="角色不存在。")
 
-    normalized_menu_ids = [menu_id.strip() for menu_id in menu_ids if menu_id and menu_id.strip()]
+    normalized_menu_ids = [mid.strip() for mid in menu_ids if mid and mid.strip()]
     normalized_menu_ids = list(dict.fromkeys(normalized_menu_ids))
     if normalized_menu_ids:
-        placeholders = ", ".join("?" for _ in normalized_menu_ids)
-        menu_rows = connection.execute(
-            f"SELECT id, parent_id FROM menus WHERE id IN ({placeholders})",
-            tuple(normalized_menu_ids),
-        ).fetchall()
+        menu_rows = session.scalars(
+            select(Menu).where(Menu.id.in_(normalized_menu_ids))
+        ).all()
     else:
         menu_rows = []
 
-    found_ids = {row["id"] for row in menu_rows}
-    missing_ids = [menu_id for menu_id in normalized_menu_ids if menu_id not in found_ids]
+    found_ids = {m.id for m in menu_rows}
+    missing_ids = [mid for mid in normalized_menu_ids if mid not in found_ids]
     if missing_ids:
         raise HTTPException(status_code=404, detail=f"以下菜单不存在: {', '.join(missing_ids)}")
 
+    # Collect all ancestor menu IDs
     all_ids = set(normalized_menu_ids)
-    parent_lookup = {row["id"]: row["parent_id"] for row in menu_rows}
-    pending_parent_ids = {parent_id for parent_id in parent_lookup.values() if parent_id}
+    parent_lookup = {m.id: m.parent_id for m in menu_rows}
+    pending_parent_ids = {pid for pid in parent_lookup.values() if pid}
 
     while pending_parent_ids:
-        placeholders = ", ".join("?" for _ in pending_parent_ids)
-        parent_rows = connection.execute(
-            f"SELECT id, parent_id FROM menus WHERE id IN ({placeholders})",
-            tuple(pending_parent_ids),
-        ).fetchall()
-        if not parent_rows:
+        parent_menus = session.scalars(
+            select(Menu).where(Menu.id.in_(pending_parent_ids))
+        ).all()
+        if not parent_menus:
             break
         pending_parent_ids = set()
-        for row in parent_rows:
-            menu_id_value = row["id"]
-            if menu_id_value in all_ids:
+        for m in parent_menus:
+            if m.id in all_ids:
                 continue
-            all_ids.add(menu_id_value)
-            if row["parent_id"]:
-                pending_parent_ids.add(row["parent_id"])
+            all_ids.add(m.id)
+            if m.parent_id:
+                pending_parent_ids.add(m.parent_id)
 
-    connection.execute("DELETE FROM role_menus WHERE role_id = ?", (role_id,))
-    now = utcnow_iso()
-    for menu_id_value in all_ids:
-        connection.execute(
-            """
-            INSERT INTO role_menus (role_id, menu_id, created_at)
-            VALUES (?, ?, ?)
-            """,
-            (role_id, menu_id_value, now),
-        )
-    connection.commit()
+    # Replace role-menu bindings
+    session.execute(sa_delete(RoleMenu).where(RoleMenu.role_id == role_id))
+    now = utcnow_ms()
+    for mid in all_ids:
+        session.add(RoleMenu(role_id=role_id, menu_id=mid, created_at=now))
+    session.flush()
 
-    role = _row_to_role(_get_role_by_id(connection, role_id))
-
-    role["menus"] = get_role_menus(connection, role_id)
+    result = _role_to_dict(role)
+    result["menus"] = get_role_menus(session, role_id)
     _issue_audit_log("role_assign_menus", outcome="success", detail=role_id)
-    return role
+    return result
 
 
 def list_user_navigation(
-    connection: sqlite3.Connection,
+    session: Session,
     *,
     user_id: str,
     is_superuser: bool,
 ) -> list[dict[str, Any]]:
     if is_superuser:
-        candidate_rows = connection.execute(
-            """
-            SELECT *
-            FROM menus
-            WHERE is_enabled = 1 AND is_visible = 1
-            ORDER BY sort_order ASC, created_at ASC, id ASC
-            """
-        ).fetchall()
+        candidate_menus_q = (
+            select(Menu)
+            .where(Menu.is_enabled == True, Menu.is_visible == True)
+            .order_by(Menu.sort_order.asc(), Menu.created_at.asc(), Menu.id.asc())
+        )
     else:
-        candidate_rows = connection.execute(
-            """
-            SELECT DISTINCT m.*
-            FROM menus m
-            INNER JOIN role_menus rm ON rm.menu_id = m.id
-            INNER JOIN user_roles ur ON ur.role_id = rm.role_id
-            WHERE ur.user_id = ?
-              AND m.is_enabled = 1
-              AND m.is_visible = 1
-            ORDER BY m.sort_order ASC, m.created_at ASC, m.id ASC
-            """,
-            (user_id,),
-        ).fetchall()
+        candidate_menus_q = (
+            select(Menu)
+            .join(RoleMenu, RoleMenu.menu_id == Menu.id)
+            .join(UserRole, UserRole.role_id == RoleMenu.role_id)
+            .where(
+                UserRole.user_id == user_id,
+                Menu.is_enabled == True,
+                Menu.is_visible == True,
+            )
+            .order_by(Menu.sort_order.asc(), Menu.created_at.asc(), Menu.id.asc())
+            .distinct()
+        )
 
-    candidate_menus = [_row_to_menu(row) for row in candidate_rows]
+    candidate_rows = session.scalars(candidate_menus_q).all()
+    candidate_menus = [_menu_to_dict(m) for m in candidate_rows]
+
     visible_menu_ids: set[str] = set()
     by_id = {menu["id"]: menu for menu in candidate_menus}
 
@@ -790,139 +744,101 @@ def list_user_navigation(
     return build_menu_tree(filtered_menus)
 
 
+# ---------------------------------------------------------------------------
+# Role CRUD
+# ---------------------------------------------------------------------------
 
-def list_roles(connection: sqlite3.Connection) -> list[dict[str, Any]]:
-    rows = connection.execute(
-        """
-        SELECT *
-        FROM roles
-        ORDER BY created_at ASC, id ASC
-        """
-    ).fetchall()
-    roles = []
-    for row in rows:
-        role = _row_to_role(row)
-
-        role["menus"] = get_role_menus(connection, role["id"])
-        roles.append(role)
-    return roles
-
-
-def _get_role_by_id(connection: sqlite3.Connection, role_id: str) -> sqlite3.Row | None:
-    return connection.execute(
-        "SELECT * FROM roles WHERE id = ? LIMIT 1",
-        (role_id,),
-    ).fetchone()
-
-
-def _get_role_by_code(connection: sqlite3.Connection, role_code: str) -> sqlite3.Row | None:
-    return connection.execute(
-        "SELECT * FROM roles WHERE code = ? LIMIT 1",
-        (normalize_role_code(role_code),),
-    ).fetchone()
+def list_roles(session: Session) -> list[dict[str, Any]]:
+    roles = session.scalars(
+        select(Role).order_by(Role.created_at.asc(), Role.id.asc())
+    ).all()
+    result = []
+    for r in roles:
+        role_dict = _role_to_dict(r)
+        role_dict["menus"] = get_role_menus(session, r.id)
+        result.append(role_dict)
+    return result
 
 
 def create_role(
-    connection: sqlite3.Connection,
+    session: Session,
     *,
     code: str,
     name: str,
     description: str | None = None,
-
 ) -> dict[str, Any]:
     normalized_code = normalize_role_code(code)
     normalized_name = name.strip()
     if not normalized_name:
         raise ValueError("角色名称不能为空。")
 
-    existing = _get_role_by_code(connection, normalized_code)
+    existing = _get_role_by_code(session, normalized_code)
     if existing is not None:
         raise HTTPException(status_code=409, detail="角色编码已存在。")
 
-    now = utcnow_iso()
-    role_id = uuid.uuid4().hex
-    connection.execute(
-        """
-        INSERT INTO roles (
-            id, code, name, description, is_system, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            role_id,
-            normalized_code,
-            normalized_name,
-            description.strip() if description else None,
-            0,
-            now,
-            now,
-        ),
+    now = utcnow_ms()
+    role = Role(
+        id=uuid.uuid4().hex,
+        code=normalized_code,
+        name=normalized_name,
+        description=description.strip() if description else None,
+        is_system=False,
+        created_at=now,
+        updated_at=now,
     )
+    session.add(role)
+    session.flush()
 
-
-    connection.commit()
-    role_row = _get_role_by_id(connection, role_id)
-    role = _row_to_role(role_row)
-
-    role["menus"] = get_role_menus(connection, role_id)
+    result = _role_to_dict(role)
+    result["menus"] = get_role_menus(session, role.id)
     _issue_audit_log("role_create", outcome="success", detail=normalized_code)
-    return role
+    return result
 
 
 def update_role(
-    connection: sqlite3.Connection,
+    session: Session,
     role_id: str,
     *,
     name: str | None = None,
     description: str | None = None,
 ) -> dict[str, Any]:
-    role_row = _get_role_by_id(connection, role_id)
-    if role_row is None:
+    role = _get_role_by_id(session, role_id)
+    if role is None:
         raise HTTPException(status_code=404, detail="角色不存在。")
 
-    updates: list[str] = []
-    values: list[Any] = []
+    changed = False
     if name is not None:
         normalized_name = name.strip()
         if not normalized_name:
             raise ValueError("角色名称不能为空。")
-        updates.append("name = ?")
-        values.append(normalized_name)
+        role.name = normalized_name
+        changed = True
     if description is not None:
-        updates.append("description = ?")
-        values.append(description.strip() or None)
+        role.description = description.strip() or None
+        changed = True
 
-    if updates:
-        updates.append("updated_at = ?")
-        values.append(utcnow_iso())
-        values.append(role_id)
-        connection.execute(
-            f"UPDATE roles SET {', '.join(updates)} WHERE id = ?",
-            tuple(values),
-        )
-        connection.commit()
+    if changed:
+        role.updated_at = utcnow_ms()
+        session.flush()
 
-    role = _row_to_role(_get_role_by_id(connection, role_id))
-
-    role["menus"] = get_role_menus(connection, role_id)
+    result = _role_to_dict(role)
+    result["menus"] = get_role_menus(session, role_id)
     _issue_audit_log("role_update", outcome="success", detail=role_id)
-    return role
+    return result
 
 
 def delete_role(
-    connection: sqlite3.Connection,
+    session: Session,
     role_id: str,
 ) -> dict[str, Any]:
-    role_row = _get_role_by_id(connection, role_id)
-    if role_row is None:
+    role = _get_role_by_id(session, role_id)
+    if role is None:
         raise HTTPException(status_code=404, detail="角色不存在。")
-    if bool(role_row["is_system"]):
+    if role.is_system:
         raise HTTPException(status_code=400, detail="系统内置角色不允许删除。")
 
-    bound_user_count = int(
-        connection.execute(
-            "SELECT COUNT(1) AS count FROM user_roles WHERE role_id = ?",
-            (role_id,),
-        ).fetchone()["count"]
+    bound_user_count = session.scalar(
+        select(func.count()).select_from(UserRole).where(UserRole.role_id == role_id)
     )
     if bound_user_count > 0:
         raise HTTPException(
@@ -930,65 +846,51 @@ def delete_role(
             detail="当前角色仍分配给用户，无法删除。请先解除用户绑定。",
         )
 
-    role = _row_to_role(role_row)
-    connection.execute("DELETE FROM roles WHERE id = ?", (role_id,))
-    connection.commit()
-    _issue_audit_log("role_delete", outcome="success", detail=role_id)
-    return {
-        "id": role["id"],
-        "code": role["code"],
-        "name": role["name"],
+    result = {
+        "id": role.id,
+        "code": role.code,
+        "name": role.name,
         "deleted": True,
     }
+    session.delete(role)
+    session.flush()
+    _issue_audit_log("role_delete", outcome="success", detail=role_id)
+    return result
 
 
+# ---------------------------------------------------------------------------
+# User CRUD
+# ---------------------------------------------------------------------------
 
-
-def list_users(connection: sqlite3.Connection) -> list[dict[str, Any]]:
-    rows = connection.execute(
-        """
-        SELECT *
-        FROM users
-        ORDER BY created_at ASC, id ASC
-        """
-    ).fetchall()
-    return [build_user_profile(connection, row["id"]) for row in rows]
+def list_users(session: Session) -> list[dict[str, Any]]:
+    users = session.scalars(
+        select(User).order_by(User.created_at.asc(), User.id.asc())
+    ).all()
+    return [build_user_profile(session, u.id) for u in users]
 
 
 def _ensure_user_uniqueness(
-    connection: sqlite3.Connection,
+    session: Session,
     *,
     username: str,
     email: str,
     exclude_user_id: str | None = None,
 ) -> None:
-    username_row = connection.execute(
-        """
-        SELECT id
-        FROM users
-        WHERE username = ? AND (? IS NULL OR id != ?)
-        LIMIT 1
-        """,
-        (username, exclude_user_id, exclude_user_id),
-    ).fetchone()
-    if username_row is not None:
+    username_q = select(User.id).where(User.username == username)
+    if exclude_user_id:
+        username_q = username_q.where(User.id != exclude_user_id)
+    if session.scalar(username_q) is not None:
         raise HTTPException(status_code=409, detail="用户名已存在。")
 
-    email_row = connection.execute(
-        """
-        SELECT id
-        FROM users
-        WHERE email = ? AND (? IS NULL OR id != ?)
-        LIMIT 1
-        """,
-        (email, exclude_user_id, exclude_user_id),
-    ).fetchone()
-    if email_row is not None:
+    email_q = select(User.id).where(User.email == email)
+    if exclude_user_id:
+        email_q = email_q.where(User.id != exclude_user_id)
+    if session.scalar(email_q) is not None:
         raise HTTPException(status_code=409, detail="邮箱已存在。")
 
 
 def _resolve_role_ids(
-    connection: sqlite3.Connection,
+    session: Session,
     role_codes: list[str],
 ) -> list[str]:
     normalized_codes = [normalize_role_code(code) for code in role_codes]
@@ -996,42 +898,33 @@ def _resolve_role_ids(
     if not normalized_codes:
         return []
 
-    placeholders = ", ".join("?" for _ in normalized_codes)
-    rows = connection.execute(
-        f"SELECT id, code FROM roles WHERE code IN ({placeholders})",
-        tuple(normalized_codes),
-    ).fetchall()
-    role_id_by_code = {row["code"]: row["id"] for row in rows}
+    roles = session.scalars(
+        select(Role).where(Role.code.in_(normalized_codes))
+    ).all()
+    role_id_by_code = {r.code: r.id for r in roles}
     missing_codes = [code for code in normalized_codes if code not in role_id_by_code]
     if missing_codes:
         raise HTTPException(
             status_code=404,
             detail=f"以下角色不存在: {', '.join(missing_codes)}",
         )
-
     return [role_id_by_code[code] for code in normalized_codes]
 
 
 def _sync_user_roles(
-    connection: sqlite3.Connection,
+    session: Session,
     user_id: str,
     role_codes: list[str],
 ) -> None:
-    now = utcnow_iso()
-    role_ids = _resolve_role_ids(connection, role_codes)
-    connection.execute("DELETE FROM user_roles WHERE user_id = ?", (user_id,))
+    now = utcnow_ms()
+    role_ids = _resolve_role_ids(session, role_codes)
+    session.execute(sa_delete(UserRole).where(UserRole.user_id == user_id))
     for role_id in role_ids:
-        connection.execute(
-            """
-            INSERT INTO user_roles (user_id, role_id, created_at)
-            VALUES (?, ?, ?)
-            """,
-            (user_id, role_id, now),
-        )
+        session.add(UserRole(user_id=user_id, role_id=role_id, created_at=now))
 
 
 def create_user(
-    connection: sqlite3.Connection,
+    session: Session,
     *,
     username: str,
     email: str,
@@ -1045,41 +938,34 @@ def create_user(
     normalized_email = normalize_email(email)
     ensure_password_strength(password)
     _ensure_user_uniqueness(
-        connection,
+        session,
         username=normalized_username,
         email=normalized_email,
     )
 
     user_id = uuid.uuid4().hex
-    now = utcnow_iso()
-    connection.execute(
-        """
-        INSERT INTO users (
-            id, username, email, display_name, password_hash,
-            is_active, is_superuser, token_version, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            user_id,
-            normalized_username,
-            normalized_email,
-            display_name.strip() if display_name and display_name.strip() else normalized_username,
-            hash_password(password),
-            int(is_active),
-            int(is_superuser),
-            0,
-            now,
-            now,
-        ),
+    now = utcnow_ms()
+    user = User(
+        id=user_id,
+        username=normalized_username,
+        email=normalized_email,
+        display_name=display_name.strip() if display_name and display_name.strip() else normalized_username,
+        password_hash=hash_password(password),
+        is_active=is_active,
+        is_superuser=is_superuser,
+        token_version=0,
+        created_at=now,
+        updated_at=now,
     )
-    _sync_user_roles(connection, user_id, role_codes or ["user"])
-    connection.commit()
+    session.add(user)
+    _sync_user_roles(session, user_id, role_codes or ["user"])
+    session.flush()
     _issue_audit_log("user_create", outcome="success", target_user_id=user_id)
-    return build_user_profile(connection, user_id)
+    return build_user_profile(session, user_id)
 
 
 def update_user(
-    connection: sqlite3.Connection,
+    session: Session,
     user_id: str,
     *,
     email: str | None = None,
@@ -1088,76 +974,63 @@ def update_user(
     is_active: bool | None = None,
     is_superuser: bool | None = None,
 ) -> dict[str, Any]:
-    current_user = get_user_by_id(connection, user_id)
-    if current_user is None:
+    user = session.get(User, user_id)
+    if user is None:
         raise HTTPException(status_code=404, detail="用户不存在。")
 
-    normalized_email = (
-        normalize_email(email)
-        if email is not None
-        else current_user["email"]
-    )
+    normalized_email = normalize_email(email) if email is not None else user.email
     _ensure_user_uniqueness(
-        connection,
-        username=current_user["username"],
+        session,
+        username=user.username,
         email=normalized_email,
         exclude_user_id=user_id,
     )
 
-    updates: list[str] = []
-    values: list[Any] = []
+    changed = False
     if email is not None:
-        updates.append("email = ?")
-        values.append(normalized_email)
+        user.email = normalized_email
+        changed = True
     if display_name is not None:
         normalized_display_name = display_name.strip()
         if not normalized_display_name:
             raise ValueError("显示名称不能为空。")
-        updates.append("display_name = ?")
-        values.append(normalized_display_name)
+        user.display_name = normalized_display_name
+        changed = True
     if is_active is not None:
-        updates.append("is_active = ?")
-        values.append(int(is_active))
+        user.is_active = is_active
+        changed = True
     if is_superuser is not None:
-        updates.append("is_superuser = ?")
-        values.append(int(is_superuser))
+        user.is_superuser = is_superuser
+        changed = True
     if avatar_url is not None:
-        updates.append("avatar_url = ?")
-        values.append(avatar_url)
+        user.avatar_url = avatar_url
+        changed = True
 
-    if updates:
-        updates.append("updated_at = ?")
-        values.append(utcnow_iso())
-        values.append(user_id)
-        connection.execute(
-            f"UPDATE users SET {', '.join(updates)} WHERE id = ?",
-            tuple(values),
-        )
+    if changed:
+        user.updated_at = utcnow_ms()
         if is_active is False:
-            _revoke_user_sessions(connection, user_id=user_id, reason="user_disabled")
-        connection.commit()
+            _revoke_user_sessions(session, user_id=user_id, reason="user_disabled")
+        session.flush()
 
     _issue_audit_log("user_update", outcome="success", target_user_id=user_id)
-    return build_user_profile(connection, user_id)
+    return build_user_profile(session, user_id)
 
 
 def delete_user(
-    connection: sqlite3.Connection,
+    session: Session,
     user_id: str,
     *,
     actor_user_id: str | None = None,
 ) -> dict[str, Any]:
-    user = get_user_by_id(connection, user_id)
+    user = session.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="用户不存在。")
     if actor_user_id and actor_user_id == user_id:
         raise HTTPException(status_code=400, detail="不允许删除当前登录用户。")
 
-    if user["is_superuser"]:
-        superuser_count = int(
-            connection.execute(
-                "SELECT COUNT(1) AS count FROM users WHERE is_superuser = 1",
-            ).fetchone()["count"]
+    if user.is_superuser:
+        superuser_count = session.scalar(
+            select(func.count()).select_from(User).where(User.is_superuser == True)
         )
         if superuser_count <= 1:
             raise HTTPException(
@@ -1165,142 +1038,128 @@ def delete_user(
                 detail="系统至少需要保留一个超级管理员，当前用户无法删除。",
             )
 
-    connection.execute("DELETE FROM users WHERE id = ?", (user_id,))
-    connection.commit()
+    result = {
+        "id": user.id,
+        "username": user.username,
+        "display_name": user.display_name,
+        "deleted": True,
+    }
+    session.delete(user)
+    session.flush()
     _issue_audit_log(
         "user_delete",
         outcome="success",
         user_id=actor_user_id,
         target_user_id=user_id,
     )
-    return {
-        "id": user["id"],
-        "username": user["username"],
-        "display_name": user["display_name"],
-        "deleted": True,
-    }
+    return result
 
 
 def assign_roles_to_user(
-    connection: sqlite3.Connection,
+    session: Session,
     user_id: str,
     role_codes: list[str],
 ) -> dict[str, Any]:
-    current_user = get_user_by_id(connection, user_id)
-    if current_user is None:
+    user = session.get(User, user_id)
+    if user is None:
         raise HTTPException(status_code=404, detail="用户不存在。")
 
-    _sync_user_roles(connection, user_id, role_codes)
-    connection.commit()
+    _sync_user_roles(session, user_id, role_codes)
+    session.flush()
     _issue_audit_log("user_assign_roles", outcome="success", target_user_id=user_id)
-    return build_user_profile(connection, user_id)
+    return build_user_profile(session, user_id)
 
 
-def _get_user_token_version(connection: sqlite3.Connection, user_id: str) -> int:
-    row = connection.execute(
-        "SELECT token_version FROM users WHERE id = ? LIMIT 1",
-        (user_id,),
-    ).fetchone()
-    if row is None:
+# ---------------------------------------------------------------------------
+# Token & session management
+# ---------------------------------------------------------------------------
+
+def _get_user_token_version(session: Session, user_id: str) -> int:
+    user = session.get(User, user_id)
+    if user is None:
         raise HTTPException(status_code=404, detail="用户不存在。")
-    return int(row["token_version"])
+    return user.token_version
 
 
 def _create_session(
-    connection: sqlite3.Connection,
+    session: Session,
     *,
     user_id: str,
     remember: bool,
     client_ip: str | None = None,
     user_agent: str | None = None,
 ) -> dict[str, Any]:
-    now = utcnow_iso()
+    now = utcnow_ms()
     session_id = uuid.uuid4().hex
-    connection.execute(
-        """
-        INSERT INTO auth_sessions (
-            id, user_id, token_version, csrf_token, remember,
-            client_ip, user_agent, created_at, updated_at, last_seen_at,
-            revoked_at, revoked_reason
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            session_id,
-            user_id,
-            _get_user_token_version(connection, user_id),
-            secrets.token_urlsafe(32),
-            int(remember),
-            client_ip,
-            user_agent,
-            now,
-            now,
-            now,
-            None,
-            None,
-        ),
+    auth_session = AuthSession(
+        id=session_id,
+        user_id=user_id,
+        token_version=_get_user_token_version(session, user_id),
+        csrf_token=secrets.token_urlsafe(32),
+        remember=remember,
+        client_ip=client_ip,
+        user_agent=user_agent,
+        created_at=now,
+        updated_at=now,
+        last_seen_at=now,
     )
-    session = get_session_by_id(connection, session_id)
-    if session is None:
+    session.add(auth_session)
+    session.flush()
+    result = get_session_by_id(session, session_id)
+    if result is None:
         raise HTTPException(status_code=500, detail="创建会话失败。")
-    return session
+    return result
 
 
-def _touch_session(connection: sqlite3.Connection, session_id: str) -> None:
-    now = utcnow_iso()
-    connection.execute(
-        """
-        UPDATE auth_sessions
-        SET last_seen_at = ?, updated_at = ?
-        WHERE id = ?
-        """,
-        (now, now, session_id),
-    )
+def _touch_session(session: Session, session_id: str) -> None:
+    auth_session = session.get(AuthSession, session_id)
+    if auth_session is not None:
+        now = utcnow_ms()
+        auth_session.last_seen_at = now
+        auth_session.updated_at = now
 
 
 def _revoke_session(
-    connection: sqlite3.Connection,
+    session: Session,
     *,
     session_id: str,
     reason: str,
 ) -> None:
-    now = utcnow_iso()
-    connection.execute(
-        """
-        UPDATE auth_sessions
-        SET revoked_at = COALESCE(revoked_at, ?),
-            revoked_reason = COALESCE(revoked_reason, ?),
-            updated_at = ?
-        WHERE id = ?
-        """,
-        (now, reason, now, session_id),
-    )
-    connection.execute(
-        """
-        UPDATE refresh_tokens
-        SET revoked_at = COALESCE(revoked_at, ?),
-            revoked_reason = COALESCE(revoked_reason, ?)
-        WHERE session_id = ? AND revoked_at IS NULL
-        """,
-        (now, reason, session_id),
-    )
+    now = utcnow_ms()
+    auth_session = session.get(AuthSession, session_id)
+    if auth_session is not None:
+        if auth_session.revoked_at is None:
+            auth_session.revoked_at = now
+        if auth_session.revoked_reason is None:
+            auth_session.revoked_reason = reason
+        auth_session.updated_at = now
+
+    # Revoke related refresh tokens
+    tokens = session.scalars(
+        select(RefreshToken).where(
+            RefreshToken.session_id == session_id,
+            RefreshToken.revoked_at.is_(None),
+        )
+    ).all()
+    for token in tokens:
+        token.revoked_at = now
+        token.revoked_reason = reason
 
 
 def _revoke_user_sessions(
-    connection: sqlite3.Connection,
+    session: Session,
     *,
     user_id: str,
     reason: str,
 ) -> None:
-    session_rows = connection.execute(
-        """
-        SELECT id
-        FROM auth_sessions
-        WHERE user_id = ? AND revoked_at IS NULL
-        """,
-        (user_id,),
-    ).fetchall()
-    for row in session_rows:
-        _revoke_session(connection, session_id=row["id"], reason=reason)
+    active_sessions = session.scalars(
+        select(AuthSession).where(
+            AuthSession.user_id == user_id,
+            AuthSession.revoked_at.is_(None),
+        )
+    ).all()
+    for s in active_sessions:
+        _revoke_session(session, session_id=s.id, reason=reason)
 
 
 def _extract_session_claims(claims: dict[str, Any]) -> tuple[str, int]:
@@ -1317,37 +1176,37 @@ def _extract_session_claims(claims: dict[str, Any]) -> tuple[str, int]:
 
 
 def validate_token_session(
-    connection: sqlite3.Connection,
+    session: Session,
     *,
     claims: dict[str, Any],
     require_active_user: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     session_id, token_version = _extract_session_claims(claims)
-    session = _get_active_session(connection, session_id)
-    if session["user_id"] != claims["sub"]:
+    auth_session = _get_active_session(session, session_id)
+    if auth_session["user_id"] != claims["sub"]:
         raise HTTPException(status_code=401, detail="当前会话与用户不匹配。")
-    if session["token_version"] != token_version:
+    if auth_session["token_version"] != token_version:
         raise HTTPException(status_code=401, detail="当前令牌版本已失效。")
 
-    user = build_user_profile(connection, claims["sub"])
+    user = build_user_profile(session, claims["sub"])
     if user is None:
         raise HTTPException(status_code=401, detail="用户不存在。")
     if require_active_user and not user["is_active"]:
         raise HTTPException(status_code=403, detail="当前用户已被禁用。")
-    if _get_user_token_version(connection, user["id"]) != token_version:
+    if _get_user_token_version(session, user["id"]) != token_version:
         raise HTTPException(status_code=401, detail="当前令牌版本已失效。")
-    return session, user
+    return auth_session, user
 
 
 def _issue_token_pair(
-    connection: sqlite3.Connection,
+    session: Session,
     user: dict[str, Any],
-    session: dict[str, Any],
+    auth_session: dict[str, Any],
 ) -> dict[str, Any]:
     additional_claims = {
         "username": user["username"],
-        "sid": session["id"],
-        "ver": session["token_version"],
+        "sid": auth_session["id"],
+        "ver": auth_session["token_version"],
     }
     access_token = create_jwt_token(
         subject=user["id"],
@@ -1366,44 +1225,39 @@ def _issue_token_pair(
         additional_claims=additional_claims,
     )
 
-    connection.execute(
-        """
-        INSERT INTO refresh_tokens (
-            id, user_id, session_id, token_jti, expires_at, created_at, revoked_at, revoked_reason
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            uuid.uuid4().hex,
-            user["id"],
-            session["id"],
-            refresh_token["claims"]["jti"],
-            datetime.fromtimestamp(
-                refresh_token["claims"]["exp"],
-                tz=UTC,
-            ).isoformat(),
-            utcnow_iso(),
-            None,
-            None,
+    rt = RefreshToken(
+        id=uuid.uuid4().hex,
+        user_id=user["id"],
+        session_id=auth_session["id"],
+        token_jti=refresh_token["claims"]["jti"],
+        expires_at=datetime_to_timestamp_ms(
+            datetime.fromtimestamp(refresh_token["claims"]["exp"], tz=UTC)
         ),
+        created_at=utcnow_ms(),
     )
-    _touch_session(connection, session["id"])
-    connection.commit()
+    session.add(rt)
+    _touch_session(session, auth_session["id"])
+    session.flush()
 
     return {
         "token_type": "Cookie",
         "access_token": access_token["token"],
         "refresh_token": refresh_token["token"],
-        "csrf_token": session["csrf_token"],
+        "csrf_token": auth_session["csrf_token"],
         "access_token_expires_in": settings.auth_access_token_expire_minutes * 60,
         "refresh_token_expires_in": settings.auth_refresh_token_expire_days * 24 * 60 * 60,
         "user": user,
-        "remember": session["remember"],
-        "session_id": session["id"],
+        "remember": auth_session["remember"],
+        "session_id": auth_session["id"],
     }
 
 
+# ---------------------------------------------------------------------------
+# High-level auth operations
+# ---------------------------------------------------------------------------
+
 def register_user(
-    connection: sqlite3.Connection,
+    session: Session,
     *,
     username: str,
     email: str,
@@ -1414,7 +1268,7 @@ def register_user(
     user_agent: str | None = None,
 ) -> dict[str, Any]:
     user = create_user(
-        connection,
+        session,
         username=username,
         email=email,
         password=password,
@@ -1423,36 +1277,29 @@ def register_user(
         is_active=True,
         is_superuser=False,
     )
-    session = _create_session(
-        connection,
+    auth_session = _create_session(
+        session,
         user_id=user["id"],
         remember=remember,
         client_ip=client_ip,
         user_agent=user_agent,
     )
-    result = _issue_token_pair(connection, user, session)
-    _issue_audit_log("register", outcome="success", user_id=user["id"], session_id=session["id"])
+    result = _issue_token_pair(session, user, auth_session)
+    _issue_audit_log("register", outcome="success", user_id=user["id"], session_id=auth_session["id"])
     return result
 
 
-def _get_user_login_row(
-    connection: sqlite3.Connection,
-    login: str,
-) -> sqlite3.Row | None:
+def _get_user_login_row(session: Session, login: str) -> User | None:
     normalized_login = login.strip().lower()
-    return connection.execute(
-        """
-        SELECT *
-        FROM users
-        WHERE username = ? OR email = ?
-        LIMIT 1
-        """,
-        (normalized_login, normalized_login),
-    ).fetchone()
+    return session.scalar(
+        select(User).where(
+            (User.username == normalized_login) | (User.email == normalized_login)
+        )
+    )
 
 
 def authenticate_user(
-    connection: sqlite3.Connection,
+    session: Session,
     *,
     login: str,
     password: str,
@@ -1460,43 +1307,38 @@ def authenticate_user(
     client_ip: str | None = None,
     user_agent: str | None = None,
 ) -> dict[str, Any]:
-    user_row = _get_user_login_row(connection, login)
-    if user_row is None or not verify_password(password, user_row["password_hash"]):
-        register_login_failure(connection, login=login, client_ip=client_ip)
+    user_obj = _get_user_login_row(session, login)
+    if user_obj is None or not verify_password(password, user_obj.password_hash):
+        register_login_failure(session, login=login, client_ip=client_ip)
         _issue_audit_log("login", outcome="failure", detail="invalid_credentials")
         raise HTTPException(status_code=401, detail="用户名或密码错误。")
 
-    if not bool(user_row["is_active"]):
-        register_login_failure(connection, login=login, client_ip=client_ip)
-        _issue_audit_log("login", outcome="failure", user_id=user_row["id"], detail="user_disabled")
+    if not user_obj.is_active:
+        register_login_failure(session, login=login, client_ip=client_ip)
+        _issue_audit_log("login", outcome="failure", user_id=user_obj.id, detail="user_disabled")
         raise HTTPException(status_code=403, detail="当前用户已被禁用。")
 
-    clear_login_failures(connection, login=login, client_ip=client_ip)
-    connection.execute(
-        """
-        UPDATE users
-        SET last_login_at = ?, updated_at = ?
-        WHERE id = ?
-        """,
-        (utcnow_iso(), utcnow_iso(), user_row["id"]),
-    )
-    connection.commit()
+    clear_login_failures(session, login=login, client_ip=client_ip)
+    now = utcnow_ms()
+    user_obj.last_login_at = now
+    user_obj.updated_at = now
+    session.flush()
 
-    user = build_user_profile(connection, user_row["id"])
-    session = _create_session(
-        connection,
+    user = build_user_profile(session, user_obj.id)
+    auth_session = _create_session(
+        session,
         user_id=user["id"],
         remember=remember,
         client_ip=client_ip,
         user_agent=user_agent,
     )
-    result = _issue_token_pair(connection, user, session)
-    _issue_audit_log("login", outcome="success", user_id=user["id"], session_id=session["id"])
+    result = _issue_token_pair(session, user, auth_session)
+    _issue_audit_log("login", outcome="success", user_id=user["id"], session_id=auth_session["id"])
     return result
 
 
 def refresh_user_token(
-    connection: sqlite3.Connection,
+    session: Session,
     *,
     refresh_token: str,
 ) -> dict[str, Any]:
@@ -1510,45 +1352,37 @@ def refresh_user_token(
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
-    token_row = connection.execute(
-        """
-        SELECT *
-        FROM refresh_tokens
-        WHERE token_jti = ? AND revoked_at IS NULL
-        LIMIT 1
-        """,
-        (claims["jti"],),
-    ).fetchone()
-    if token_row is None:
+    token_obj = session.scalar(
+        select(RefreshToken).where(
+            RefreshToken.token_jti == claims["jti"],
+            RefreshToken.revoked_at.is_(None),
+        )
+    )
+    if token_obj is None:
         raise HTTPException(status_code=401, detail="刷新令牌不存在或已失效。")
 
-    if _parse_datetime(token_row["expires_at"]) <= datetime.now(UTC):
+    if _parse_datetime(token_obj.expires_at) <= datetime.now(UTC):
         raise HTTPException(status_code=401, detail="刷新令牌已过期。")
 
-    session, user = validate_token_session(
-        connection,
+    auth_session, user = validate_token_session(
+        session,
         claims=claims,
         require_active_user=True,
     )
-    if token_row["session_id"] and token_row["session_id"] != session["id"]:
+    if token_obj.session_id and token_obj.session_id != auth_session["id"]:
         raise HTTPException(status_code=401, detail="刷新令牌会话不匹配。")
 
-    connection.execute(
-        """
-        UPDATE refresh_tokens
-        SET revoked_at = ?, revoked_reason = ?
-        WHERE token_jti = ?
-        """,
-        (utcnow_iso(), "rotated", claims["jti"]),
-    )
-    connection.commit()
-    result = _issue_token_pair(connection, user, session)
-    _issue_audit_log("refresh", outcome="success", user_id=user["id"], session_id=session["id"])
+    token_obj.revoked_at = utcnow_ms()
+    token_obj.revoked_reason = "rotated"
+    session.flush()
+
+    result = _issue_token_pair(session, user, auth_session)
+    _issue_audit_log("refresh", outcome="success", user_id=user["id"], session_id=auth_session["id"])
     return result
 
 
 def revoke_refresh_token(
-    connection: sqlite3.Connection,
+    session: Session,
     *,
     refresh_token: str | None = None,
     access_token: str | None = None,
@@ -1569,41 +1403,31 @@ def revoke_refresh_token(
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
     session_id, _ = _extract_session_claims(claims)
-    _revoke_session(connection, session_id=session_id, reason="logout")
-    connection.commit()
+    _revoke_session(session, session_id=session_id, reason="logout")
+    session.flush()
     _issue_audit_log("logout", outcome="success", user_id=claims.get("sub"), session_id=session_id)
     return {"revoked": True}
 
 
 def change_password(
-    connection: sqlite3.Connection,
+    session: Session,
     *,
     user_id: str,
     current_password: str,
     new_password: str,
 ) -> dict[str, Any]:
     ensure_password_strength(new_password)
-    user_row = connection.execute(
-        "SELECT id, password_hash FROM users WHERE id = ? LIMIT 1",
-        (user_id,),
-    ).fetchone()
-    if user_row is None:
+    user = session.get(User, user_id)
+    if user is None:
         raise HTTPException(status_code=404, detail="用户不存在。")
 
-    if not verify_password(current_password, user_row["password_hash"]):
+    if not verify_password(current_password, user.password_hash):
         raise HTTPException(status_code=400, detail="当前密码不正确。")
 
-    connection.execute(
-        """
-        UPDATE users
-        SET password_hash = ?,
-            token_version = token_version + 1,
-            updated_at = ?
-        WHERE id = ?
-        """,
-        (hash_password(new_password), utcnow_iso(), user_id),
-    )
-    _revoke_user_sessions(connection, user_id=user_id, reason="password_changed")
-    connection.commit()
+    user.password_hash = hash_password(new_password)
+    user.token_version = user.token_version + 1
+    user.updated_at = utcnow_ms()
+    _revoke_user_sessions(session, user_id=user_id, reason="password_changed")
+    session.flush()
     _issue_audit_log("password_change", outcome="success", user_id=user_id)
     return {"changed": True}

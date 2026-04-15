@@ -1,1 +1,0 @@
-import{aa as s,n as i,ab as n}from"./CqeGIYj2.js";import{a as r}from"./DdsAn1gZ.js";const c=s(async()=>{let t,a;const e=r();if(e.isAuthenticated.value)return i("/dashboard");if([t,a]=n(()=>e.initialize()),t=await t,a(),t)return i("/dashboard")});export{c as default};

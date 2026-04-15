@@ -17,13 +17,13 @@ class Settings(BaseSettings):
     log_backup_count: int = 7
     log_encoding: str = "utf-8"
 
-    database_url: str = "sqlite:///./app.db"
+    database_url: str = "mysql+pymysql://root@127.0.0.1/fast-video-whipser"
     temp_dir: str = "./temp_files"
     max_file_size: int = 2 * 1024 * 1024 * 1024
     frontend_static_dir: str = "./static"
     serve_frontend_static: bool = False
     frontend_dev_port: int = 3000
-    auth_jwt_secret: str = "change-me-in-production"
+    auth_jwt_secret: str = "change-me-to-a-random-32-plus-char-secret"
     auth_jwt_issuer: str = "fast-video-whisper"
     auth_access_token_expire_minutes: int = 1440
     auth_refresh_token_expire_days: int = 30
@@ -83,7 +83,7 @@ def validate_runtime_settings() -> None:
         failures.append("AUTH_COOKIE_SAMESITE=none 时必须同时开启 AUTH_COOKIE_SECURE=true。")
 
     if environment == "production":
-        if settings.auth_jwt_secret == "change-me-in-production":
+        if settings.auth_jwt_secret == "change-me-to-a-random-32-plus-char-secret":
             failures.append("生产环境禁止使用默认 AUTH_JWT_SECRET。")
         if len(settings.auth_jwt_secret) < 32:
             failures.append("生产环境 AUTH_JWT_SECRET 长度至少需要 32 位。")

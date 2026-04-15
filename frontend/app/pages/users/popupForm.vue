@@ -258,7 +258,7 @@ const handleSave = async () => {
               />
               <span
                 class="text-sm font-bold text-zinc-700 group-hover:text-zinc-900 transition-colors"
-                >超级管理员权限</span
+                >超级管理员</span
               >
             </label>
           </div>

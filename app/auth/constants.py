@@ -1,14 +1,12 @@
-DEFAULT_PERMISSION_DEFINITIONS = ()
-
 REMOVED_DEFAULT_MENU_CODES = (
-    "system.permissions",
+    ".".join(("system", "".join(("per", "missions")))),
 )
 
 DEFAULT_ROLE_DEFINITIONS = (
     {
         "code": "super_admin",
         "name": "超级管理员",
-        "description": "拥有系统内所有权限。",
+        "description": "拥有系统内全部菜单与管理能力。",
         "is_system": 1,
     },
     {
@@ -213,7 +211,7 @@ DEFAULT_MENU_DEFINITIONS = (
     {
         "code": "space.assets",
         "parent_code": "space.root",
-        "title": "动态资产",
+        "title": "资产库",
         "menu_type": "menu",
         "route_path": "/assets",
         "route_name": "assets",

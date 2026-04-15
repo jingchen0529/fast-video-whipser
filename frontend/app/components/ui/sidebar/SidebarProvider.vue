@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import type { HTMLAttributes, Ref } from "vue"
-import { defaultDocument, useEventListener, useMediaQuery, useVModel } from "@vueuse/core"
+import { useEventListener, useMediaQuery, useVModel } from "@vueuse/core"
 import { TooltipProvider } from "reka-ui"
-import { computed, ref } from "vue"
+import { computed, onMounted, ref } from "vue"
 import { cn } from "@/lib/utils"
 import { provideSidebarContext, SIDEBAR_COOKIE_MAX_AGE, SIDEBAR_COOKIE_NAME, SIDEBAR_KEYBOARD_SHORTCUT, SIDEBAR_WIDTH, SIDEBAR_WIDTH_ICON } from "./utils"
 
@@ -11,7 +11,7 @@ const props = withDefaults(defineProps<{
   open?: boolean
   class?: HTMLAttributes["class"]
 }>(), {
-  defaultOpen: !defaultDocument?.cookie.includes(`${SIDEBAR_COOKIE_NAME}=false`),
+  defaultOpen: true,
   open: undefined,
 })
 
@@ -26,6 +26,13 @@ const open = useVModel(props, "open", emits, {
   defaultValue: props.defaultOpen ?? false,
   passive: (props.open === undefined) as false,
 }) as Ref<boolean>
+
+onMounted(() => {
+  if (props.open !== undefined) {
+    return
+  }
+  open.value = !document.cookie.includes(`${SIDEBAR_COOKIE_NAME}=false`)
+})
 
 function setOpen(value: boolean) {
   open.value = value // emits('update:open', value)

@@ -28,6 +28,7 @@ import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { notifyError, formatDateTime } from "@/utils/common";
 import type {
+  MotionExtractionSettings,
   SystemSettingsPayload,
   SystemSettingsProviderConfig,
   TranscriptionCapabilitiesPayload,
@@ -44,7 +45,7 @@ const runtimeConfig = useRuntimeConfig();
 
 const loading = ref(false);
 const savingSection = ref<
-  "general" | "proxy" | "chat" | "transcription" | "video" | null
+  "general" | "proxy" | "chat" | "transcription" | "video" | "motion" | null
 >(null);
 const testing = ref(false);
 const loadError = ref("");
@@ -269,6 +270,69 @@ const createDefaultSettingsState = (): SystemSettingsPayload => ({
       }),
     ],
   },
+  motion_extraction: {
+    coarse_filter_mode: "keyword",
+    min_duration_ms: 800,
+    max_duration_ms: 15000,
+    signal_score_threshold: 3,
+    confidence_threshold: 0.6,
+    default_provider: "openai",
+    providers: [
+      createProviderConfig({
+        provider: "openai",
+        label: "OpenAI",
+        enabled: true,
+        base_url: "https://api.openai.com/v1",
+        api_key: "",
+        default_model: "gpt-4.1-mini",
+        model_options: ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini"],
+      }),
+      createProviderConfig({
+        provider: "gemini",
+        label: "Gemini",
+        enabled: false,
+        base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+        api_key: "",
+        default_model: "gemini-2.5-flash",
+        model_options: [
+          "gemini-2.5-pro",
+          "gemini-2.5-flash",
+          "gemini-2.5-flash-lite",
+        ],
+      }),
+      createProviderConfig({
+        provider: "doubao",
+        label: "豆包",
+        enabled: true,
+        base_url: "https://ark.cn-beijing.volces.com/api/v3",
+        api_key: "",
+        default_model: "doubao-seed-1-6-250615",
+        model_options: [
+          "doubao-seed-1-6-250615",
+          "doubao-pro",
+          "doubao-lite",
+        ],
+      }),
+      createProviderConfig({
+        provider: "deepseek",
+        label: "DeepSeek",
+        enabled: false,
+        base_url: "https://api.deepseek.com/v1",
+        api_key: "",
+        default_model: "deepseek-chat",
+        model_options: ["deepseek-chat", "deepseek-reasoner"],
+      }),
+      createProviderConfig({
+        provider: "custom",
+        label: "自定义兼容服务",
+        enabled: false,
+        base_url: "",
+        api_key: "",
+        default_model: "custom-model",
+        model_options: ["custom-model"],
+      }),
+    ],
+  },
 });
 
 const mergeProviderGroup = (
@@ -323,6 +387,24 @@ const ensureDefaultProviderEnabled = (
   }
 };
 
+const mergeMotionExtractionSettings = (
+  defaults: MotionExtractionSettings,
+  incoming?: Partial<MotionExtractionSettings> | null,
+): MotionExtractionSettings => {
+  const providerGroup = mergeProviderGroup(
+    { default_provider: defaults.default_provider, providers: defaults.providers },
+    incoming ? { default_provider: incoming.default_provider, providers: incoming.providers } : null,
+  );
+  return {
+    coarse_filter_mode: incoming?.coarse_filter_mode || defaults.coarse_filter_mode,
+    min_duration_ms: incoming?.min_duration_ms ?? defaults.min_duration_ms,
+    max_duration_ms: incoming?.max_duration_ms ?? defaults.max_duration_ms,
+    signal_score_threshold: incoming?.signal_score_threshold ?? defaults.signal_score_threshold,
+    confidence_threshold: incoming?.confidence_threshold ?? defaults.confidence_threshold,
+    ...providerGroup,
+  };
+};
+
 const normalizeSettingsPayload = (
   payload?: Partial<SystemSettingsPayload> | null,
 ): SystemSettingsPayload => {
@@ -342,6 +424,10 @@ const normalizeSettingsPayload = (
       payload?.transcription,
     ),
     remake: mergeProviderGroup(defaults.remake, payload?.remake),
+    motion_extraction: mergeMotionExtractionSettings(
+      defaults.motion_extraction,
+      payload?.motion_extraction,
+    ),
   };
 
   // 强制启用所有默认 provider，避免数据库中残留的 enabled=false 导致功能不可用
@@ -357,6 +443,8 @@ const formState = ref<SystemSettingsPayload>(createDefaultSettingsState());
 const selectedChatProvider = ref<string>("openai");
 const selectedTranscriptionProvider = ref<string>("faster_whisper");
 const selectedVideoProvider = ref<string>("doubao");
+const selectedMotionProvider = ref<string>("openai");
+const showMotionApiKey = ref(false);
 const transcriptionCapabilities = ref<TranscriptionCapabilitiesPayload | null>(
   null,
 );
@@ -397,6 +485,29 @@ const currentVideoProvider = computed(
       (p) => p.provider === selectedVideoProvider.value,
     ) || null,
 );
+
+const currentMotionProvider = computed(
+  () =>
+    formState.value.motion_extraction?.providers?.find(
+      (p) => p.provider === selectedMotionProvider.value,
+    ) || null,
+);
+
+const selectedDefaultMotionProvider = computed({
+  get: () =>
+    formState.value.motion_extraction?.default_provider ||
+    selectedMotionProvider.value ||
+    "openai",
+  set: (provider: string) => {
+    if (!formState.value.motion_extraction) return;
+    formState.value.motion_extraction.default_provider = provider;
+    selectedMotionProvider.value = provider;
+    const target = formState.value.motion_extraction.providers.find(
+      (p) => p.provider === provider,
+    );
+    if (target) target.enabled = true;
+  },
+});
 
 const videoBaseUrlPlaceholder = computed(() => {
   switch (currentVideoProvider.value?.provider) {
@@ -528,6 +639,16 @@ const syncSelectedProviders = (
     preferredVideoProvider,
     "doubao",
   );
+
+  const preferredMotionProvider =
+    mode === "default-first"
+      ? formState.value.motion_extraction?.default_provider || selectedMotionProvider.value
+      : selectedMotionProvider.value || formState.value.motion_extraction?.default_provider;
+  selectedMotionProvider.value = pickExistingProvider(
+    formState.value.motion_extraction?.providers,
+    preferredMotionProvider,
+    "openai",
+  );
 };
 
 const isAbsoluteAssetUrl = (value: string) =>
@@ -656,7 +777,7 @@ const handleProxyEnabledChange = (checked: boolean) => {
 const normalizeLoadErrorMessage = (error: unknown) => {
   const message = api.normalizeError(error);
   if (message.includes("settings.view")) {
-    return "当前账号没有系统设置查看权限，请使用管理员账号登录后查看。";
+    return "当前账号无法访问系统设置，请使用管理员账号登录后查看。";
   }
   if (message.includes("Method Not Allowed")) {
     return "当前后端还不支持该设置接口的探测请求，请重启后端后再试。";
@@ -706,6 +827,16 @@ const validateProviderBaseUrls = (payload: SystemSettingsPayload) => {
         `${group.label} / ${provider.label} 的 API Base Endpoint 必须以 http:// 或 https:// 开头。${suffix}`,
       );
     }
+  }
+
+  // Also validate motion_extraction providers
+  for (const provider of payload.motion_extraction?.providers || []) {
+    const baseUrl = (provider.base_url || "").trim();
+    if (!baseUrl) continue;
+    if (isValidHttpBaseUrl(baseUrl)) continue;
+    throw new Error(
+      `动作提取 / ${provider.label} 的 API Base Endpoint 必须以 http:// 或 https:// 开头。请输入完整接口地址。`,
+    );
   }
 };
 
@@ -772,7 +903,7 @@ const loadSettings = async (manual = false) => {
 };
 
 const saveSettings = async (
-  section: "general" | "proxy" | "chat" | "transcription" | "video",
+  section: "general" | "proxy" | "chat" | "transcription" | "video" | "motion",
   label: string,
 ) => {
   if (!formState.value || !canUpdate.value || savingSection.value) return;
@@ -791,6 +922,14 @@ const saveSettings = async (
     }
     if (section === "video") {
       ensureDefaultProviderEnabled(payload, "remake");
+    }
+    if (section === "motion") {
+      const me = payload.motion_extraction;
+      const dp = me?.default_provider;
+      if (me && dp) {
+        const target = me.providers.find((p) => p.provider === dp);
+        if (target) target.enabled = true;
+      }
     }
 
     const data = await api.patch<SystemSettingsPayload>("/settings", payload);
@@ -918,6 +1057,12 @@ onMounted(async () => {
               class="h-full flex-1 rounded-md border border-transparent bg-transparent px-3 text-[13px] font-medium text-zinc-600 transition-colors hover:text-zinc-900 data-[state=active]:border-zinc-900 data-[state=active]:bg-zinc-900 data-[state=active]:text-white dark:text-zinc-400 dark:hover:text-zinc-100 dark:data-[state=active]:border-zinc-900 dark:data-[state=active]:bg-zinc-900 dark:data-[state=active]:text-white"
             >
               视频模型
+            </TabsTrigger>
+            <TabsTrigger
+              value="motion"
+              class="h-full flex-1 rounded-md border border-transparent bg-transparent px-3 text-[13px] font-medium text-zinc-600 transition-colors hover:text-zinc-900 data-[state=active]:border-zinc-900 data-[state=active]:bg-zinc-900 data-[state=active]:text-white dark:text-zinc-400 dark:hover:text-zinc-100 dark:data-[state=active]:border-zinc-900 dark:data-[state=active]:bg-zinc-900 dark:data-[state=active]:text-white"
+            >
+              动作提取
             </TabsTrigger>
           </TabsList>
         </div>
@@ -1849,6 +1994,204 @@ onMounted(async () => {
                     ]"
                   />
                   {{ savingSection === "video" ? "保存中..." : "保存视频配置" }}
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <!-- Motion Extraction Tab -->
+        <TabsContent
+          v-if="formState.motion_extraction"
+          value="motion"
+          class="space-y-6 focus-visible:outline-none"
+        >
+          <Card
+            class="rounded-xl border-zinc-200 bg-white shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+          >
+            <CardContent class="flex flex-col gap-6 px-4 pt-4">
+              <!-- Coarse filter mode -->
+              <div class="space-y-2">
+                <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                  >粗筛模式</label
+                >
+                <Select v-model="formState.motion_extraction.coarse_filter_mode">
+                  <SelectTrigger
+                    class="h-11 w-full rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                  >
+                    <SelectValue placeholder="选择粗筛模式" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="keyword">关键词匹配</SelectItem>
+                    <SelectItem value="permissive">宽松模式 (全部送审)</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p class="text-xs text-zinc-500 ml-1">
+                  {{ formState.motion_extraction.coarse_filter_mode === "permissive"
+                    ? "宽松模式下所有时长合规的镜头都直接进入 LLM 精标，召回率最高但 token 消耗更大。"
+                    : "关键词模式下只有匹配到动作关键词且信号分达标的镜头才会进入精标流程。"
+                  }}
+                </p>
+              </div>
+
+              <!-- Duration range -->
+              <div class="grid grid-cols-2 gap-4">
+                <div class="space-y-2">
+                  <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                    >最短时长 (ms)</label
+                  >
+                  <Input
+                    v-model.number="formState.motion_extraction.min_duration_ms"
+                    type="number"
+                    placeholder="800"
+                    class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                  />
+                </div>
+                <div class="space-y-2">
+                  <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                    >最长时长 (ms)</label
+                  >
+                  <Input
+                    v-model.number="formState.motion_extraction.max_duration_ms"
+                    type="number"
+                    placeholder="15000"
+                    class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                  />
+                </div>
+              </div>
+
+              <!-- Signal score threshold (only in keyword mode) -->
+              <div
+                v-if="formState.motion_extraction.coarse_filter_mode === 'keyword'"
+                class="space-y-2"
+              >
+                <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                  >信号分阈值</label
+                >
+                <Input
+                  v-model.number="formState.motion_extraction.signal_score_threshold"
+                  type="number"
+                  placeholder="3"
+                  class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                />
+                <p class="text-xs text-zinc-500 ml-1">
+                  粗筛阶段的综合信号分需达到此阈值才进入精标，数值越低召回越多。默认 3。
+                </p>
+              </div>
+
+              <!-- Confidence threshold -->
+              <div class="space-y-2">
+                <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                  >置信度阈值</label
+                >
+                <Input
+                  v-model.number="formState.motion_extraction.confidence_threshold"
+                  type="number"
+                  step="0.05"
+                  min="0"
+                  max="1"
+                  placeholder="0.6"
+                  class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                />
+                <p class="text-xs text-zinc-500 ml-1">
+                  精标后 LLM 返回的置信度需达到此阈值才会保留。取值范围 0~1，越低保留越多。
+                </p>
+              </div>
+
+              <!-- Separator -->
+              <div class="border-t border-zinc-200 dark:border-zinc-800" />
+
+              <!-- Provider selection -->
+              <div class="space-y-2">
+                <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                  >精标模型</label
+                >
+                <Select v-model="selectedDefaultMotionProvider">
+                  <SelectTrigger
+                    class="h-11 w-full rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                  >
+                    <SelectValue placeholder="选择精标模型" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem
+                      v-for="p in formState.motion_extraction.providers"
+                      :key="p.provider"
+                      :value="p.provider"
+                    >
+                      {{ p.label }}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+                <p class="text-xs text-zinc-500 ml-1">
+                  动作提取精标使用的 LLM 模型，独立于对话模型配置。
+                </p>
+              </div>
+
+              <template v-if="currentMotionProvider">
+                <!-- Model -->
+                <div class="space-y-2">
+                  <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                    >Model</label
+                  >
+                  <Input
+                    v-model="currentMotionProvider.default_model"
+                    placeholder="填写模型名称"
+                    class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                  />
+                </div>
+
+                <!-- Base URL -->
+                <div class="space-y-2">
+                  <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                    >API Base Endpoint</label
+                  >
+                  <Input
+                    v-model="currentMotionProvider.base_url"
+                    placeholder="填写接口地址"
+                    class="h-11 rounded-lg border-zinc-200 bg-white px-4 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                  />
+                </div>
+
+                <!-- API Key -->
+                <div class="space-y-2">
+                  <label class="text-[12px] font-bold text-zinc-400 ml-1"
+                    >API Key</label
+                  >
+                  <div class="relative">
+                    <Input
+                      v-model="currentMotionProvider.api_key"
+                      :type="showMotionApiKey ? 'text' : 'password'"
+                      placeholder="填写密钥"
+                      class="h-11 rounded-lg border-zinc-200 bg-white px-4 pr-12 shadow-none dark:border-zinc-800 dark:bg-zinc-950"
+                    />
+                    <button
+                      type="button"
+                      class="absolute inset-y-0 right-0 flex w-11 items-center justify-center text-zinc-400 transition-colors hover:text-zinc-700 dark:hover:text-zinc-200"
+                      @click="showMotionApiKey = !showMotionApiKey"
+                    >
+                      <EyeOff v-if="showMotionApiKey" class="size-4" />
+                      <Eye v-else class="size-4" />
+                    </button>
+                  </div>
+                </div>
+              </template>
+
+              <!-- Footer -->
+              <div
+                class="flex items-center justify-end pt-4 border-t border-zinc-200 dark:border-zinc-800"
+              >
+                <Button
+                  class="h-8 min-w-8 rounded-md border border-zinc-900 bg-zinc-900 px-3 text-xs font-medium text-white shadow-none duration-200 ease-linear hover:bg-zinc-900/90 active:bg-zinc-900/90 dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-100/90 dark:active:bg-zinc-100/90"
+                  :disabled="!canUpdate || !!savingSection || loading"
+                  @click="saveSettings('motion', '动作提取配置')"
+                >
+                  <Save
+                    :class="[
+                      'mr-1.5 size-3.5',
+                      savingSection === 'motion' && 'animate-pulse',
+                    ]"
+                  />
+                  {{ savingSection === "motion" ? "保存中..." : "保存动作提取配置" }}
                 </Button>
               </div>
             </CardContent>

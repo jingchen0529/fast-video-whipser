@@ -52,7 +52,7 @@ REMAKE_TASK_STEPS = (
     TaskStepDefinition(
         "finish",
         "全部完成",
-        "将复刻视频写入动态资产并更新项目为完成状态。",
+        "将复刻视频写入资产库并更新项目为完成状态。",
     ),
 )
 

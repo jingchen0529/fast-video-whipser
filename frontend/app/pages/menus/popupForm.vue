@@ -230,10 +230,10 @@ const handleSaveMenu = async () => {
                       <Input
                         v-model="menuForm.code"
                         :disabled="isEdit"
-                        placeholder="例如：sys:user:list"
+                        placeholder="例如：system.users"
                         class="h-11 rounded-xl border-zinc-200 bg-white px-3 text-[14px] focus:ring-1 focus:ring-zinc-900"
                       />
-                      <p class="text-[11px] text-zinc-400">作为权限唯一标识，创建后不可修改。</p>
+                      <p class="text-[11px] text-zinc-400">作为菜单唯一标识，创建后不可修改。</p>
                     </div>
                     <div class="space-y-2">
                       <label class="text-[13px] font-semibold text-zinc-800">菜单类型</label>

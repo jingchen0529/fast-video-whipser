@@ -5,14 +5,29 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.coverage
+.coverage.*
+coverage.xml
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+htmlcov/
+.ipynb_checkpoints/
 .DS_Store
 log_files/
 temp_files/
+.pnpm-store/
+.claude/
 
 # webpack and other build artifacts
 node_modules/
 dist/
 build/
+frontend/.nuxt/
+frontend/.output/
+frontend/node_modules/.cache/
 
 # Local databases
 *.db

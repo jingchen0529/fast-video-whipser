@@ -34,7 +34,7 @@ definePageMeta({
   ssr: false,
 });
 
-useHead({ title: "我的资产" });
+useHead({ title: "资产库" });
 
 const apiService = useApi();
 const api = apiService.requestData;
@@ -110,9 +110,7 @@ const fetchStorageUsage = async () => {
 const fetchAssets = async () => {
   loading.value = true;
   try {
-    const res = await api<{ items: any[]; total: number }>(
-      "/assets",
-    );
+    const res = await api<{ items: any[]; total: number }>("/assets");
     items.value = res.items || [];
   } catch (e) {
     console.error(e);
@@ -129,6 +127,7 @@ const handleFileUpload = async (event: Event) => {
   try {
     for (let i = 0; i < target.files.length; i++) {
       const file = target.files[i];
+      if (!file) continue;
       const formData = new FormData();
       formData.append("file", file);
 
@@ -200,6 +199,7 @@ const getTypeLabel = (type: string) => {
 const getSourceLabel = (source: string) => {
   if (source === "generated") return "AI 生成";
   if (source === "upload") return "本地上传";
+  if (source === "url") return "外链";
   return "其他";
 };
 
@@ -384,6 +384,23 @@ onMounted(() => {
           </div>
         </div>
       </div>
+
+      <!-- Storage Usage Footer -->
+      <div
+        v-if="storageUsage.total_bytes > 0"
+        class="mt-auto pt-6 border-t border-zinc-100 dark:border-zinc-800 flex items-center justify-between"
+      >
+        <div class="flex-1 max-w-xs">
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-xs font-semibold text-zinc-500"
+              >存储空间使用（{{ formatBytes(storageUsage.used_bytes) }}）</span
+            >
+          </div>
+        </div>
+        <div class="text-[10px] text-zinc-400 font-medium">
+          {{ items.length }} 个资产项目
+        </div>
+      </div>
     </div>
 
     <!-- Image/Video Preview Overlay -->
@@ -437,23 +454,23 @@ onMounted(() => {
         </div>
 
         <div
-          class="flex-1 flex items-center justify-center p-4 lg:p-12 overflow-hidden"
+          class="flex-1 flex items-center justify-center p-4 sm:p-10 min-h-0"
         >
           <div
-            class="relative max-w-7xl max-h-full aspect-auto rounded-xl overflow-hidden shadow-[0_0_100px_rgba(0,0,0,0.5)]"
+            class="relative max-w-full max-h-full flex items-center justify-center"
             @click.stop
           >
             <video
               v-if="previewItem.asset_type === 'video'"
               :src="resolveAssetUrl(previewItem.id) || undefined"
-              class="w-full h-full max-h-[80vh] object-contain"
+              class="max-w-full max-h-[calc(100vh-160px)] rounded-2xl shadow-stone-900/50 shadow-2xl"
               controls
               autoplay
             />
             <img
               v-else
               :src="resolveAssetUrl(previewItem.id) || undefined"
-              class="w-full h-full max-h-[80vh] object-contain"
+              class="max-w-full max-h-[calc(100vh-160px)] rounded-2xl shadow-stone-900/50 shadow-2xl"
             />
           </div>
         </div>
@@ -463,7 +480,7 @@ onMounted(() => {
     <!-- Delete Confirmation -->
     <Dialog v-model:open="showDeleteConfirm">
       <DialogContent
-        class="sm:max-w-[400px] border-none shadow-2xl overflow-hidden rounded-[2rem]"
+        class="sm:max-w-[400px] border-none shadow-2xl overflow-y-auto max-h-[90vh] rounded-[2rem] custom-scrollbar"
       >
         <DialogHeader class="pt-6">
           <DialogTitle class="text-xl font-bold flex items-center gap-3 px-2">

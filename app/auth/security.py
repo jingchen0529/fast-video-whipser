@@ -1,11 +1,12 @@
 import base64
 import hashlib
 import hmac
-import json
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, Dict
+
+import jwt
 
 
 def utcnow() -> datetime:
@@ -14,6 +15,47 @@ def utcnow() -> datetime:
 
 def utcnow_iso() -> str:
     return utcnow().replace(microsecond=0).isoformat()
+
+
+def datetime_to_timestamp_ms(value: datetime) -> int:
+    normalized = value.astimezone(UTC) if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return int(normalized.timestamp() * 1000)
+
+
+def utcnow_ms() -> int:
+    return datetime_to_timestamp_ms(utcnow())
+
+
+def parse_datetime_value(value: Any) -> datetime | None:
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        return value.astimezone(UTC) if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+    if isinstance(value, (int, float)):
+        numeric_value = float(value)
+        if abs(numeric_value) >= 10_000_000_000:
+            numeric_value /= 1000
+        return datetime.fromtimestamp(numeric_value, tz=UTC)
+
+    if isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if normalized.lstrip("-").isdigit():
+            return parse_datetime_value(int(normalized))
+        parsed = datetime.fromisoformat(normalized)
+        return parsed.astimezone(UTC) if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+    raise TypeError(f"不支持的时间值类型: {type(value)!r}")
+
+
+def normalize_timestamp_ms(value: Any) -> int | None:
+    parsed = parse_datetime_value(value)
+    if parsed is None:
+        return None
+    return datetime_to_timestamp_ms(parsed)
 
 
 def hash_password(password: str, *, iterations: int = 390_000) -> str:
@@ -58,15 +100,6 @@ def verify_password(password: str, encoded_password: str) -> bool:
     return hmac.compare_digest(expected_hash, encoded_hash)
 
 
-def _b64url_encode(raw_bytes: bytes) -> str:
-    return base64.urlsafe_b64encode(raw_bytes).rstrip(b"=").decode("ascii")
-
-
-def _b64url_decode(value: str) -> bytes:
-    padding = "=" * (-len(value) % 4)
-    return base64.urlsafe_b64decode(f"{value}{padding}")
-
-
 def create_jwt_token(
     *,
     subject: str,
@@ -92,22 +125,10 @@ def create_jwt_token(
     if additional_claims:
         payload.update(additional_claims)
 
-    header = {"alg": "HS256", "typ": "JWT"}
-    encoded_header = _b64url_encode(
-        json.dumps(header, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    )
-    encoded_payload = _b64url_encode(
-        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    )
-    signing_input = f"{encoded_header}.{encoded_payload}"
-    signature = hmac.new(
-        secret.encode("utf-8"),
-        signing_input.encode("ascii"),
-        hashlib.sha256,
-    ).digest()
+    token = jwt.encode(payload, secret, algorithm="HS256")
 
     return {
-        "token": f"{signing_input}.{_b64url_encode(signature)}",
+        "token": token,
         "claims": payload,
     }
 
@@ -120,41 +141,25 @@ def decode_jwt_token(
     expected_type: str | None = None,
 ) -> Dict[str, Any]:
     try:
-        encoded_header, encoded_payload, encoded_signature = token.split(".", 2)
-    except ValueError as exc:
+        payload = jwt.decode(
+            token,
+            secret,
+            algorithms=["HS256"],
+            issuer=issuer,
+            options={"require": ["sub", "iss", "exp", "jti"]},
+        )
+    except jwt.ExpiredSignatureError as exc:
+        raise ValueError("JWT 已过期。") from exc
+    except jwt.InvalidIssuerError as exc:
+        raise ValueError("JWT 签发方不匹配。") from exc
+    except jwt.InvalidSignatureError as exc:
+        raise ValueError("JWT 签名校验失败。") from exc
+    except jwt.DecodeError as exc:
         raise ValueError("JWT 格式不正确。") from exc
-
-    signing_input = f"{encoded_header}.{encoded_payload}"
-    expected_signature = hmac.new(
-        secret.encode("utf-8"),
-        signing_input.encode("ascii"),
-        hashlib.sha256,
-    ).digest()
-    try:
-        actual_signature = _b64url_decode(encoded_signature)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("JWT 签名解析失败。") from exc
-
-    if not hmac.compare_digest(expected_signature, actual_signature):
-        raise ValueError("JWT 签名校验失败。")
-
-    try:
-        payload = json.loads(_b64url_decode(encoded_payload))
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise ValueError("JWT 载荷解析失败。") from exc
-
-    if payload.get("iss") != issuer:
-        raise ValueError("JWT 签发方不匹配。")
+    except jwt.InvalidTokenError as exc:
+        raise ValueError(f"JWT 校验失败: {exc}") from exc
 
     if expected_type and payload.get("typ") != expected_type:
         raise ValueError("JWT 类型不匹配。")
-
-    try:
-        expires_at = int(payload["exp"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("JWT 缺少有效过期时间。") from exc
-
-    if expires_at <= int(utcnow().timestamp()):
-        raise ValueError("JWT 已过期。")
 
     return payload

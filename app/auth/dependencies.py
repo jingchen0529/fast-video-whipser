@@ -1,14 +1,14 @@
 import hmac
-import sqlite3
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.orm import Session
 
 from app.auth.security import decode_jwt_token
 from app.auth.service import validate_token_session
 from app.core.config import settings
-from app.db import get_db
+from app.db import get_db_session
 
 bearer_scheme = HTTPBearer(auto_error=False)
 SAFE_HTTP_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -83,7 +83,7 @@ def clear_auth_cookies(
 def get_current_user(
     request: Request,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
-    connection: Annotated[sqlite3.Connection, Depends(get_db)],
+    session: Annotated[Session, Depends(get_db_session)],
 ) -> dict:
     token, token_source = get_access_token_from_request(request, credentials)
     if not token:
@@ -99,12 +99,12 @@ def get_current_user(
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
-    session, user = validate_token_session(
-        connection,
+    auth_session, user = validate_token_session(
+        session,
         claims=claims,
         require_active_user=True,
     )
-    request.state.auth_session = session
+    request.state.auth_session = auth_session
     request.state.auth_token_source = token_source
     return user
 
@@ -122,7 +122,7 @@ def require_admin_access(
     if role_codes & ADMIN_ROLE_CODES:
         return current_user
 
-    raise HTTPException(status_code=403, detail="当前账号没有访问该资源的权限。")
+    raise HTTPException(status_code=403, detail="当前账号无法访问该资源。")
 
 
 def require_csrf_protection(
@@ -132,4 +132,3 @@ def require_csrf_protection(
     session = getattr(request.state, "auth_session", None)
     expected_token = session["csrf_token"] if session else None
     validate_csrf_request(request, expected_token=expected_token)
-

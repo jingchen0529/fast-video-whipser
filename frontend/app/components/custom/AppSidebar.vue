@@ -84,6 +84,11 @@ const route = useRoute();
 const colorMode = useColorMode();
 const runtimeConfig = useRuntimeConfig();
 const loggingOut = ref(false);
+const avatarCacheBust = ref("");
+
+onMounted(() => {
+  avatarCacheBust.value = String(Date.now());
+});
 
 const colorPreference = computed(
   () => colorMode.store?.value ?? colorMode.value,
@@ -100,7 +105,7 @@ const user = computed(() => {
     name: u?.display_name || u?.username || "Admin",
     email: u?.email || "admin@example.com",
     avatar_url: avatarUrl
-      ? `${avatarUrl}${avatarUrl.includes("?") ? "&" : "?"}_t=${import.meta.client ? Date.now() : ""}`
+      ? `${avatarUrl}${avatarUrl.includes("?") ? "&" : "?"}_t=${avatarCacheBust.value}`
       : undefined,
   };
 });
@@ -156,14 +161,8 @@ const loadProjects = async (silent = false) => {
   }
 };
 
-const handleProjectSelect = async (projectId: number) => {
-  try {
-    const project = await api<any>(`/projects/${projectId}`);
-    chatStore.selectedProject = project;
-    useRouter().push({ path: '/video/history', query: { id: projectId } });
-  } catch (error) {
-    console.error(error);
-  }
+const handleProjectSelect = (projectId: number) => {
+  useRouter().push({ path: '/video/history', query: { id: projectId } });
 };
 
 const startNewChat = () => {
@@ -390,7 +389,7 @@ const fallbackMenus: AuthMenu[] = [
         id: "fallback-assets",
         parent_id: "fallback-space",
         code: "space.assets",
-        title: "动态资产",
+        title: "资产库",
         menu_type: "menu",
         route_path: "/assets",
         icon: "Shapes",
@@ -473,7 +472,34 @@ const isMenuActive = (menu: AuthMenu) => {
   if (!activePath) {
     return false;
   }
-  return route.path === activePath || route.path.startsWith(`${activePath}/`);
+
+  // /video/history 由侧边栏历史对话列表负责高亮，不高亮导航菜单项
+  if (route.path.startsWith('/video/history')) {
+    return false;
+  }
+
+  if (route.path === activePath) {
+    return true;
+  }
+
+  // 处理子路径情况：找出所有匹配当前路由的菜单，保留最长的匹配项以防止多个父路径菜单同时高亮
+  if (route.path.startsWith(`${activePath}/`)) {
+    const allMenuItems = effectiveNavigationMenus.value.flatMap(m => flattenNavigationItems([m]));
+    let bestMatchLen = 0;
+    
+    allMenuItems.forEach((m) => {
+      const p = (m.active_menu_path || m.route_path || "").trim();
+      if (p && (route.path === p || route.path.startsWith(`${p}/`))) {
+        if (p.length > bestMatchLen) {
+          bestMatchLen = p.length;
+        }
+      }
+    });
+
+    return activePath.length >= bestMatchLen;
+  }
+
+  return false;
 };
 
 const loadNavigation = async () => {
@@ -640,7 +666,7 @@ onMounted(async () => {
 
                 <SidebarMenuItem v-for="project in projects" :key="project.id">
                   <SidebarMenuButton
-                    :is-active="selectedProject?.id === project.id"
+                    :is-active="route.path.startsWith('/video/history') && Number(route.query.id) === project.id"
                     @click="handleProjectSelect(project.id)"
                     class="group/item relative h-9 w-full transition-all duration-200 hover:bg-zinc-100/80 dark:hover:bg-zinc-800/80"
                   >

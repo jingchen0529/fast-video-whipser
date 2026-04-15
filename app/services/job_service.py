@@ -1,16 +1,51 @@
 import json
 import uuid
 
-from app.auth.security import utcnow_iso
-from app.db.sqlite import create_connection
+from sqlalchemy import select
+
+from app.auth.security import utcnow_ms
+from app.db.session import get_db_session
+from app.models.job import Job
+
+
+def _get_session():
+    gen = get_db_session()
+    return next(gen)
 
 
 class JobService:
+    @staticmethod
+    def _job_to_dict(job: Job) -> dict:
+        result_json = job.result_json
+        if isinstance(result_json, str):
+            try:
+                result_json = json.loads(result_json)
+            except (json.JSONDecodeError, TypeError):
+                result_json = {}
+        return {
+            "id": job.id,
+            "project_id": job.project_id,
+            "trigger_message_id": job.trigger_message_id,
+            "job_type": job.job_type,
+            "status": job.status,
+            "progress": job.progress,
+            "input_asset_id": job.input_asset_id,
+            "output_asset_id": job.output_asset_id,
+            "parent_job_id": job.parent_job_id,
+            "source_job_id": job.source_job_id,
+            "error_message": job.error_message,
+            "result_json": result_json or {},
+            "created_at": job.created_at,
+            "updated_at": job.updated_at,
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+        }
+
     def create_job(
         self,
         *,
         job_type: str,
-        conversation_id: str | None = None,
+        project_id: int | None = None,
         trigger_message_id: str | None = None,
         input_asset_id: str | None = None,
         output_asset_id: str | None = None,
@@ -21,81 +56,45 @@ class JobService:
         result: dict | None = None,
         error_message: str | None = None,
     ) -> dict:
-        now = utcnow_iso()
+        now = utcnow_ms()
         job_id = uuid.uuid4().hex
 
-        connection = create_connection()
+        session = _get_session()
         try:
-            connection.execute(
-                """
-                INSERT INTO jobs (
-                    id, conversation_id, trigger_message_id, job_type, status, progress,
-                    input_asset_id, output_asset_id, parent_job_id, source_job_id,
-                    error_message, result_json, created_at, updated_at, started_at, finished_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    job_id,
-                    conversation_id,
-                    trigger_message_id,
-                    job_type,
-                    status,
-                    progress,
-                    input_asset_id,
-                    output_asset_id,
-                    parent_job_id,
-                    source_job_id,
-                    error_message,
-                    json.dumps(result or {}, ensure_ascii=False),
-                    now,
-                    now,
-                    now if status == "running" else None,
-                    now if status in {"succeeded", "failed", "cancelled"} else None,
-                ),
+            job = Job(
+                id=job_id,
+                project_id=project_id,
+                trigger_message_id=trigger_message_id,
+                job_type=job_type,
+                status=status,
+                progress=progress,
+                input_asset_id=input_asset_id,
+                output_asset_id=output_asset_id,
+                parent_job_id=parent_job_id,
+                source_job_id=source_job_id,
+                error_message=error_message,
+                result_json=json.dumps(result or {}, ensure_ascii=False),
+                created_at=now,
+                updated_at=now,
+                started_at=now if status == "running" else None,
+                finished_at=now if status in {"succeeded", "failed", "cancelled"} else None,
             )
-            connection.commit()
+            session.add(job)
+            session.commit()
+            return self._job_to_dict(job)
+        except Exception:
+            session.rollback()
+            raise
         finally:
-            connection.close()
-
-        return {
-            "id": job_id,
-            "conversation_id": conversation_id,
-            "trigger_message_id": trigger_message_id,
-            "job_type": job_type,
-            "status": status,
-            "progress": progress,
-            "input_asset_id": input_asset_id,
-            "output_asset_id": output_asset_id,
-            "parent_job_id": parent_job_id,
-            "source_job_id": source_job_id,
-            "error_message": error_message,
-            "result_json": result or {},
-            "created_at": now,
-            "updated_at": now,
-            "started_at": now if status == "running" else None,
-            "finished_at": now if status in {"succeeded", "failed", "cancelled"} else None,
-        }
+            session.close()
 
     def get_job(self, *, job_id: str) -> dict | None:
-        connection = create_connection()
+        session = _get_session()
         try:
-            row = connection.execute(
-                """
-                SELECT *
-                FROM jobs
-                WHERE id = ?
-                """,
-                (job_id,),
-            ).fetchone()
-            if row is None:
-                return None
-
-            job = dict(row)
-            if job.get("result_json"):
-                job["result_json"] = json.loads(job["result_json"])
-            return job
+            job = session.get(Job, job_id)
+            return self._job_to_dict(job) if job else None
         finally:
-            connection.close()
+            session.close()
 
     def update_job_status(
         self,
@@ -105,36 +104,29 @@ class JobService:
         progress: int,
         result: dict | None = None,
         error_message: str | None = None,
-        started_at: str | None = None,
-        finished_at: str | None = None,
+        started_at: int | None = None,
+        finished_at: int | None = None,
     ) -> None:
-        now = utcnow_iso()
-
-        connection = create_connection()
+        now = utcnow_ms()
+        session = _get_session()
         try:
-            connection.execute(
-                """
-                UPDATE jobs
-                SET status = ?,
-                    progress = ?,
-                    result_json = COALESCE(?, result_json),
-                    error_message = COALESCE(?, error_message),
-                    started_at = COALESCE(?, started_at),
-                    finished_at = COALESCE(?, finished_at),
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    status,
-                    progress,
-                    json.dumps(result, ensure_ascii=False) if result is not None else None,
-                    error_message,
-                    started_at,
-                    finished_at,
-                    now,
-                    job_id,
-                ),
-            )
-            connection.commit()
+            job = session.get(Job, job_id)
+            if job is None:
+                return
+            job.status = status
+            job.progress = progress
+            if result is not None:
+                job.result_json = json.dumps(result, ensure_ascii=False)
+            if error_message is not None:
+                job.error_message = error_message
+            if started_at is not None and job.started_at is None:
+                job.started_at = started_at
+            if finished_at is not None and job.finished_at is None:
+                job.finished_at = finished_at
+            job.updated_at = now
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
         finally:
-            connection.close()
+            session.close()

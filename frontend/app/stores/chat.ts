@@ -3,7 +3,6 @@ import { ref } from 'vue'
 
 export interface ProjectListItem {
   id: number;
-  conversation_id: string | null;
   title: string;
   source_url: string;
   source_platform: string;
@@ -12,6 +11,7 @@ export interface ProjectListItem {
   source_name: string;
   status: string;
   media_url: string | null;
+  generated_media_url: string | null;
   objective: string;
   summary: string;
   created_at: string;
@@ -30,7 +30,7 @@ export interface ProjectDetail extends ProjectListItem {
     content: string | null;
   };
   source_analysis: any;
-  conversation_messages: Array<{
+  messages: Array<{
     id: string;
     role: string;
     message_type: string;

@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from app.crawlers.tiktok import TikTokAPPCrawler
-from app.db.sqlite import create_connection
+from app.db import create_connection
 from app.services.analysis_ai_service import AnalysisAIService
 from app.services.project_service import ProjectService
 from app.services.system_settings_service import SystemSettingsService
@@ -505,7 +505,7 @@ def test_upload_project_with_file_completes_analysis_workflow(monkeypatch, tmp_p
         detail = detail_response.json()["data"]
 
         assert detail["status"] == "succeeded"
-        assert detail["conversation_id"]
+        assert "messages" in detail
         assert detail["source_type"] == "upload"
         assert detail["media_url"].startswith("/uploads/project-sources/")
         assert detail["script_overview"]["full_text"]
@@ -514,16 +514,16 @@ def test_upload_project_with_file_completes_analysis_workflow(monkeypatch, tmp_p
         assert len(detail["shot_segments"]) >= 1
         assert detail["storyboard"]["items"]
         assert detail["storyboard"]["summary"]
-        assert len(detail["conversation_messages"]) >= 6
-        assert detail["conversation_messages"][0]["role"] == "user"
-        assert detail["conversation_messages"][0]["message_type"] == "project_request"
+        assert len(detail["messages"]) >= 6
+        assert detail["messages"][0]["role"] == "user"
+        assert detail["messages"][0]["message_type"] == "project_request"
         assert any(
             item["message_type"] == "analysis_reply"
-            for item in detail["conversation_messages"]
+            for item in detail["messages"]
         )
         assert any(
             item["message_type"] == "suggestion_reply"
-            for item in detail["conversation_messages"]
+            for item in detail["messages"]
         )
         assert [step["step_key"] for step in detail["task_steps"]] == [
             "extract_video_link",
@@ -676,7 +676,7 @@ def test_upload_project_accepts_source_url_and_runs_workflow(monkeypatch, tmp_pa
         assert any(
             item["message_type"] == "analysis_reply"
             and item["content"].startswith("## 爆点总结")
-            for item in detail["conversation_messages"]
+            for item in detail["messages"]
         )
         assert detail["task_steps"][1]["status"] == "completed"
         assert detail["task_steps"][-1]["step_key"] == "finish"
@@ -741,7 +741,7 @@ def test_project_detail_rebuilds_legacy_analysis_task_steps(monkeypatch, tmp_pat
                 """
                 SELECT *
                 FROM project_task_steps
-                WHERE project_id = ?
+                WHERE project_id = %s
                 ORDER BY display_order ASC, id ASC
                 """,
                 (project_id,),
@@ -758,7 +758,7 @@ def test_project_detail_rebuilds_legacy_analysis_task_steps(monkeypatch, tmp_pat
             ]
 
             connection.execute(
-                "DELETE FROM project_task_steps WHERE project_id = ?",
+                "DELETE FROM project_task_steps WHERE project_id = %s",
                 (project_id,),
             )
             for index, step_key in enumerate(legacy_step_keys, start=1):
@@ -771,7 +771,7 @@ def test_project_detail_rebuilds_legacy_analysis_task_steps(monkeypatch, tmp_pat
                     INSERT INTO project_task_steps (
                         project_id, step_key, title, detail, status,
                         error_detail, output_json, display_order, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         project_id,
@@ -992,7 +992,7 @@ def test_upload_project_create_workflow_generates_video_asset(monkeypatch, tmp_p
         assert detail["video_generation"]["provider_task_id"] == "create-task-001"
         assert detail["video_generation"]["output_asset_id"]
         assert detail["video_generation"]["asset_url"].startswith("/uploads/generated/")
-        assert detail["media_url"] == detail["video_generation"]["asset_url"]
+        assert detail["generated_media_url"] == detail["video_generation"]["asset_url"]
         assert detail["video_generation"]["prompt"]
         assert detail["script_overview"]["full_text"]
         assert detail["storyboard"]["items"]
@@ -1007,7 +1007,7 @@ def test_upload_project_create_workflow_generates_video_asset(monkeypatch, tmp_p
         assert all(step["status"] == "completed" for step in detail["task_steps"])
         assert any(
             message["message_type"] == "video_generation_result"
-            for message in detail["conversation_messages"]
+            for message in detail["messages"]
         )
 
 
@@ -1131,7 +1131,8 @@ def test_upload_project_remake_workflow_generates_video_asset(monkeypatch, tmp_p
         assert detail["video_generation"]["provider_task_id"] == "remake-task-001"
         assert detail["video_generation"]["output_asset_id"]
         assert detail["video_generation"]["asset_url"].startswith("/uploads/generated/")
-        assert detail["media_url"] == detail["video_generation"]["asset_url"]
+        assert detail["generated_media_url"] == detail["video_generation"]["asset_url"]
+        assert detail["media_url"].startswith("/uploads/project-sources/")
         assert detail["video_generation"]["prompt"]
         assert detail["source_analysis"]["visual_features"]
         assert "参考视频开场先抛出卖点" in detail["script_overview"]["full_text"]
@@ -1149,7 +1150,7 @@ def test_upload_project_remake_workflow_generates_video_asset(monkeypatch, tmp_p
         assert all(step["status"] == "completed" for step in detail["task_steps"])
         assert any(
             message["message_type"] == "video_generation_result"
-            for message in detail["conversation_messages"]
+            for message in detail["messages"]
         )
 
 

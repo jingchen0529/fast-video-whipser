@@ -1,26 +1,30 @@
+from contextlib import contextmanager
+
 from fastapi.testclient import TestClient
 
 from app.core.application import create_app
 from app.core.config import settings
 from app.crawlers.tiktok import TikTokAPPCrawler
 from app.services import captcha_service
+from tests.test_auth_api import _test_database_scope
 
 
+@contextmanager
 def _build_authenticated_client(tmp_path) -> TestClient:
-    settings.database_url = f"sqlite:///{tmp_path / 'tiktok-test.db'}"
-    settings.environment = "development"
-    settings.auth_jwt_secret = "unit-test-secret-value-which-is-long-enough"
-    settings.auth_jwt_issuer = "unit-test-suite"
-    settings.auth_initial_admin_username = "admin"
-    settings.auth_initial_admin_email = "admin@example.com"
-    settings.auth_initial_admin_password = "Admin12345!"
-    settings.auth_initial_admin_display_name = "Admin User"
-    settings.auth_allow_public_register = False
-    settings.auth_require_captcha_for_login = True
-    settings.auth_cookie_secure = False
-    settings.auth_cookie_samesite = "lax"
-
-    return TestClient(create_app(serve_frontend_static=False))
+    with _test_database_scope(tmp_path, prefix="tiktok"):
+        settings.environment = "development"
+        settings.auth_jwt_secret = "unit-test-secret-value-which-is-long-enough"
+        settings.auth_jwt_issuer = "unit-test-suite"
+        settings.auth_initial_admin_username = "admin"
+        settings.auth_initial_admin_email = "admin@example.com"
+        settings.auth_initial_admin_password = "Admin12345!"
+        settings.auth_initial_admin_display_name = "Admin User"
+        settings.auth_allow_public_register = False
+        settings.auth_require_captcha_for_login = True
+        settings.auth_cookie_secure = False
+        settings.auth_cookie_samesite = "lax"
+        with TestClient(create_app(serve_frontend_static=False)) as client:
+            yield client
 
 
 def _login_admin(client: TestClient) -> None:

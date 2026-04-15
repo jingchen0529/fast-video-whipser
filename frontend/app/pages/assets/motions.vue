@@ -4,13 +4,14 @@ import {
   RefreshCw,
   Search,
   Film,
-  Tag,
-  Shapes,
   MapPin,
   Sparkles,
   Clock3,
   ChevronRight,
   AlertCircle,
+  ArrowLeft,
+  Play,
+  Image as ImageIcon,
 } from "lucide-vue-next";
 
 import { Button } from "@/components/ui/button";
@@ -30,6 +31,12 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { notifyError, formatDateTime } from "@/utils/common";
 import type { MotionAsset, MotionAssetListPayload } from "@/types/api";
 
@@ -58,11 +65,9 @@ const loading = ref(false);
 const items = ref<MotionAsset[]>([]);
 const searchInput = ref("");
 const appliedKeyword = ref("");
-const actionFilter = ref("__all");
-const sceneFilter = ref("__all");
-const reviewFilter = ref("__all");
 const selectedItem = ref<MotionAsset | null>(null);
 const showDetail = ref(false);
+const selectedGroup = ref<MotionAssetGroup | null>(null);
 
 const resolveAssetUrl = (assetId?: string | null): string | null => {
   if (!assetId) return null;
@@ -83,6 +88,18 @@ const resolveAssetUrl = (assetId?: string | null): string | null => {
   }
 };
 
+const resolveMotionThumbnailUrl = (item?: MotionAsset | null): string | null => {
+  if (!item) return null;
+  return resolveAssetUrl(
+    item.thumbnail_asset_id || item.metadata_json?.thumbnail_asset_id || null,
+  );
+};
+
+const resolveMotionClipUrl = (item?: MotionAsset | null): string | null => {
+  if (!item) return null;
+  return resolveAssetUrl(item.clip_asset_id);
+};
+
 const formatRange = (startMs: number, endMs: number) => {
   const formatPoint = (value: number) => {
     const totalSeconds = Math.max(0, Math.floor(value / 1000));
@@ -98,25 +115,6 @@ const formatRange = (startMs: number, endMs: number) => {
 const formatDuration = (startMs: number, endMs: number) =>
   `${Math.max(0, endMs - startMs) / 1000}s`;
 
-const reviewStatusLabel = (status?: string | null) => {
-  const normalized = String(status || "").trim().toLowerCase();
-  if (normalized === "approved") return "已入库";
-  if (normalized === "rejected") return "已驳回";
-  if (normalized === "draft") return "草稿";
-  return "待审核";
-};
-
-const reviewStatusClass = (status?: string | null) => {
-  const normalized = String(status || "").trim().toLowerCase();
-  if (normalized === "approved") {
-    return "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/30 dark:bg-emerald-950/30 dark:text-emerald-300";
-  }
-  if (normalized === "rejected") {
-    return "border-red-200 bg-red-50 text-red-700 dark:border-red-900/30 dark:bg-red-950/30 dark:text-red-300";
-  }
-  return "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/30 dark:bg-amber-950/30 dark:text-amber-300";
-};
-
 const confidenceText = (item: MotionAsset) => {
   const raw = item.metadata_json?.confidence;
   const normalized =
@@ -130,10 +128,7 @@ const fetchMotionAssets = async () => {
   try {
     const params = new URLSearchParams();
     if (appliedKeyword.value.trim()) params.set("q", appliedKeyword.value.trim());
-    if (actionFilter.value !== "__all") params.set("action_label", actionFilter.value);
-    if (sceneFilter.value !== "__all") params.set("scene_label", sceneFilter.value);
-    if (reviewFilter.value !== "__all") params.set("review_status", reviewFilter.value);
-    params.set("limit", "100");
+    params.set("limit", "1000"); // Expand limit to allow robust client-side global content search.
 
     const query = params.toString();
     const data = await api<MotionAssetListPayload>(
@@ -152,33 +147,27 @@ const handleSearch = async () => {
   await fetchMotionAssets();
 };
 
-const handleFilterChange = async () => {
-  await fetchMotionAssets();
-};
-
-const resetFilters = async () => {
-  searchInput.value = "";
-  appliedKeyword.value = "";
-  actionFilter.value = "__all";
-  sceneFilter.value = "__all";
-  reviewFilter.value = "__all";
-  await fetchMotionAssets();
-};
-
-const actionOptions = computed(() =>
-  [...new Set(items.value.map((item) => item.action_label).filter(Boolean))]
-    .sort((a, b) => String(a).localeCompare(String(b), "zh-CN")),
-);
-
-const sceneOptions = computed(() =>
-  [...new Set(items.value.map((item) => item.scene_label).filter(Boolean))]
-    .sort((a, b) => String(a).localeCompare(String(b), "zh-CN")),
-);
-
 const groupedItems = computed<MotionAssetGroup[]>(() => {
   const groups = new Map<string, MotionAssetGroup>();
+  const kw = appliedKeyword.value.trim().toLowerCase();
 
   for (const item of items.value) {
+    if (kw) {
+      const matchStr = [
+        item.action_summary,
+        item.action_label,
+        item.scene_label,
+        item.emotion_label,
+        item.camera_motion,
+        item.camera_shot,
+        item.temperament_label,
+        item.entrance_style,
+        item.source_video_asset?.file_name
+      ].filter(Boolean).join(" ").toLowerCase();
+      
+      if (!matchStr.includes(kw)) continue;
+    }
+
     const sourceVideoAssetId = item.source_video_asset_id || null;
     const groupKey = sourceVideoAssetId || `unknown-${item.id}`;
     const sourceVideoName =
@@ -215,13 +204,19 @@ const groupedItems = computed<MotionAssetGroup[]>(() => {
 const stats = computed(() => ({
   videoCount: groupedItems.value.length,
   motionCount: items.value.length,
-  pendingCount: items.value.filter((item) => item.review_status === "auto_tagged").length,
-  approvedCount: items.value.filter((item) => item.review_status === "approved").length,
 }));
 
 const openDetail = (item: MotionAsset) => {
   selectedItem.value = item;
   showDetail.value = true;
+};
+
+const enterGroup = (group: MotionAssetGroup) => {
+  selectedGroup.value = group;
+};
+
+const leaveGroup = () => {
+  selectedGroup.value = null;
 };
 
 onMounted(fetchMotionAssets);
@@ -230,130 +225,163 @@ onMounted(fetchMotionAssets);
 <template>
   <div class="h-full w-full overflow-hidden bg-white p-6 dark:bg-[#121212]">
     <div class="mx-auto flex h-full max-w-7xl flex-col gap-6">
-      <div class="flex flex-col gap-4 rounded-3xl border border-zinc-200 bg-zinc-50/60 p-6 dark:border-zinc-800 dark:bg-zinc-950/70">
-        <div class="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
-          <div class="space-y-2">
-            <div class="inline-flex w-fit items-center gap-2 rounded-full border border-zinc-200 bg-white px-3 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
-              <Sparkles class="size-3.5" />
-              每个视频拆成多个动作标签分镜
-            </div>
-            <div>
-              <h1 class="text-3xl font-bold tracking-tight text-zinc-950 dark:text-zinc-50">
-                动作资产库
-              </h1>
-              <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-                按来源视频聚合查看动作资产，重点看每段分镜对应的动作标签、情绪、场景和运镜。
-              </p>
-            </div>
-          </div>
 
-          <div class="flex items-center gap-2">
-            <Button
-              variant="outline"
-              class="h-10 rounded-xl"
-              :disabled="loading"
-              @click="fetchMotionAssets"
-            >
-              <RefreshCw :class="['mr-2 size-4', loading && 'animate-spin']" />
-              刷新
-            </Button>
-          </div>
-        </div>
-
-        <div class="grid gap-3 md:grid-cols-4">
-          <div class="rounded-2xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
-            <p class="text-xs text-zinc-500">来源视频</p>
-            <p class="mt-2 text-2xl font-semibold text-zinc-950 dark:text-zinc-50">
-              {{ stats.videoCount }}
-            </p>
-          </div>
-          <div class="rounded-2xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
-            <p class="text-xs text-zinc-500">动作分镜</p>
-            <p class="mt-2 text-2xl font-semibold text-zinc-950 dark:text-zinc-50">
-              {{ stats.motionCount }}
-            </p>
-          </div>
-          <div class="rounded-2xl border border-amber-200 bg-amber-50 p-4 dark:border-amber-900/30 dark:bg-amber-950/20">
-            <p class="text-xs text-amber-700 dark:text-amber-300">待审核</p>
-            <p class="mt-2 text-2xl font-semibold text-amber-900 dark:text-amber-100">
-              {{ stats.pendingCount }}
-            </p>
-          </div>
-          <div class="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 dark:border-emerald-900/30 dark:bg-emerald-950/20">
-            <p class="text-xs text-emerald-700 dark:text-emerald-300">已入库</p>
-            <p class="mt-2 text-2xl font-semibold text-emerald-900 dark:text-emerald-100">
-              {{ stats.approvedCount }}
-            </p>
-          </div>
-        </div>
-      </div>
-
-      <div class="grid gap-3 rounded-3xl border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-950 lg:grid-cols-[minmax(0,2fr)_220px_220px_220px_auto]">
-        <div class="flex items-center gap-2 rounded-2xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900/60">
-          <Search class="size-4 text-zinc-400" />
-          <Input
-            v-model="searchInput"
-            placeholder="搜索动作摘要"
-            class="border-0 bg-transparent px-0 shadow-none focus-visible:ring-0"
-            @keyup.enter="handleSearch"
-          />
-        </div>
-
-        <Select v-model="actionFilter" @update:model-value="handleFilterChange">
-          <SelectTrigger class="h-11 rounded-2xl border-zinc-200 dark:border-zinc-800">
-            <SelectValue placeholder="动作标签" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="__all">全部动作</SelectItem>
-            <SelectItem
-              v-for="option in actionOptions"
-              :key="option"
-              :value="option"
-            >
-              {{ option }}
-            </SelectItem>
-          </SelectContent>
-        </Select>
-
-        <Select v-model="sceneFilter" @update:model-value="handleFilterChange">
-          <SelectTrigger class="h-11 rounded-2xl border-zinc-200 dark:border-zinc-800">
-            <SelectValue placeholder="场景标签" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="__all">全部场景</SelectItem>
-            <SelectItem
-              v-for="option in sceneOptions"
-              :key="option"
-              :value="option"
-            >
-              {{ option }}
-            </SelectItem>
-          </SelectContent>
-        </Select>
-
-        <Select v-model="reviewFilter" @update:model-value="handleFilterChange">
-          <SelectTrigger class="h-11 rounded-2xl border-zinc-200 dark:border-zinc-800">
-            <SelectValue placeholder="审核状态" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="__all">全部状态</SelectItem>
-            <SelectItem value="auto_tagged">待审核</SelectItem>
-            <SelectItem value="approved">已入库</SelectItem>
-            <SelectItem value="rejected">已驳回</SelectItem>
-          </SelectContent>
-        </Select>
-
-        <div class="flex items-center gap-2">
-          <Button class="h-11 rounded-2xl" :disabled="loading" @click="handleSearch">
-            查询
-          </Button>
-          <Button
-            variant="outline"
-            class="h-11 rounded-2xl"
-            :disabled="loading"
-            @click="resetFilters"
+      <!-- ===== DETAIL VIEW: single video's motions ===== -->
+      <template v-if="selectedGroup">
+        <!-- Back header -->
+        <div class="flex items-center gap-3">
+          <button
+            type="button"
+            class="inline-flex items-center gap-1.5 rounded-xl px-3 py-2 text-sm font-medium text-zinc-600 transition-colors hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800"
+            @click="leaveGroup"
           >
-            重置
+            <ArrowLeft class="size-4" />
+            返回列表
+          </button>
+        </div>
+
+        <!-- Video info header -->
+        <div class="grid gap-5 rounded-3xl border border-zinc-200 bg-zinc-50/60 p-5 dark:border-zinc-800 dark:bg-zinc-950/70 lg:grid-cols-[360px_minmax(0,1fr)]">
+          <div class="overflow-hidden rounded-2xl border border-zinc-200 bg-black dark:border-zinc-800">
+            <video
+              v-if="selectedGroup.sourceVideoUrl"
+              :src="selectedGroup.sourceVideoUrl"
+              controls
+              class="aspect-video w-full object-contain"
+            />
+            <div
+              v-else
+              class="flex aspect-video items-center justify-center text-sm text-white/50"
+            >
+              暂无源视频预览
+            </div>
+          </div>
+          <div class="flex min-w-0 flex-col justify-between gap-4">
+            <div class="space-y-3">
+              <div class="flex flex-wrap items-center gap-2">
+                <Badge class="border-zinc-200 bg-zinc-100 text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
+                  <Film class="mr-1 size-3.5" />
+                  {{ selectedGroup.items.length }} 条分镜动作
+                </Badge>
+                <Badge
+                  v-for="label in selectedGroup.actionLabels.slice(0, 6)"
+                  :key="label"
+                  variant="outline"
+                  class="border-zinc-200 text-zinc-600 dark:border-zinc-700 dark:text-zinc-300"
+                >
+                  {{ label }}
+                </Badge>
+              </div>
+              <div>
+                <h2 class="truncate text-xl font-semibold text-zinc-950 dark:text-zinc-50">
+                  {{ selectedGroup.sourceVideoName }}
+                </h2>
+                <p class="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                  Source Asset ID: {{ selectedGroup.sourceVideoAssetId || "未关联" }}
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Motion cards for this video -->
+        <div class="custom-scrollbar min-h-0 flex-1 overflow-y-auto pr-1">
+          <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+            <button
+              v-for="item in selectedGroup.items"
+              :key="item.id"
+              type="button"
+              class="group rounded-2xl border border-zinc-200 bg-zinc-50/40 p-4 text-left transition-all hover:-translate-y-0.5 hover:border-zinc-300 hover:bg-white hover:shadow-sm dark:border-zinc-800 dark:bg-zinc-900/50 dark:hover:border-zinc-700 dark:hover:bg-zinc-900"
+              @click="openDetail(item)"
+            >
+              <div class="relative mb-4 aspect-video overflow-hidden rounded-2xl border border-zinc-200 bg-zinc-950 dark:border-zinc-800">
+                <img
+                  v-if="resolveMotionThumbnailUrl(item)"
+                  :src="resolveMotionThumbnailUrl(item) || undefined"
+                  class="h-full w-full object-cover transition-transform duration-500 group-hover:scale-105"
+                  alt="动作截图"
+                />
+                <div
+                  v-else
+                  class="flex h-full w-full items-center justify-center bg-zinc-900 text-zinc-500"
+                >
+                  <ImageIcon class="size-8 opacity-60" />
+                </div>
+                <div class="absolute inset-0 bg-gradient-to-t from-black/55 via-black/5 to-transparent" />
+                <div class="absolute left-3 top-3">
+                  <span class="inline-flex items-center gap-1 rounded-full bg-black/45 px-2 py-1 text-[10px] font-medium text-white backdrop-blur-sm">
+                    <Play class="size-3" />
+                    点击查看截图与片段
+                  </span>
+                </div>
+              </div>
+              <div class="flex items-start justify-between gap-3">
+                <div class="space-y-1">
+                  <p class="text-sm font-semibold text-zinc-950 dark:text-zinc-50">
+                    {{ item.action_label || "未标注动作" }}
+                  </p>
+                  <p class="text-xs text-zinc-500 dark:text-zinc-400">
+                    {{ formatRange(item.start_ms, item.end_ms) }}
+                  </p>
+                </div>
+              </div>
+              <p class="mt-3 line-clamp-3 text-sm leading-6 text-zinc-600 dark:text-zinc-300">
+                {{ item.action_summary }}
+              </p>
+              <div class="mt-4 flex flex-wrap gap-2">
+                <Badge v-if="item.emotion_label" variant="outline" class="border-zinc-200 text-zinc-600 dark:border-zinc-700 dark:text-zinc-300">{{ item.emotion_label }}</Badge>
+                <Badge v-if="item.scene_label" variant="outline" class="border-zinc-200 text-zinc-600 dark:border-zinc-700 dark:text-zinc-300">{{ item.scene_label }}</Badge>
+                <Badge v-if="item.camera_motion" variant="outline" class="border-zinc-200 text-zinc-600 dark:border-zinc-700 dark:text-zinc-300">{{ item.camera_motion }}</Badge>
+              </div>
+              <div class="mt-4 flex items-center justify-between text-xs text-zinc-500 dark:text-zinc-400">
+                <span class="inline-flex items-center gap-1.5"><Clock3 class="size-3.5" />{{ formatDuration(item.start_ms, item.end_ms) }}</span>
+                <span class="inline-flex items-center gap-1.5"><Sparkles class="size-3.5" />置信度 {{ confidenceText(item) }}</span>
+                <ChevronRight class="size-4 transition-transform group-hover:translate-x-0.5" />
+              </div>
+            </button>
+          </div>
+        </div>
+      </template>
+
+      <!-- ===== LIST VIEW: video cards ===== -->
+      <template v-else>
+
+      <div class="flex items-center justify-between pb-2 mb-2 px-2">
+        <div class="space-y-1 hidden md:block">
+          <h1 class="text-2xl font-bold tracking-tight text-zinc-950 dark:text-zinc-50">
+            动作资产库
+          </h1>
+        </div>
+
+        <div class="flex flex-1 md:flex-none items-center justify-end gap-3">
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger as-child>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  class="size-9 shrink-0 rounded-full border border-zinc-200 bg-white shadow-sm dark:bg-zinc-900 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                  @click="fetchMotionAssets"
+                  :disabled="loading"
+                >
+                  <RefreshCw :class="['size-4 text-zinc-600 dark:text-zinc-400', loading && 'animate-spin']" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>手动刷新</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+
+          <div class="relative w-full max-w-sm md:w-80">
+            <Search class="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-zinc-400" />
+            <Input
+              v-model="searchInput"
+              placeholder="搜索任何内容..."
+              class="h-9 pl-9 rounded-xl border-zinc-200/60 shadow-sm text-sm bg-white dark:bg-zinc-950 dark:border-zinc-800 focus-visible:ring-1"
+              @keyup.enter="handleSearch"
+            />
+          </div>
+          <Button variant="default" size="sm" class="h-9 px-4 rounded-xl font-medium shadow-sm transition-all text-sm bg-zinc-900 text-white dark:bg-zinc-50 dark:text-zinc-900 hover:opacity-90 active:scale-95 shrink-0" @click="handleSearch">
+            搜索
           </Button>
         </div>
       </div>
@@ -379,143 +407,83 @@ onMounted(fetchMotionAssets);
           </p>
         </div>
 
-        <div v-else class="space-y-6">
-          <section
+        <!-- Video card grid -->
+        <div v-else class="grid gap-5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+          <div
             v-for="group in groupedItems"
             :key="group.groupKey"
-            class="overflow-hidden rounded-3xl border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950"
+            class="group cursor-pointer overflow-hidden rounded-2xl border border-zinc-200 bg-white transition-all hover:-translate-y-0.5 hover:border-zinc-300 hover:shadow-lg dark:border-zinc-800 dark:bg-zinc-950 dark:hover:border-zinc-700"
+            @click="enterGroup(group)"
           >
-            <div class="grid gap-5 border-b border-zinc-200 p-5 dark:border-zinc-800 lg:grid-cols-[320px_minmax(0,1fr)]">
-              <div class="overflow-hidden rounded-2xl border border-zinc-200 bg-black dark:border-zinc-800">
-                <video
-                  v-if="group.sourceVideoUrl"
-                  :src="group.sourceVideoUrl"
-                  controls
-                  class="aspect-video w-full object-contain"
-                />
-                <div
-                  v-else
-                  class="flex aspect-video items-center justify-center text-sm text-white/50"
-                >
-                  暂无源视频预览
-                </div>
-              </div>
-
-              <div class="flex min-w-0 flex-col justify-between gap-4">
-                <div class="space-y-3">
-                  <div class="flex flex-wrap items-center gap-2">
-                    <Badge class="border-zinc-200 bg-zinc-100 text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
-                      <Film class="mr-1 size-3.5" />
-                      {{ group.items.length }} 条分镜动作
-                    </Badge>
-                    <Badge
-                      v-for="label in group.actionLabels.slice(0, 6)"
-                      :key="label"
-                      variant="outline"
-                      class="border-zinc-200 text-zinc-600 dark:border-zinc-700 dark:text-zinc-300"
-                    >
-                      {{ label }}
-                    </Badge>
-                  </div>
-
-                  <div>
-                    <h2 class="truncate text-xl font-semibold text-zinc-950 dark:text-zinc-50">
-                      {{ group.sourceVideoName }}
-                    </h2>
-                    <p class="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-                      Source Asset ID:
-                      {{ group.sourceVideoAssetId || "未关联" }}
-                    </p>
-                  </div>
-                </div>
-
-                <div class="flex flex-wrap items-center gap-4 text-sm text-zinc-500 dark:text-zinc-400">
-                  <span class="inline-flex items-center gap-1.5">
-                    <Tag class="size-4" />
-                    标签化动作分镜库
-                  </span>
-                  <span class="inline-flex items-center gap-1.5">
-                    <Shapes class="size-4" />
-                    按源视频聚合
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            <div class="grid gap-4 p-5 md:grid-cols-2 xl:grid-cols-3">
-              <button
-                v-for="item in group.items"
-                :key="item.id"
-                type="button"
-                class="group rounded-2xl border border-zinc-200 bg-zinc-50/40 p-4 text-left transition-all hover:-translate-y-0.5 hover:border-zinc-300 hover:bg-white hover:shadow-sm dark:border-zinc-800 dark:bg-zinc-900/50 dark:hover:border-zinc-700 dark:hover:bg-zinc-900"
-                @click="openDetail(item)"
+            <!-- Video thumbnail -->
+            <div class="relative aspect-video w-full overflow-hidden bg-zinc-950">
+              <video
+                v-if="group.sourceVideoUrl"
+                :src="group.sourceVideoUrl"
+                class="h-full w-full object-cover transition-transform duration-500 group-hover:scale-105"
+                muted
+                preload="metadata"
+              />
+              <div
+                v-else
+                class="flex h-full w-full items-center justify-center"
               >
-                <div class="flex items-start justify-between gap-3">
-                  <div class="space-y-1">
-                    <p class="text-sm font-semibold text-zinc-950 dark:text-zinc-50">
-                      {{ item.action_label || "未标注动作" }}
-                    </p>
-                    <p class="text-xs text-zinc-500 dark:text-zinc-400">
-                      {{ formatRange(item.start_ms, item.end_ms) }}
-                    </p>
-                  </div>
-
-                  <span
-                    class="inline-flex shrink-0 items-center rounded-full border px-2 py-1 text-xs font-medium"
-                    :class="reviewStatusClass(item.review_status)"
-                  >
-                    {{ reviewStatusLabel(item.review_status) }}
-                  </span>
-                </div>
-
-                <p class="mt-3 line-clamp-3 text-sm leading-6 text-zinc-600 dark:text-zinc-300">
-                  {{ item.action_summary }}
-                </p>
-
-                <div class="mt-4 flex flex-wrap gap-2">
-                  <Badge
-                    v-if="item.emotion_label"
-                    variant="outline"
-                    class="border-zinc-200 text-zinc-600 dark:border-zinc-700 dark:text-zinc-300"
-                  >
-                    {{ item.emotion_label }}
-                  </Badge>
-                  <Badge
-                    v-if="item.scene_label"
-                    variant="outline"
-                    class="border-zinc-200 text-zinc-600 dark:border-zinc-700 dark:text-zinc-300"
-                  >
-                    {{ item.scene_label }}
-                  </Badge>
-                  <Badge
-                    v-if="item.camera_motion"
-                    variant="outline"
-                    class="border-zinc-200 text-zinc-600 dark:border-zinc-700 dark:text-zinc-300"
-                  >
-                    {{ item.camera_motion }}
-                  </Badge>
-                </div>
-
-                <div class="mt-4 flex items-center justify-between text-xs text-zinc-500 dark:text-zinc-400">
-                  <span class="inline-flex items-center gap-1.5">
-                    <Clock3 class="size-3.5" />
-                    {{ formatDuration(item.start_ms, item.end_ms) }}
-                  </span>
-                  <span class="inline-flex items-center gap-1.5">
-                    <Sparkles class="size-3.5" />
-                    置信度 {{ confidenceText(item) }}
-                  </span>
-                  <ChevronRight class="size-4 transition-transform group-hover:translate-x-0.5" />
-                </div>
-              </button>
+                <Film class="size-10 text-white/20" />
+              </div>
+              <!-- Motion count overlay -->
+              <div class="absolute bottom-2.5 right-2.5">
+                <span class="inline-flex items-center gap-1 rounded-full bg-black/60 px-2 py-0.5 text-[11px] font-medium text-white backdrop-blur-sm">
+                  <Play class="size-3" />
+                  {{ group.items.length }} 条动作
+                </span>
+              </div>
+              <!-- Hover overlay -->
+              <div class="absolute inset-0 flex items-center justify-center bg-black/40 opacity-0 transition-opacity group-hover:opacity-100">
+                <span class="rounded-full bg-white/20 px-4 py-2 text-sm font-medium text-white backdrop-blur-md">
+                  查看动作
+                </span>
+              </div>
             </div>
-          </section>
+
+            <!-- Card info -->
+            <div class="p-4">
+              <h3 class="truncate text-sm font-semibold text-zinc-950 dark:text-zinc-50">
+                {{ group.sourceVideoName }}
+              </h3>
+              <div class="mt-2.5 flex flex-wrap gap-1">
+                <Badge
+                  v-for="label in group.actionLabels.slice(0, 3)"
+                  :key="label"
+                  variant="outline"
+                  class="border-zinc-200 text-[10px] text-zinc-600 dark:border-zinc-700 dark:text-zinc-300"
+                >
+                  {{ label }}
+                </Badge>
+                <Badge
+                  v-if="group.actionLabels.length > 3"
+                  variant="outline"
+                  class="border-zinc-200 text-[10px] text-zinc-400 dark:border-zinc-700"
+                >
+                  +{{ group.actionLabels.length - 3 }}
+                </Badge>
+              </div>
+              <div class="mt-3 flex items-center justify-between text-xs text-zinc-500 dark:text-zinc-400">
+                <span class="inline-flex items-center gap-1">
+                  <Film class="size-3.5" />
+                  {{ group.items.length }} 条分镜
+                </span>
+                <ChevronRight class="size-4 transition-transform group-hover:translate-x-0.5" />
+              </div>
+            </div>
+          </div>
         </div>
       </div>
+
+      </template><!-- /v-else LIST VIEW -->
     </div>
 
     <Dialog v-model:open="showDetail">
-      <DialogContent class="max-w-2xl rounded-3xl border-zinc-200 dark:border-zinc-800">
+      <DialogContent class="max-w-2xl rounded-3xl border-zinc-200 dark:border-zinc-800 max-h-[90vh] overflow-y-auto custom-scrollbar">
         <DialogHeader>
           <DialogTitle class="text-xl">
             {{ selectedItem?.action_label || "动作资产详情" }}
@@ -525,12 +493,45 @@ onMounted(fetchMotionAssets);
           </DialogDescription>
         </DialogHeader>
 
-        <div v-if="selectedItem" class="space-y-5">
+        <div v-if="selectedItem" class="space-y-5 mt-2">
+          <div class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.15fr)]">
+            <div class="overflow-hidden rounded-3xl border border-zinc-200 bg-zinc-950 dark:border-zinc-800">
+              <img
+                v-if="resolveMotionThumbnailUrl(selectedItem)"
+                :src="resolveMotionThumbnailUrl(selectedItem) || undefined"
+                class="aspect-video w-full object-cover"
+                alt="动作截图"
+              />
+              <div
+                v-else
+                class="flex aspect-video items-center justify-center text-sm text-white/45"
+              >
+                暂无动作截图
+              </div>
+            </div>
+
+            <div class="overflow-hidden rounded-3xl border border-zinc-200 bg-zinc-950 dark:border-zinc-800">
+              <video
+                v-if="resolveMotionClipUrl(selectedItem)"
+                :src="resolveMotionClipUrl(selectedItem) || undefined"
+                controls
+                preload="metadata"
+                class="aspect-video w-full object-contain"
+              />
+              <div
+                v-else
+                class="flex aspect-video items-center justify-center text-sm text-white/45"
+              >
+                暂无动作片段
+              </div>
+            </div>
+          </div>
+
           <div class="grid gap-3 md:grid-cols-2">
             <div class="rounded-2xl border border-zinc-200 bg-zinc-50 p-4 dark:border-zinc-800 dark:bg-zinc-900/60">
               <p class="text-xs text-zinc-500">动作摘要</p>
               <p class="mt-2 text-sm leading-6 text-zinc-700 dark:text-zinc-300">
-                {{ selectedItem.action_summary }}
+                {{ selectedItem.action_summary || "暂无动作摘要" }}
               </p>
             </div>
 
@@ -546,13 +547,7 @@ onMounted(fetchMotionAssets);
             </div>
           </div>
 
-          <div class="grid gap-3 md:grid-cols-3">
-            <div class="rounded-2xl border border-zinc-200 p-4 dark:border-zinc-800">
-              <p class="text-xs text-zinc-500">审核状态</p>
-              <p class="mt-2 text-sm font-medium text-zinc-900 dark:text-zinc-100">
-                {{ reviewStatusLabel(selectedItem.review_status) }}
-              </p>
-            </div>
+          <div class="grid gap-3 md:grid-cols-2">
             <div class="rounded-2xl border border-zinc-200 p-4 dark:border-zinc-800">
               <p class="text-xs text-zinc-500">置信度</p>
               <p class="mt-2 text-sm font-medium text-zinc-900 dark:text-zinc-100">

@@ -377,7 +377,7 @@ const handleSaveRole = async () => {
                   </div>
                   
                   <div class="space-y-2">
-                    <label class="text-[13px] font-semibold text-zinc-800">权限字符 <span class="text-red-500">*</span></label>
+                    <label class="text-[13px] font-semibold text-zinc-800">角色编码 <span class="text-red-500">*</span></label>
                     <Input
                       v-model="roleForm.code"
                       :disabled="isEdit"
@@ -432,7 +432,7 @@ const handleSaveRole = async () => {
               <!-- Tree View -->
               <ScrollArea class="flex-1 min-h-0 bg-white relative">
                 <div v-if="isSuperAdminRole" class="absolute inset-x-0 top-0 z-10 px-4 py-3 bg-blue-50/80 border-b border-blue-100 text-blue-700 text-[13px] flex items-center justify-center backdrop-blur-sm">
-                  超级管理员默认拥有全部菜单权限，不可取消勾选。
+                  超级管理员默认拥有全部菜单，不可取消勾选。
                 </div>
                 
                 <div class="p-5 pb-8" :class="isSuperAdminRole ? 'pt-14' : ''">
@@ -481,8 +481,8 @@ const handleSaveRole = async () => {
                         </button>
                       </div>
 
-                      <!-- Permission String -->
-                      <div v-if="node.code && node.code.includes(':')" class="ml-10 min-w-32 shrink-0">
+                      <!-- Menu Code -->
+                      <div v-if="node.code" class="ml-10 min-w-32 shrink-0">
                         <span class="text-[11px] text-zinc-400 font-mono tracking-wide px-1.5 py-0.5 rounded transition-colors"
                               :class="getNodeCheckState(node.id) !== false ? 'text-zinc-500 bg-zinc-100' : 'bg-transparent group-hover:bg-zinc-100/50'">
                           {{ node.code }}

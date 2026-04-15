@@ -163,10 +163,12 @@ export interface MotionAsset {
   id: string;
   source_video_asset_id: string | null;
   clip_asset_id: string | null;
-  conversation_id: string | null;
+  thumbnail_asset_id?: string | null;
+  project_id: number | null;
   job_id: string | null;
   start_ms: number;
   end_ms: number;
+  thumbnail_path?: string | null;
   action_summary: string;
   action_label: string | null;
   entrance_style: string | null;
@@ -175,6 +177,8 @@ export interface MotionAsset {
   scene_label: string | null;
   camera_motion: string | null;
   camera_shot: string | null;
+  confidence?: number | null;
+  asset_candidate?: boolean;
   origin: string;
   review_status: string;
   copyright_risk_level: string;
@@ -239,12 +243,23 @@ export interface SystemSettingsInfoConfig {
   logo_url: string;
 }
 
+export interface MotionExtractionSettings {
+  coarse_filter_mode: "keyword" | "permissive";
+  min_duration_ms: number;
+  max_duration_ms: number;
+  signal_score_threshold: number;
+  confidence_threshold: number;
+  default_provider: string;
+  providers: SystemSettingsProviderConfig[];
+}
+
 export interface SystemSettingsPayload {
   system: SystemSettingsInfoConfig;
   proxy: SystemSettingsProxyConfig;
   analysis: SystemSettingsProviderGroup;
   transcription: SystemSettingsProviderGroup;
   remake: SystemSettingsProviderGroup;
+  motion_extraction: MotionExtractionSettings;
 }
 
 export interface TranscriptionDependencyStatus {

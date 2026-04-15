@@ -1,5 +1,4 @@
-import sqlite3
-
+from app.db import create_connection
 from app.services.system_settings_service import SystemSettingsService
 from tests.test_auth_api import _build_test_client, _csrf_headers, _login
 
@@ -48,10 +47,10 @@ def test_get_settings_returns_default_payload(tmp_path) -> None:
             "openai_whisper_api",
         }
 
-    connection = sqlite3.connect(tmp_path / "auth-test.db")
+    connection = create_connection()
     try:
         row = connection.execute(
-            "SELECT value_json FROM system_settings WHERE key = ?",
+            "SELECT value_json FROM system_settings WHERE `key` = %s",
             ("runtime_ai_settings",),
         ).fetchone()
     finally:
@@ -68,17 +67,17 @@ def test_get_settings_backfills_legacy_payload(tmp_path) -> None:
         )
         assert login_response.status_code == 200
 
-        connection = sqlite3.connect(tmp_path / "auth-test.db")
+        connection = create_connection()
         try:
             connection.execute(
                 """
-                INSERT INTO system_settings (key, value_json, updated_at, updated_by_user_id)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO system_settings (`key`, value_json, updated_at, updated_by_user_id)
+                VALUES (%s, %s, %s, %s)
                 """,
                 (
                     "runtime_ai_settings",
                     '{"proxy":{"enabled":true,"http_url":"http://127.0.0.1:7890"}}',
-                    "2026-01-01T00:00:00+00:00",
+                    1767225600000,
                     None,
                 ),
             )
@@ -95,19 +94,19 @@ def test_get_settings_backfills_legacy_payload(tmp_path) -> None:
         assert payload["analysis"]["default_provider"] == "openai"
         assert payload["transcription"]["default_provider"] == "faster_whisper"
 
-        connection = sqlite3.connect(tmp_path / "auth-test.db")
+        connection = create_connection()
         try:
             row = connection.execute(
-                "SELECT value_json FROM system_settings WHERE key = ?",
+                "SELECT value_json FROM system_settings WHERE `key` = %s",
                 ("runtime_ai_settings",),
             ).fetchone()
         finally:
             connection.close()
         assert row is not None
-        assert '"system"' in row[0]
-        assert '"analysis"' in row[0]
-        assert '"transcription"' in row[0]
-        assert '"remake"' in row[0]
+        assert '"system"' in row["value_json"]
+        assert '"analysis"' in row["value_json"]
+        assert '"transcription"' in row["value_json"]
+        assert '"remake"' in row["value_json"]
 
 
 def test_update_settings_persists_configuration(tmp_path) -> None:

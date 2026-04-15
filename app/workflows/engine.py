@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from app.auth.security import utcnow_iso
-from app.db.sqlite import create_connection
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +133,7 @@ UNSUPPORTED_WORKFLOW_STEPS = (
 class WorkflowEngine:
     """
     Executes a workflow by running its registered steps in sequence.
-    Handles step status updates, error handling, and conversation messages.
+    Handles step status updates, error handling, and project messages.
     """
 
     def __init__(self):

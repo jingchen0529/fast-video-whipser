@@ -63,14 +63,20 @@ const isAllCompleted = computed(
   () => totalCount.value > 0 && completedCount.value === totalCount.value,
 );
 
+// 当前进度序号：已完成数 + 正在执行的1个（如果有）
+const currentProgressIndex = computed(() => {
+  if (isAllCompleted.value) return totalCount.value;
+  return completedCount.value + (activeTask.value ? 1 : 0);
+});
+
 const headerTitle = computed(() => {
   if (failedTask.value) {
-    return `执行异常 · ${failedTask.value.title} (${completedCount.value}/${totalCount.value})`;
+    return `执行异常 · ${failedTask.value.title} (${currentProgressIndex.value}/${totalCount.value})`;
   }
   if (isAllCompleted.value) {
-    return `所有任务已完成 (${completedCount.value}/${totalCount.value})`;
+    return `所有任务已完成 (${totalCount.value}/${totalCount.value})`;
   }
-  return `处理中 · ${activeTask.value?.title || "等待执行"} (${completedCount.value}/${totalCount.value})`;
+  return `处理中 · ${activeTask.value?.title || "等待执行"} (${currentProgressIndex.value}/${totalCount.value})`;
 });
 
 const getStatusLabel = (status: string) => {

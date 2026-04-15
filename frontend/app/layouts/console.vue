@@ -13,7 +13,11 @@ const titles: Record<string, string> = {
   "/menus": "菜单管理",
   "/account": "个人资料",
   "/settings": "系统设置",
-  "/video/workbench": "分析工作台",
+  "/video/workbench": "视频分析",
+  "/video/history": "视频分析",
+  "/motion/extract": "动作提取",
+  "/assets": "资产库",
+  "/assets/motions": "动作资产库",
 };
 
 const currentTitle = computed(() => {
@@ -43,11 +47,19 @@ const currentTitle = computed(() => {
             >
               {{ currentTitle }}
             </span>
-            <div id="header-portal" class="flex items-center gap-3 flex-1 min-w-0"></div>
+            <div
+              id="header-portal"
+              class="flex items-center gap-3 flex-1 min-w-0"
+            ></div>
           </div>
-          <div id="header-actions" class="flex items-center shrink-0 gap-2"></div>
+          <div
+            id="header-actions"
+            class="flex items-center shrink-0 gap-2"
+          ></div>
         </header>
-        <main class="flex-1 overflow-auto bg-[#ffffff] dark:bg-[#171717] transition-colors duration-200">
+        <main
+          class="flex-1 overflow-auto bg-[#ffffff] dark:bg-[#171717] transition-colors duration-200"
+        >
           <slot />
         </main>
       </div>
