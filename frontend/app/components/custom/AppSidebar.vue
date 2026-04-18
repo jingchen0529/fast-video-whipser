@@ -519,7 +519,7 @@ onMounted(async () => {
 </script>
 
 <template>
-  <Sidebar collapsible="icon" class="border-r border-zinc-200">
+  <Sidebar variant="inset" collapsible="icon" class="border-r border-zinc-200">
     <SidebarHeader class="h-14 border-b border-zinc-200 px-4">
       <SidebarMenu>
         <SidebarMenuItem>

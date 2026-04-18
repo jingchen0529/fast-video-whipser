@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
+import { SidebarProvider, SidebarTrigger, SidebarInset } from "@/components/ui/sidebar";
 import AppSidebar from "@/components/custom/AppSidebar.vue";
 import { useRoute } from "vue-router";
 import { computed } from "vue";
@@ -31,9 +31,9 @@ const currentTitle = computed(() => {
       class="flex min-h-screen w-full transition-colors duration-200 bg-[#ffffff] dark:bg-[#171717] text-zinc-900 dark:text-zinc-100"
     >
       <AppSidebar />
-      <div class="flex-1 flex flex-col min-w-0">
+      <SidebarInset class="flex flex-col min-w-0 bg-transparent">
         <header
-          class="flex h-14 items-center justify-between px-4 border-b border-zinc-200 dark:border-zinc-800 bg-[#ffffff] dark:bg-[#171717] sticky top-0 z-10 transition-colors duration-200"
+          class="flex h-14 items-center justify-between px-4 border-zinc-200 dark:border-zinc-800 bg-white/80 dark:bg-zinc-900/80 backdrop-blur sticky top-0 z-10 transition-colors duration-200"
         >
           <div class="flex items-center gap-3 min-w-0 flex-1">
             <SidebarTrigger />
@@ -58,11 +58,13 @@ const currentTitle = computed(() => {
           ></div>
         </header>
         <main
-          class="flex-1 overflow-auto bg-[#ffffff] dark:bg-[#171717] transition-colors duration-200"
+          class="flex-1 overflow-auto bg-zinc-50 dark:bg-zinc-950/20 transition-colors duration-200 p-6"
         >
-          <slot />
+          <div class="h-full">
+            <slot />
+          </div>
         </main>
-      </div>
+      </SidebarInset>
     </div>
   </SidebarProvider>
 </template>
